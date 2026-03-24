@@ -159,7 +159,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: ${{ steps.release_tag.outputs.value }}
-          releaseName: "Vencord Installer GUI v__VERSION__"
+          releaseName: "RoN Mod Manager v__VERSION__"
           releaseBody: "Importing now supports rar files"
           includeUpdaterJson: true
           releaseDraft: false
