@@ -160,7 +160,7 @@ jobs:
         with:
           tagName: ${{ steps.release_tag.outputs.value }}
           releaseName: "Vencord Installer GUI v__VERSION__"
-          releaseBody: "Fix pak files not being supported for importing"
+          releaseBody: "Importing now supports rar files"
           includeUpdaterJson: true
           releaseDraft: false
           prerelease: false
