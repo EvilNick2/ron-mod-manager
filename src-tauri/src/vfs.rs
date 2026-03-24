@@ -110,10 +110,19 @@ pub async fn install_mod_archive(app_handle: tauri::AppHandle, archive_path: Str
     let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
 
     if extension == "pak" {
+        // Just copy the pak file directly
         let file_name = path.file_name().ok_or("Invalid file name")?;
         let outpath = target_dir.join(file_name);
         std::fs::copy(&archive_path, &outpath).map_err(|e| format!("Failed to copy .pak file: {}", e))?;
+    } else if extension == "rar" {
+        // Correct API for rar crate 0.4
+        rar::Archive::extract_all(
+            &archive_path, 
+            &target_dir.to_string_lossy(), 
+            ""
+        ).map_err(|e| format!("Failed to extract RAR: {:?}", e))?;
     } else {
+        // Assume it's a zip and extract
         let file = std::fs::File::open(&archive_path).map_err(|e| format!("Failed to open archive: {}", e))?;
         let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("Invalid zip archive: {}", e))?;
         
@@ -226,8 +235,8 @@ pub async fn toggle_mod(app_handle: tauri::AppHandle, mod_id: String, enable: bo
 #[tauri::command]
 pub async fn pick_mod_archive() -> Result<Option<String>, String> {
     let result = rfd::AsyncFileDialog::new()
-        .set_title("Select Mod Archive (.zip, .pak)")
-        .add_filter("Mod Archives", &["zip", "pak"])
+        .set_title("Select Mod Archive (.zip, .pak, .rar)")
+        .add_filter("Mod Archives", &["zip", "pak", "rar"])
         .pick_file()
         .await;
         

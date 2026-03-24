@@ -29,5 +29,6 @@ uuid = { version = "1", features = ["v4", "fast-rng"] }
 reqwest = { version = "0.11", features = ["json", "stream"] }
 rfd = "0.14"
 zip = "8.3.1"
+rar = "0.4"
 base64 = "0.22"
 keyring = "2"
