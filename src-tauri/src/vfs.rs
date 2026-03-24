@@ -106,24 +106,33 @@ pub async fn install_mod_archive(app_handle: tauri::AppHandle, archive_path: Str
     }
     std::fs::create_dir_all(&target_dir).map_err(|e| format!("Failed to create mod directory: {}", e))?;
     
-    let file = std::fs::File::open(&archive_path).map_err(|e| format!("Failed to open zip: {}", e))?;
-    let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("Invalid zip archive: {}", e))?;
-    
-    for i in 0..archive.len() {
-        let mut file = archive.by_index(i).map_err(|e| e.to_string())?;
-        let outpath = match file.enclosed_name() {
-            Some(path) => target_dir.join(path),
-            None => continue,
-        };
+    let path = std::path::Path::new(&archive_path);
+    let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+
+    if extension == "pak" {
+        let file_name = path.file_name().ok_or("Invalid file name")?;
+        let outpath = target_dir.join(file_name);
+        std::fs::copy(&archive_path, &outpath).map_err(|e| format!("Failed to copy .pak file: {}", e))?;
+    } else {
+        let file = std::fs::File::open(&archive_path).map_err(|e| format!("Failed to open archive: {}", e))?;
+        let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("Invalid zip archive: {}", e))?;
         
-        if file.is_dir() {
-            std::fs::create_dir_all(&outpath).ok();
-        } else {
-            if let Some(p) = outpath.parent() {
-                std::fs::create_dir_all(p).ok();
+        for i in 0..archive.len() {
+            let mut file = archive.by_index(i).map_err(|e| e.to_string())?;
+            let outpath = match file.enclosed_name() {
+                Some(path) => target_dir.join(path),
+                None => continue,
+            };
+            
+            if file.is_dir() {
+                std::fs::create_dir_all(&outpath).ok();
+            } else {
+                if let Some(p) = outpath.parent() {
+                    std::fs::create_dir_all(p).ok();
+                }
+                let mut outfile = std::fs::File::create(&outpath).map_err(|_| "Failed to create extracted file")?;
+                std::io::copy(&mut file, &mut outfile).map_err(|_| "Failed to write extracted file")?;
             }
-            let mut outfile = std::fs::File::create(&outpath).map_err(|_| "Failed to create extracted file")?;
-            std::io::copy(&mut file, &mut outfile).map_err(|_| "Failed to write extracted file")?;
         }
     }
     
