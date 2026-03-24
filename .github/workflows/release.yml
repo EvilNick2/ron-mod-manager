@@ -1,0 +1,230 @@
+name: Release and Update
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+    branches:
+      - main
+    paths:
+      - package.json
+      - src-tauri/tauri.conf.json
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  determine-version:
+    runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.check.outputs.should_release }}
+      release_version: ${{ steps.check.outputs.release_version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for version bump
+        id: check
+        run: |
+          new_pkg_version=$(jq -r '.version' package.json)
+          new_tauri_version=$(jq -r '.version' src-tauri/tauri.conf.json)
+
+          if [[ "$new_pkg_version" != "$new_tauri_version" ]]; then
+            echo "package.json and tauri.conf.json version fields diverged; cannot determine release version." >&2
+            exit 1
+          fi
+
+          if [[ "${GITHUB_EVENT_NAME}" != "push" ]]; then
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+            echo "release_version=$new_tauri_version" >> "$GITHUB_OUTPUT"
+            echo "Manual trigger detected; releasing current version $new_tauri_version."
+            exit 0
+          fi
+
+          changed_files=$(git diff --name-only HEAD^..HEAD -- package.json src-tauri/tauri.conf.json || true)
+          if [[ -z "$changed_files" ]]; then
+            echo "No version files changed; skipping release."
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          old_pkg_version=$(git show HEAD^:package.json 2>/dev/null | jq -r '.version' 2>/dev/null || "")
+          old_tauri_version=$(git show HEAD^:src-tauri/tauri.conf.json 2>/dev/null | jq -r '.version' 2>/dev/null || "")
+
+          pkg_bumped=$([[ "$new_pkg_version" != "$old_pkg_version" ]] && echo true || echo false)
+          tauri_bumped=$([[ "$new_tauri_version" != "$old_tauri_version" ]] && echo true || echo false)
+
+          if [[ "$pkg_bumped" != true && "$tauri_bumped" != true ]]; then
+            echo "Version fields unchanged; skipping release."
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "$pkg_bumped" == true && "$tauri_bumped" == true && "$new_pkg_version" != "$new_tauri_version" ]]; then
+            echo "package.json and tauri.conf.json version fields diverged; cannot determine release version." >&2
+            exit 1
+          fi
+
+          release_version=$([[ "$tauri_bumped" == true ]] && echo "$new_tauri_version" || echo "$new_pkg_version")
+          echo "should_release=true" >> "$GITHUB_OUTPUT"
+          echo "release_version=$release_version" >> "$GITHUB_OUTPUT"
+          echo "Detected version bump to $release_version."
+
+  build-and-release:
+    needs: determine-version
+    if: needs.determine-version.outputs.should_release == 'true'
+    outputs:
+      release_tag: ${{ steps.release_tag.outputs.value }}
+    strategy:
+      fail-fast: false
+      # max-parallel: 1
+      matrix:
+        platform: [macos-latest, ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          workspaces: ./src-tauri
+
+      - name: Create version tag
+        if: github.event_name == 'push' && matrix.platform == 'ubuntu-latest'
+        env:
+          RELEASE_VERSION: ${{ needs.determine-version.outputs.release_version }}
+        run: |
+          if git rev-parse -q --verify "refs/tags/v${RELEASE_VERSION}" >/dev/null; then
+            echo "Tag v${RELEASE_VERSION} already exists; skipping creation."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag "v${RELEASE_VERSION}"
+          git push origin "v${RELEASE_VERSION}"
+
+      - name: Set release tag
+        id: release_tag
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            echo "value=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          elif [[ -n "${{ needs.determine-version.outputs.release_version }}" ]]; then
+            echo "value=v${{ needs.determine-version.outputs.release_version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "Unable to determine release tag." >&2
+            exit 1
+          fi
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: >-
+          sudo apt-get update &&
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev
+          build-essential libssl-dev libgtk-3-dev libayatana-appindicator3-dev
+          librsvg2-dev
+
+      - name: Build and publish with Tauri
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ steps.release_tag.outputs.value }}
+          releaseName: "Vencord Installer GUI v__VERSION__"
+          releaseBody: "Fix untrusted mount point error in install workflow"
+          includeUpdaterJson: true
+          releaseDraft: false
+          prerelease: false
+
+  publish-updates:
+    name: Publish updater manifest
+    needs:
+      - build-and-release
+      - determine-version
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Download latest.json from release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p updater
+          tag="${{ needs.build-and-release.outputs.release_tag || github.ref_name }}"
+          echo "Downloading latest.json from release tag: $tag"
+          gh release download "$tag" \
+            -R "${{ github.repository }}" \
+            -p latest.json \
+            -D updater
+
+      - name: Upload updater manifest
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: updater
+
+      - name: Deploy updater manifest to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Remove latest.json and .sig files from release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ needs.build-and-release.outputs.release_tag || github.ref_name }}"
+          echo "Cleaning assets for release tag: $tag"
+
+          release_json=$(gh api "repos/${{ github.repository }}/releases/tags/$tag")
+
+          asset_ids=$(echo "$release_json" | jq -r '
+            .assets[]
+            | select(
+                .name == "latest.json"
+                or ((.name // "") | endswith(".sig"))
+              )
+            | .id
+          ')
+
+          if [ -z "$asset_ids" ]; then
+            echo "No deletable assets found."
+            exit 0
+          fi
+
+          echo "Deleting assets:"
+          echo "$asset_ids"
+
+          for id in $asset_ids; do
+            gh api "repos/${{ github.repository }}/releases/assets/$id" -X DELETE
+            echo "Deleted asset ID: $id"
+          done
+
+          echo "Cleanup complete."
