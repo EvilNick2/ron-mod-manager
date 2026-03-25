@@ -2,6 +2,7 @@
 import { store } from "../store";
 import { invoke } from "@tauri-apps/api/core";
 import { ref, computed } from "vue";
+import { ExternalLink, Download, PackageSearch, X } from 'lucide-vue-next';
 
 const isToggling = ref(false);
 const errorMsg = ref("");
@@ -65,7 +66,9 @@ const cleanDescription = computed(() => {
   <aside class="right-panel" v-if="store.selectedMod">
     <div class="panel-header">
       <h2>{{ store.selectedMod.name }}</h2>
-      <a href="#" class="external-link">↗</a>
+      <a href="#" class="external-link" title="View on Nexus Mods">
+        <ExternalLink :size="18" color="#3b82f6" />
+      </a>
     </div>
     
     <img 
@@ -123,7 +126,7 @@ const cleanDescription = computed(() => {
           style="border-color: #3b82f6; background: rgba(59, 130, 246, 0.1);"
           @click="downloadOnlineMod"
         >
-          <span class="icon" style="font-size: 1.2rem; margin-right: 0.5rem;">📥</span>
+          <Download :size="18" color="#3b82f6" />
           Download via Browser
         </button>
         
@@ -143,15 +146,17 @@ const cleanDescription = computed(() => {
   
   <aside class="right-panel empty-panel" v-else>
     <div style="text-align:center; color: var(--text-muted); opacity: 0.5;">
-      <span style="font-size: 3rem; display:block; margin-bottom:1rem;">📌</span>
-      Select a mod from the grid to view details.
+      <PackageSearch :size="48" color="#94a3b8" style="margin-bottom: 1rem;" />
+      <p>Select a mod from the grid to view details.</p>
     </div>
   </aside>
 
   <teleport to="body">
     <transition name="fade">
       <div v-if="isImageEnlarged && store.selectedMod" class="lightbox-overlay" @click="isImageEnlarged = false">
-        <button class="lightbox-close">×</button>
+        <button class="lightbox-close">
+          <X :size="24" color="#ffffff" />
+        </button>
         <img :src="store.selectedMod.thumbnail_url || 'https://images.unsplash.com/photo-1579566346927-c68383817a25?auto=format&fit=crop&q=80&w=1200&h=800'" class="lightbox-img" @click.stop />
       </div>
     </transition>

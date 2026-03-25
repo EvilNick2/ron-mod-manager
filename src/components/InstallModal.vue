@@ -2,6 +2,7 @@
 import { store } from "../store";
 import { invoke } from "@tauri-apps/api/core";
 import { ref, watch } from "vue";
+import { Archive, FileArchive, FolderOpen } from 'lucide-vue-next';
 
 const nexusInput = ref("");
 const isInstalling = ref(false);
@@ -79,14 +80,16 @@ async function browseForArchive() {
       <h2 class="modal-title">Install Mod Archive</h2>
       
       <div v-if="store.installingModPath" class="archive-info">
-        <span class="icon">📦</span>
+        <Archive :size="18" color="#f59e0b" />
         <code>{{ store.installingModPath }}</code>
       </div>
       
       <div v-else class="archive-info drop-pulse" style="border-style: dashed; justify-content: center; color: var(--text-muted); flex-direction: column; align-items: center; gap: 0.75rem;">
-        <span class="icon" style="font-size: 1.5rem">📥</span>
+        <FileArchive :size="32" color="#3b82f6" class="icon" />
         <span>Drop .zip file here or browse</span>
-        <button class="browse-btn" @click="browseForArchive">📂 Browse for .zip</button>
+        <button class="browse-btn" @click="browseForArchive">
+          <FolderOpen :size="14" color="#fbbf24" /> Browse for archive
+        </button>
       </div>
 
       <p class="install-desc" v-if="store.installingModPath">

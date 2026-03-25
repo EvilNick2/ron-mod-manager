@@ -2,6 +2,7 @@
 import { store } from "../store";
 import { invoke } from "@tauri-apps/api/core";
 import { onMounted, ref, computed } from "vue";
+import { Search, Plus, RefreshCw, X } from 'lucide-vue-next';
 
 const searchQuery = ref("");
 const activeCategory = ref("All");
@@ -148,16 +149,16 @@ async function refreshMods() {
   <main class="main-content">
     <header class="top-bar">
       <div class="search-container">
-        <span class="search-icon">🔍</span>
+        <Search class="search-icon" :size="18" color="#94a3b8" />
         <input type="text" placeholder="Search mods..." class="search-bar" v-model="searchQuery" />
       </div>
       
       <button class="btn add-mod-btn" @click="manualPickArchive" title="Install from .zip archive">
-        <span class="icon">➕</span> Add Mod
+        <Plus :size="18" color="#22c55e" /> Add Mod
       </button>
 
       <button class="btn" @click="refreshMods" title="Refresh Mod List" style="margin-left: auto;">
-        <span class="icon">🔄</span> Refresh
+        <RefreshCw :size="18" color="#3b82f6" /> Refresh
       </button>
     </header>
 
@@ -188,7 +189,9 @@ async function refreshMods() {
         <div class="mod-info">
           <h3>{{ mod.name }}</h3>
         </div>
-        <button v-if="!mod.is_online" class="delete-mod" @click.stop="removeMod(mod)" title="Remove Mod Completely">×</button>
+        <button v-if="!mod.is_online" class="delete-mod" @click.stop="removeMod(mod)" title="Remove Mod Completely">
+          <X :size="16" color="#ffffff" />
+        </button>
       </div>
       
       <button 

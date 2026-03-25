@@ -2,6 +2,15 @@
 import { onMounted } from 'vue';
 import { invoke } from "@tauri-apps/api/core";
 import { store } from "../store";
+import { 
+  Package, 
+  Globe, 
+  Settings, 
+  Download, 
+  Upload, 
+  Save, 
+  X 
+} from 'lucide-vue-next';
 
 async function loginNexus() {
   try {
@@ -154,14 +163,14 @@ async function fetchOnlineMods() {
           :class="{ active: store.currentMode === 'Installed' }"
           @click="store.currentMode = 'Installed'"
         >
-          <span class="icon">📥</span> Installed
+          <Package :size="18" color="#3b82f6" /> Installed
         </button>
         <button 
           class="mode-btn online-btn" 
           :class="{ active: store.currentMode === 'Online' }"
           @click="store.currentMode = 'Online'; fetchOnlineMods()"
         >
-          <span class="icon">🌐</span> Online
+          <Globe :size="18" color="#10b981" /> Online
         </button>
       </div>
     </div>
@@ -183,18 +192,22 @@ async function fetchOnlineMods() {
             {{ name }}
             <span class="preset-count">{{ ids.length }}</span>
           </button>
-          <button class="preset-action-btn" @click="exportPreset(name as string)" title="Export Preset to .zip">📤</button>
-          <button class="preset-delete-btn preset-action-btn" @click="removePreset(name as string)" title="Delete Preset">×</button>
+          <button class="preset-action-btn" @click="exportPreset(name as string)" title="Export Preset to .zip">
+            <Upload :size="14" color="#f59e0b" />
+          </button>
+          <button class="preset-delete-btn preset-action-btn" @click="removePreset(name as string)" title="Delete Preset">
+            <X :size="14" color="#ef4444" />
+          </button>
         </div>
       </div>
       <p v-else class="preset-empty">No presets saved yet.</p>
       
       <div class="preset-buttons" style="display: flex; gap: 0.5rem;">
         <button class="full-btn secondary-btn preset-save-btn" @click="saveCurrentPreset" style="flex: 1;">
-          💾 Save
+          <Save :size="16" color="#3b82f6" /> Save
         </button>
         <button class="full-btn secondary-btn preset-save-btn" @click="importPreset" style="flex: 1;" title="Import from .zip">
-          📥 Import
+          <Download :size="16" color="#3b82f6" /> Import
         </button>
       </div>
     </div>
@@ -207,8 +220,8 @@ async function fetchOnlineMods() {
         Nexus Mods Linked
       </button>
       
-      <button class="full-btn secondary-btn" @click="store.isSettingsOpen = true">
-        <span class="icon">⚙️</span> Settings
+      <button class="full-btn secondary-btn settings-btn" @click="store.isSettingsOpen = true">
+        <Settings :size="18" color="#94a3b8" /> Settings
       </button>
     </div>
   </aside>
@@ -345,6 +358,13 @@ async function fetchOnlineMods() {
   background: var(--bg-hover);
 }
 
+.settings-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+}
+
 .nexus-login {
   background: #2563eb;
   border-color: #3b82f6;
@@ -439,5 +459,9 @@ async function fetchOnlineMods() {
 
 .preset-save-btn {
   font-size: 0.8rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
 }
 </style>

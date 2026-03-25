@@ -2,6 +2,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { store } from "../store";
 import { onMounted, ref } from "vue";
+import { X, Globe, Crosshair, Info } from 'lucide-vue-next';
 
 const activeTab = ref("Global");
 const pendingGamePath = ref("");
@@ -99,22 +100,24 @@ async function toggleBlur(state: boolean) {
 <template>
   <div v-if="store.isSettingsOpen" class="modal-overlay" @click.self="store.isSettingsOpen = false">
     <div class="settings-modal">
-      <button class="close-btn" @click="store.isSettingsOpen = false">✕</button>
+      <button class="close-btn" @click="store.isSettingsOpen = false">
+        <X :size="20" color="#94a3b8" />
+      </button>
       <h2 class="modal-title">Settings</h2>
       
       <div class="settings-tabs">
         <button class="tab-btn" :class="{ active: activeTab === 'Global' }" @click="activeTab = 'Global'">
-          <span class="icon">🌐</span> Global
+          <Globe :size="18" color="#3b82f6" /> Global
         </button>
         <button class="tab-btn" :class="{ active: activeTab === 'Ready or Not' }" @click="activeTab = 'Ready or Not'">
-          <span class="icon">🔫</span> Ready or Not
+          <Crosshair :size="18" color="#ef4444" /> Ready or Not
         </button>
       </div>
 
       <div class="settings-content">
         <template v-if="activeTab === 'Global'">
           <div class="settings-section col-span-full">
-            <h3>Local Mod Storage Location ℹ️</h3>
+            <h3>Local Mod Storage Location <Info :size="14" color="#3b82f6" class="info-icon" /></h3>
             <p class="settings-desc">Select the master folder where mods are saved. A `ReadyOrNot` child folder is generated here automatically.</p>
             <div class="path-picker-row">
               <button class="action-btn" @click="pickStorageFolder">Change</button>
@@ -123,7 +126,7 @@ async function toggleBlur(state: boolean) {
           </div>
           
           <div class="settings-section">
-            <h3>Nexus Mods API Configuration ℹ️</h3>
+            <h3>Nexus Mods API Configuration <Info :size="14" color="#3b82f6" class="info-icon" /></h3>
             <p class="settings-desc" style="margin-bottom: 1rem;">Your API Key is actively stored and securely managed. Re-login from sidebar to update.</p>
             <div class="api-key-box">
               <code v-if="store.apiKeyStore">{{ store.apiKeyStore.substring(0, 15) }}...*****************</code>
@@ -132,7 +135,7 @@ async function toggleBlur(state: boolean) {
           </div>
 
           <div class="settings-section">
-            <h3>Modal Background Appearance ℹ️</h3>
+            <h3>Modal Background Appearance <Info :size="14" color="#3b82f6" class="info-icon" /></h3>
             <p class="settings-desc" style="margin-bottom: 1rem;">Toggle the cinematic gaussian blur effect when overlay menus are open.</p>
             <div class="settings-tabs" style="margin-bottom: 0;">
               <button class="tab-btn" :class="{ active: store.isBlurEnabled }" @click="toggleBlur(true)">Blur Enabled</button>
@@ -143,7 +146,7 @@ async function toggleBlur(state: boolean) {
 
         <template v-if="activeTab === 'Ready or Not'">
           <div class="settings-section col-span-full">
-            <h3>Game Installation Path ℹ️</h3>
+            <h3>Game Installation Path <Info :size="14" color="#3b82f6" class="info-icon" /></h3>
             <p class="settings-desc">Select the folder where Ready Or Not is installed (contains Paks/mods).</p>
             <div class="path-picker-row" style="margin-bottom: 1rem;">
               <input type="text" v-model="pendingGamePath" placeholder="C:\Program Files (x86)\... or /home/..." class="path-input" />
@@ -319,5 +322,23 @@ async function toggleBlur(state: boolean) {
   font-size: 0.85rem;
   color: var(--text-main);
   word-break: break-all;
+}
+
+h3 {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.info-icon {
+  color: var(--accent-primary);
+  opacity: 0.7;
+}
+
+.tab-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
 }
 </style>
