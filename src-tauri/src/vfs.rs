@@ -4,6 +4,12 @@ use serde::{Serialize, Deserialize};
 use tauri::{AppHandle, Manager};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct AddonInfo {
+    pub filename: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ModInfo {
     pub id: String,
     pub name: String,
@@ -12,6 +18,7 @@ pub struct ModInfo {
     pub author: String,
     pub thumbnail_url: Option<String>,
     pub enabled: bool,
+    pub addons: Vec<AddonInfo>,
 }
 
 pub fn get_mods_dir(app_handle: &AppHandle) -> Result<PathBuf, String> {
@@ -56,6 +63,7 @@ pub async fn scan_local_mods(app_handle: tauri::AppHandle) -> Result<Vec<ModInfo
                     author: "Unknown".to_string(),
                     thumbnail_url: None,
                     enabled: false,
+                    addons: Vec::new(),
                 };
 
                 if let Ok(content) = fs::read_to_string(&metadata_path) {
@@ -84,6 +92,31 @@ pub async fn scan_local_mods(app_handle: tauri::AppHandle) -> Result<Vec<ModInfo
 
                         if let Some(enabled) = parsed.get("enabled").and_then(|e| e.as_bool()) {
                             info.enabled = enabled;
+                        }
+                    }
+                }
+                
+                let addons_dir = path.join("addons");
+                if addons_dir.exists() && addons_dir.is_dir() {
+                    if let Ok(addon_entries) = fs::read_dir(&addons_dir) {
+                        for addon_entry in addon_entries.filter_map(Result::ok) {
+                            let ap = addon_entry.path();
+                            if ap.is_file() {
+                                let ext = ap.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+                                if ext == "pak" {
+                                    let filename = ap.file_name().unwrap().to_string_lossy().to_string();
+                                    let addon_enabled = if let Ok(content) = fs::read_to_string(&metadata_path) {
+                                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content) {
+                                            parsed.get("addons")
+                                                .and_then(|a| a.get(&filename))
+                                                .and_then(|a| a.get("enabled"))
+                                                .and_then(|e| e.as_bool())
+                                                .unwrap_or(false)
+                                        } else { false }
+                                    } else { false };
+                                    info.addons.push(AddonInfo { filename, enabled: addon_enabled });
+                                }
+                            }
                         }
                     }
                 }
@@ -200,6 +233,9 @@ pub async fn toggle_mod(app_handle: tauri::AppHandle, mod_id: String, enable: bo
             for entry in entries.filter_map(Result::ok) {
                 let path = entry.path();
                 if path.is_dir() {
+                    if path.file_name().and_then(|n| n.to_str()) == Some("addons") {
+                        continue;
+                    }
                     find_paks(&path, paks);
                 } else if path.is_file() {
                     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
@@ -237,7 +273,44 @@ pub async fn toggle_mod(app_handle: tauri::AppHandle, mod_id: String, enable: bo
                 obj.insert("enabled".to_string(), serde_json::Value::Bool(enable));
             }
             if let Ok(json_str) = serde_json::to_string_pretty(&parsed) {
-                std::fs::write(metadata_path, json_str).ok();
+                std::fs::write(&metadata_path, json_str).ok();
+            }
+        }
+    }
+    
+    let addons_dir = target_dir.join("addons");
+    if addons_dir.exists() {
+        if let Ok(entries) = std::fs::read_dir(&addons_dir) {
+            for entry in entries.filter_map(Result::ok) {
+                let ap = entry.path();
+                if ap.is_file() {
+                    let ext = ap.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+                    if ext == "pak" {
+                        let fname = ap.file_name().unwrap().to_string_lossy().to_string();
+                        let link_name = format!("{}_addon_{}", mod_id, fname);
+                        let link_path = paks_mod_dir.join(&link_name);
+                        
+                        if !enable {
+                            if link_path.exists() {
+                                std::fs::remove_file(&link_path).ok();
+                            }
+                        } else {
+                            let addon_enabled = if let Ok(content) = std::fs::read_to_string(&metadata_path) {
+                                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content) {
+                                    parsed.get("addons")
+                                        .and_then(|a| a.get(&fname))
+                                        .and_then(|a| a.get("enabled"))
+                                        .and_then(|e| e.as_bool())
+                                        .unwrap_or(false)
+                                } else { false }
+                            } else { false };
+                            
+                            if addon_enabled && !link_path.exists() {
+                                create_link(&ap, &link_path).ok();
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -445,3 +518,165 @@ pub async fn toggle_all_mods(app_handle: tauri::AppHandle, enable: bool) -> Resu
     Ok(())
 }
 
+#[tauri::command]
+pub async fn install_addon(app_handle: tauri::AppHandle, mod_id: String, archive_path: String) -> Result<Vec<String>, String> {
+    let mods_dir = get_mods_dir(&app_handle)?;
+    let mod_dir = mods_dir.join(&mod_id);
+    let addons_dir = mod_dir.join("addons");
+    std::fs::create_dir_all(&addons_dir).map_err(|e| format!("Failed to create addons directory: {}", e))?;
+    
+    let path = std::path::Path::new(&archive_path);
+    let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    let mut added_files: Vec<String> = Vec::new();
+    
+    if extension == "pak" {
+        let file_name = path.file_name().ok_or("Invalid file name")?;
+        let outpath = addons_dir.join(file_name);
+        std::fs::copy(&archive_path, &outpath).map_err(|e| format!("Failed to copy addon .pak: {}", e))?;
+        added_files.push(file_name.to_string_lossy().to_string());
+    } else if extension == "zip" {
+        let file = std::fs::File::open(&archive_path).map_err(|e| format!("Failed to open archive: {}", e))?;
+        let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("Invalid zip archive: {}", e))?;
+        
+        for i in 0..archive.len() {
+            let mut file = archive.by_index(i).map_err(|e| e.to_string())?;
+            if file.is_dir() { continue; }
+            
+            let fname = match file.enclosed_name() {
+                Some(p) => p.file_name().unwrap_or_default().to_string_lossy().to_string(),
+                None => continue,
+            };
+            
+            let ext = std::path::Path::new(&fname).extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+            if ext == "pak" {
+                let outpath = addons_dir.join(&fname);
+                let mut outfile = std::fs::File::create(&outpath).map_err(|e| format!("Failed to create addon file: {}", e))?;
+                std::io::copy(&mut file, &mut outfile).map_err(|e| format!("Failed to extract addon: {}", e))?;
+                added_files.push(fname);
+            }
+        }
+    } else if extension == "rar" {
+        rar::Archive::extract_all(
+            &archive_path,
+            &addons_dir.to_string_lossy(),
+            ""
+        ).map_err(|e| format!("Failed to extract RAR: {:?}", e))?;
+        
+        if let Ok(entries) = std::fs::read_dir(&addons_dir) {
+            for entry in entries.filter_map(Result::ok) {
+                let p = entry.path();
+                if p.is_file() {
+                    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+                    if ext == "pak" {
+                        added_files.push(p.file_name().unwrap().to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+    } else {
+        return Err(format!("Unsupported addon format: .{}", extension));
+    }
+    
+    let metadata_path = mod_dir.join("metadata.json");
+    if let Ok(content) = std::fs::read_to_string(&metadata_path) {
+        if let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(&content) {
+            let addons_obj = parsed.as_object_mut()
+                .unwrap()
+                .entry("addons")
+                .or_insert_with(|| serde_json::json!({}));
+            
+            if let Some(obj) = addons_obj.as_object_mut() {
+                for fname in &added_files {
+                    obj.insert(fname.clone(), serde_json::json!({ "enabled": false }));
+                }
+            }
+            
+            if let Ok(json_str) = serde_json::to_string_pretty(&parsed) {
+                std::fs::write(&metadata_path, json_str).ok();
+            }
+        }
+    }
+    
+    Ok(added_files)
+}
+
+fn get_paks_dir(app_handle: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let config = crate::config::load_config(app_handle.clone()).map_err(|e| e.to_string())?;
+    let game_path_str = config.game_path.ok_or("Game installation path is not set!")?;
+    let mut paks_dir = PathBuf::from(game_path_str);
+    if !paks_dir.ends_with("Paks") {
+        paks_dir.push("ReadyOrNot");
+        paks_dir.push("Content");
+        paks_dir.push("Paks");
+    }
+    Ok(paks_dir)
+}
+
+#[tauri::command]
+pub async fn toggle_addon(app_handle: tauri::AppHandle, mod_id: String, filename: String, enable: bool) -> Result<(), String> {
+    let mods_dir = get_mods_dir(&app_handle)?;
+    let mod_dir = mods_dir.join(&mod_id);
+    let addon_path = mod_dir.join("addons").join(&filename);
+    
+    if !addon_path.exists() {
+        return Err(format!("Addon file not found: {}", filename));
+    }
+    
+    let paks_dir = get_paks_dir(&app_handle)?;
+    if enable && !paks_dir.exists() {
+        std::fs::create_dir_all(&paks_dir).map_err(|e| format!("Failed to create Paks dir: {}", e))?;
+    }
+    
+    let link_name = format!("{}_addon_{}", mod_id, filename);
+    let link_path = paks_dir.join(&link_name);
+    
+    if enable {
+        if !link_path.exists() {
+            create_link(&addon_path, &link_path).map_err(|e| format!("Failed to inject addon: {}", e))?;
+        }
+    } else {
+        if link_path.exists() {
+            std::fs::remove_file(&link_path).map_err(|e| format!("Failed to remove addon link: {}", e))?;
+        }
+    }
+    
+    let metadata_path = mod_dir.join("metadata.json");
+    if let Ok(content) = std::fs::read_to_string(&metadata_path) {
+        if let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(addons_obj) = parsed.get_mut("addons").and_then(|a| a.as_object_mut()) {
+                addons_obj.insert(filename.clone(), serde_json::json!({ "enabled": enable }));
+            }
+            if let Ok(json_str) = serde_json::to_string_pretty(&parsed) {
+                std::fs::write(&metadata_path, json_str).ok();
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn remove_addon(app_handle: tauri::AppHandle, mod_id: String, filename: String) -> Result<(), String> {
+    let _ = toggle_addon(app_handle.clone(), mod_id.clone(), filename.clone(), false).await;
+    
+    let mods_dir = get_mods_dir(&app_handle)?;
+    let addon_path = mods_dir.join(&mod_id).join("addons").join(&filename);
+    
+    if addon_path.exists() {
+        std::fs::remove_file(&addon_path).map_err(|e| format!("Failed to delete addon: {}", e))?;
+    }
+    
+    let metadata_path = mods_dir.join(&mod_id).join("metadata.json");
+    if let Ok(content) = std::fs::read_to_string(&metadata_path) {
+        if let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(addons_obj) = parsed.get_mut("addons").and_then(|a| a.as_object_mut()) {
+                addons_obj.remove(&filename);
+            }
+            if let Ok(json_str) = serde_json::to_string_pretty(&parsed) {
+                std::fs::write(&metadata_path, json_str).ok();
+            }
+        }
+    }
+    
+    Ok(())
+}

@@ -17,5 +17,6 @@ export const store = reactive({
   hasMoreOnlineMods: true,
   presets: {} as Record<string, string[]>,
   installingModPath: null as string | null,
-  awaitingDropForId: null as string | null
+  awaitingDropForId: null as string | null,
+  postInstallModId: null as string | null
 });

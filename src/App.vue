@@ -71,7 +71,7 @@ onMounted(async () => {
     <h2>Drop Mod Archive Here</h2>
   </div>
 
-  <div class="app-layout" :class="{ 'modal-open': store.isSettingsOpen || store.installingModPath, 'blur-enabled': store.isBlurEnabled }">
+  <div class="app-layout" :class="{ 'modal-open': store.isSettingsOpen || store.installingModPath || store.postInstallModId, 'blur-enabled': store.isBlurEnabled }">
     <Sidebar />
     <ModGrid />
     <RightPanel />
@@ -80,9 +80,7 @@ onMounted(async () => {
       <SettingsModal v-if="store.isSettingsOpen" />
     </transition>
 
-    <transition name="fade">
-      <InstallModal v-if="store.installingModPath || store.awaitingDropForId" />
-    </transition>
+    <InstallModal v-if="store.installingModPath || store.awaitingDropForId || store.postInstallModId" />
   </div>
 </template>
 

@@ -16,6 +16,9 @@ pub fn run() {
             config::get_default_storage_path,
             config::auto_detect_game_path,
             config::get_api_key,
+            config::save_preset,
+            config::delete_preset,
+            config::load_presets,
             api::fetch_mod_metadata,
             api::open_browser_url,
             api::open_game_path,
@@ -31,10 +34,10 @@ pub fn run() {
             vfs::apply_preset,
             vfs::export_preset,
             vfs::import_preset,
-            config::save_preset,
-            config::delete_preset,
-            config::load_presets,
-            vfs::toggle_all_mods
+            vfs::toggle_all_mods,
+            vfs::install_addon,
+            vfs::toggle_addon,
+            vfs::remove_addon
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

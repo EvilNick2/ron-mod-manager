@@ -2,11 +2,12 @@
 import { store } from "../store";
 import { invoke } from "@tauri-apps/api/core";
 import { ref, computed } from "vue";
-import { ExternalLink, Download, PackageSearch, X } from 'lucide-vue-next';
+import { ExternalLink, Download, PackageSearch, X, Plus, Puzzle, Trash2 } from 'lucide-vue-next';
 
 const isToggling = ref(false);
 const errorMsg = ref("");
 const isImageEnlarged = ref(false);
+const isAddonsExpanded = ref(true);
 
 async function toggleActiveMod() {
   if (!store.selectedMod) return;
@@ -43,6 +44,46 @@ async function downloadOnlineMod() {
     store.awaitingDropForId = store.selectedMod.id;
   } catch (e: any) {
     errorMsg.value = "Failed to launch browser: " + e;
+  }
+}
+
+async function pickAddonFile() {
+  if (!store.selectedMod) return;
+  try {
+    const file: string | null = await invoke("pick_mod_archive");
+    if (file) {
+      await invoke("install_addon", { modId: store.selectedMod.id, archivePath: file });
+      store.mods = await invoke("scan_local_mods");
+      const updated = store.mods.find((m: any) => m.id === store.selectedMod.id);
+      if (updated) store.selectedMod = updated;
+    }
+  } catch (e: any) {
+    errorMsg.value = "Failed to add addon: " + e;
+  }
+}
+
+async function toggleAddon(filename: string, enable: boolean) {
+  if (!store.selectedMod) return;
+  try {
+    await invoke("toggle_addon", { modId: store.selectedMod.id, filename, enable });
+    store.mods = await invoke("scan_local_mods");
+    const updated = store.mods.find((m: any) => m.id === store.selectedMod.id);
+    if (updated) store.selectedMod = updated;
+  } catch (e: any) {
+    errorMsg.value = "Addon toggle failed: " + e;
+  }
+}
+
+async function deleteAddon(filename: string) {
+  if (!store.selectedMod) return;
+  if (!confirm(`Remove addon "${filename}"?`)) return;
+  try {
+    await invoke("remove_addon", { modId: store.selectedMod.id, filename });
+    store.mods = await invoke("scan_local_mods");
+    const updated = store.mods.find((m: any) => m.id === store.selectedMod.id);
+    if (updated) store.selectedMod = updated;
+  } catch (e: any) {
+    errorMsg.value = "Failed to remove addon: " + e;
   }
 }
 
@@ -140,6 +181,38 @@ const cleanDescription = computed(() => {
           <span class="status-indicator"></span>
           {{ isToggling ? 'Syncing...' : (store.selectedMod.enabled ? 'Enabled (Deployed)' : 'Disabled') }}
         </button>
+      </div>
+
+      <div v-if="!store.selectedMod.is_online" class="addons-section">
+        <div class="addons-header" @click="isAddonsExpanded = !isAddonsExpanded">
+          <Puzzle :size="16" color="#f59e0b" />
+          <span>Optional Addons</span>
+          <span class="addon-count" v-if="store.selectedMod.addons?.length">{{ store.selectedMod.addons.length }}</span>
+          <span class="expand-arrow" :class="{ expanded: isAddonsExpanded }">▸</span>
+        </div>
+        
+        <div v-if="isAddonsExpanded" class="addons-list">
+          <div v-if="!store.selectedMod.addons?.length" class="no-addons">
+            No addons installed
+          </div>
+          <div v-for="addon in store.selectedMod.addons" :key="addon.filename" class="addon-row" @contextmenu.prevent="toggleAddon(addon.filename, !addon.enabled)">
+            <button 
+              class="addon-toggle" 
+              :class="{ 'addon-enabled': addon.enabled }"
+              @click="toggleAddon(addon.filename, !addon.enabled)"
+              :title="addon.enabled ? 'Disable' : 'Enable'"
+            >
+              <span class="addon-dot"></span>
+            </button>
+            <span class="addon-name">{{ addon.filename.replace('.pak', '') }}</span>
+            <button class="addon-delete" @click="deleteAddon(addon.filename)" title="Remove addon">
+              <Trash2 :size="14" color="#ef4444" />
+            </button>
+          </div>
+          <button class="add-addon-btn" @click="pickAddonFile">
+            <Plus :size="14" color="#22c55e" /> Add Addon
+          </button>
+        </div>
       </div>
     </div>
   </aside>
@@ -363,5 +436,149 @@ const cleanDescription = computed(() => {
 .lightbox-close:hover {
   background: var(--accent-primary);
   transform: scale(1.1);
+}
+
+.addons-section {
+  margin-top: 1rem;
+  padding: 0 1.5rem 1.5rem;
+}
+
+.addons-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: 0.85rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding: 0.5rem 0;
+  user-select: none;
+}
+
+.addon-count {
+  background: rgba(245, 158, 11, 0.2);
+  color: #f59e0b;
+  font-size: 0.7rem;
+  padding: 0.25rem 0.6rem;
+  border-radius: 99px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.25rem;
+  line-height: 1;
+}
+
+.expand-arrow {
+  margin-left: auto;
+  transition: transform 0.2s;
+  font-size: 0.8rem;
+}
+
+.expand-arrow.expanded {
+  transform: rotate(90deg);
+}
+
+.addons-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  margin-top: 0.25rem;
+}
+
+.no-addons {
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  opacity: 0.6;
+  padding: 0.25rem 0;
+}
+
+.addon-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.35rem 0.5rem;
+  border-radius: 6px;
+  transition: background 0.15s;
+}
+
+.addon-row:hover {
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.addon-toggle {
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 0.2rem;
+  display: flex;
+  align-items: center;
+}
+
+.addon-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  transition: all 0.2s;
+}
+
+.addon-enabled .addon-dot {
+  background: #22c55e;
+  box-shadow: 0 0 8px rgba(34, 197, 94, 0.6);
+}
+
+.addon-name {
+  flex: 1;
+  font-size: 0.85rem;
+  color: var(--text-main);
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.addon-delete {
+  background: none;
+  border: none;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s;
+  padding: 0.2rem;
+  display: flex;
+  align-items: center;
+}
+
+.addon-row:hover .addon-delete {
+  opacity: 1;
+}
+
+.addon-delete:hover {
+  transform: scale(1.15);
+}
+
+.add-addon-btn {
+  background: transparent;
+  border: 1px dashed var(--border-light);
+  color: var(--text-muted);
+  padding: 0.4rem;
+  border-radius: 6px;
+  font-size: 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.3rem;
+  margin-top: 0.25rem;
+  transition: all 0.2s;
+}
+
+.add-addon-btn:hover {
+  border-color: #22c55e;
+  background: rgba(34, 197, 94, 0.05);
+  color: var(--text-main);
 }
 </style>

@@ -2,11 +2,12 @@
 import { store } from "../store";
 import { invoke } from "@tauri-apps/api/core";
 import { ref, watch } from "vue";
-import { Archive, FileArchive, FolderOpen } from 'lucide-vue-next';
+import { Archive, FileArchive, FolderOpen, Puzzle, Trash2, Plus } from 'lucide-vue-next';
 
 const nexusInput = ref("");
 const isInstalling = ref(false);
 const errorMsg = ref("");
+const postInstallAddons = ref<string[]>([]);
 
 watch(() => store.awaitingDropForId, (newId) => {
   if (newId) {
@@ -38,26 +39,64 @@ async function startInstall() {
 
   isInstalling.value = true;
   try {
+    console.log("[InstallModal] Starting install for modId:", modId, "path:", store.installingModPath);
     await invoke("install_mod_archive", { 
       archivePath: store.installingModPath, 
       modId: modId
     });
     
+    console.log("[InstallModal] Install succeeded, scanning mods...");
     store.mods = await invoke("scan_local_mods");
     
+    console.log("[InstallModal] Setting postInstallModId to:", modId);
+    store.postInstallModId = modId;
     store.installingModPath = null;
     store.awaitingDropForId = null;
     nexusInput.value = "";
   } catch(e: any) {
-    errorMsg.value = e;
+    console.error("[InstallModal] Install failed:", e);
+    errorMsg.value = typeof e === 'string' ? e : JSON.stringify(e);
   } finally {
     isInstalling.value = false;
+  }
+}
+
+function finishInstall() {
+  store.postInstallModId = null;
+  postInstallAddons.value = [];
+  errorMsg.value = "";
+}
+
+async function pickPostInstallAddon() {
+  if (!store.postInstallModId) return;
+  try {
+    const file: string | null = await invoke("pick_mod_archive");
+    if (file) {
+      const added: string[] = await invoke("install_addon", { modId: store.postInstallModId, archivePath: file });
+      postInstallAddons.value = [...postInstallAddons.value, ...added];
+      store.mods = await invoke("scan_local_mods");
+    }
+  } catch (e: any) {
+    errorMsg.value = "Failed to add addon: " + e;
+  }
+}
+
+async function removePostInstallAddon(filename: string) {
+  if (!store.postInstallModId) return;
+  try {
+    await invoke("remove_addon", { modId: store.postInstallModId, filename });
+    postInstallAddons.value = postInstallAddons.value.filter(f => f !== filename);
+    store.mods = await invoke("scan_local_mods");
+  } catch (e: any) {
+    errorMsg.value = "Failed to remove addon: " + e;
   }
 }
 
 function cancelInstall() {
   store.installingModPath = null;
   store.awaitingDropForId = null;
+  store.postInstallModId = null;
+  postInstallAddons.value = [];
   nexusInput.value = "";
   errorMsg.value = "";
 }
@@ -75,8 +114,37 @@ async function browseForArchive() {
 </script>
 
 <template>
-  <div v-if="store.installingModPath || store.awaitingDropForId" class="modal-overlay">
-    <div class="install-modal" :class="{ 'waiting-pulse': store.awaitingDropForId && !store.installingModPath }">
+  <div v-if="store.installingModPath || store.awaitingDropForId || store.postInstallModId" class="modal-overlay">
+    
+    <div v-if="store.postInstallModId" class="install-modal">
+      <h2 class="modal-title">Add Optional Files?</h2>
+      
+      <p class="install-desc">
+        Mod installed successfully! You can now add optional addon files (.pak or .zip).
+      </p>
+      
+      <div class="addons-post-list" v-if="postInstallAddons.length">
+        <div v-for="fname in postInstallAddons" :key="fname" class="addon-post-row">
+          <Puzzle :size="14" color="#f59e0b" />
+          <span class="addon-post-name">{{ fname.replace('.pak', '') }}</span>
+          <button class="addon-post-delete" @click="removePostInstallAddon(fname)">
+            <Trash2 :size="14" color="#ef4444" />
+          </button>
+        </div>
+      </div>
+      
+      <button class="add-addon-modal-btn" @click="pickPostInstallAddon">
+        <Plus :size="16" color="#22c55e" /> Browse for Addon
+      </button>
+      
+      <div v-if="errorMsg" class="error-msg">{{ errorMsg }}</div>
+      
+      <div class="modal-actions">
+        <button class="primary-btn" @click="finishInstall">Done</button>
+      </div>
+    </div>
+    
+    <div v-else class="install-modal" :class="{ 'waiting-pulse': store.awaitingDropForId && !store.installingModPath }">
       <h2 class="modal-title">Install Mod Archive</h2>
       
       <div v-if="store.installingModPath" class="archive-info">
@@ -272,5 +340,67 @@ async function browseForArchive() {
 .browse-btn:hover {
   border-color: var(--accent-primary);
   background: var(--bg-hover);
+}
+
+.addons-post-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  margin-bottom: 1rem;
+}
+
+.addon-post-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  background: var(--bg-card);
+  padding: 0.6rem 0.75rem;
+  border-radius: 6px;
+  border: 1px solid var(--border-dark);
+}
+
+.addon-post-name {
+  flex: 1;
+  font-size: 0.85rem;
+  color: var(--text-main);
+  font-weight: 500;
+}
+
+.addon-post-delete {
+  background: none;
+  border: none;
+  cursor: pointer;
+  opacity: 0.5;
+  transition: opacity 0.15s;
+  display: flex;
+  align-items: center;
+}
+
+.addon-post-delete:hover {
+  opacity: 1;
+}
+
+.add-addon-modal-btn {
+  width: 100%;
+  background: transparent;
+  border: 1px dashed var(--border-light);
+  color: var(--text-muted);
+  padding: 0.75rem;
+  border-radius: 8px;
+  font-size: 0.9rem;
+  font-weight: 600;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+  transition: all 0.2s;
+}
+
+.add-addon-modal-btn:hover {
+  border-color: #22c55e;
+  background: rgba(34, 197, 94, 0.05);
+  color: var(--text-main);
 }
 </style>
