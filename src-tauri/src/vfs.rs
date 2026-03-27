@@ -195,24 +195,34 @@ pub async fn toggle_mod(app_handle: tauri::AppHandle, mod_id: String, enable: bo
         std::fs::create_dir_all(&paks_mod_dir).map_err(|e| format!("Failed to create Paks directory: {}", e))?;
     }
     
-    if let Ok(entries) = std::fs::read_dir(&target_dir) {
-        for entry in entries.filter_map(Result::ok) {
-            let path = entry.path();
-            if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("pak") {
-                let file_name = path.file_name().unwrap();
-                
-                let link_name = format!("{}_{}", mod_id, file_name.to_string_lossy());
-                let link_path = paks_mod_dir.join(&link_name);
-                
-                if enable {
-                    if !link_path.exists() {
-                        create_link(&path, &link_path).map_err(|e| format!("Failed to inject mod: {}", e))?;
-                    }
-                } else {
-                    if link_path.exists() {
-                        std::fs::remove_file(&link_path).map_err(|e| format!("Failed to remove injected mod: {}", e))?;
-                    }
+    fn find_paks(dir: &Path, paks: &mut Vec<PathBuf>) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.filter_map(Result::ok) {
+                let path = entry.path();
+                if path.is_dir() {
+                    find_paks(&path, paks);
+                } else if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("pak") {
+                    paks.push(path);
                 }
+            }
+        }
+    }
+
+    let mut paks = Vec::new();
+    find_paks(&target_dir, &mut paks);
+
+    for path in paks {
+        let file_name = path.file_name().unwrap();
+        let link_name = format!("{}_{}", mod_id, file_name.to_string_lossy());
+        let link_path = paks_mod_dir.join(&link_name);
+        
+        if enable {
+            if !link_path.exists() {
+                create_link(&path, &link_path).map_err(|e| format!("Failed to inject mod: {}", e))?;
+            }
+        } else {
+            if link_path.exists() {
+                std::fs::remove_file(&link_path).map_err(|e| format!("Failed to remove injected mod: {}", e))?;
             }
         }
     }
@@ -419,5 +429,16 @@ pub async fn import_preset(app_handle: tauri::AppHandle) -> Result<String, Strin
     crate::config::save_config(app_handle, config)?;
     
     Ok(name)
+}
+
+#[tauri::command]
+pub async fn toggle_all_mods(app_handle: tauri::AppHandle, enable: bool) -> Result<(), String> {
+    let mods = scan_local_mods(app_handle.clone()).await?;
+    for m in mods {
+        if m.enabled != enable {
+            toggle_mod(app_handle.clone(), m.id, enable).await?;
+        }
+    }
+    Ok(())
 }
 

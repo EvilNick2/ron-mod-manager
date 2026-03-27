@@ -32,7 +32,8 @@ pub fn run() {
             vfs::import_preset,
             config::save_preset,
             config::delete_preset,
-            config::load_presets
+            config::load_presets,
+            vfs::toggle_all_mods
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

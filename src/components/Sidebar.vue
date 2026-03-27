@@ -9,7 +9,9 @@ import {
   Download, 
   Upload, 
   Save, 
-  X 
+  X,
+  CheckCircle,
+  CircleOff
 } from 'lucide-vue-next';
 
 async function loginNexus() {
@@ -76,6 +78,8 @@ async function importPreset() {
     alert(`Successfully imported preset: ${importedName}`);
     await loadPresets();
     
+    await applyPreset(importedName);
+    
     const refreshed: any[] = await invoke("scan_local_mods");
     store.mods = refreshed;
   } catch (e: any) {
@@ -92,6 +96,20 @@ async function removePreset(name: string) {
     await loadPresets();
   } catch (e) {
     console.error("Failed to delete preset:", e);
+  }
+}
+
+async function bulkToggleMods(enable: boolean) {
+  store.isFetchingOnline = true;
+  try {
+    await invoke("toggle_all_mods", { enable });
+    const refreshed: any[] = await invoke("scan_local_mods");
+    store.mods = refreshed;
+  } catch (e: any) {
+    console.error("Bulk toggle failed:", e);
+    alert("Bulk Action Failed: " + e);
+  } finally {
+    store.isFetchingOnline = false;
   }
 }
 
@@ -181,6 +199,15 @@ async function fetchOnlineMods() {
         <button class="filter-btn" :class="{ active: store.activeDeploymentFilter === 'All' }" @click="store.activeDeploymentFilter = 'All'">All</button>
         <button class="filter-btn" :class="{ active: store.activeDeploymentFilter === 'Enabled' }" @click="store.activeDeploymentFilter = 'Enabled'">Enabled</button>
         <button class="filter-btn" :class="{ active: store.activeDeploymentFilter === 'Disabled' }" @click="store.activeDeploymentFilter = 'Disabled'">Disabled</button>
+      </div>
+      
+      <div class="bulk-actions" v-if="store.currentMode === 'Installed'">
+        <button class="bulk-btn" @click="bulkToggleMods(true)">
+          <CheckCircle :size="14" color="#22c55e" /> Enable All
+        </button>
+        <button class="bulk-btn" @click="bulkToggleMods(false)">
+          <CircleOff :size="14" color="#ef4444" /> Disable All
+        </button>
       </div>
     </div>
 
@@ -332,6 +359,36 @@ async function fetchOnlineMods() {
   background: var(--bg-card);
   color: var(--accent-primary);
   font-weight: 600;
+}
+
+.bulk-actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+  padding: 0 0.5rem;
+}
+
+.bulk-btn {
+  flex: 1;
+  background: transparent;
+  border: 1px solid var(--border-light);
+  color: var(--text-muted);
+  padding: 0.4rem;
+  border-radius: 6px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.3rem;
+  transition: all 0.2s;
+}
+
+.bulk-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-main);
+  border-color: var(--border-light);
 }
 
 .bottom-section {
