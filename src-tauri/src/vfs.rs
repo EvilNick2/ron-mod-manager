@@ -201,8 +201,11 @@ pub async fn toggle_mod(app_handle: tauri::AppHandle, mod_id: String, enable: bo
                 let path = entry.path();
                 if path.is_dir() {
                     find_paks(&path, paks);
-                } else if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("pak") {
-                    paks.push(path);
+                } else if path.is_file() {
+                    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+                    if ext == "pak" {
+                        paks.push(path);
+                    }
                 }
             }
         }
@@ -270,15 +273,16 @@ pub async fn delete_mod(app_handle: tauri::AppHandle, mod_id: String) -> Result<
 #[tauri::command]
 pub async fn apply_preset(app_handle: tauri::AppHandle, mod_ids: Vec<String>) -> Result<(), String> {
     let all_mods = scan_local_mods(app_handle.clone()).await?;
-    let preset_set: std::collections::HashSet<&str> = mod_ids.iter().map(|s| s.as_str()).collect();
+    let preset_set: std::collections::HashSet<String> = mod_ids.iter().cloned().collect();
     
     for m in &all_mods {
-        let should_enable = preset_set.contains(m.id.as_str());
-        if m.enabled && !should_enable {
+        if !preset_set.contains(&m.id) && m.enabled {
             toggle_mod(app_handle.clone(), m.id.clone(), false).await?;
-        } else if !m.enabled && should_enable {
-            toggle_mod(app_handle.clone(), m.id.clone(), true).await?;
         }
+    }
+    
+    for id in mod_ids {
+        toggle_mod(app_handle.clone(), id, true).await?;
     }
     
     Ok(())
@@ -413,14 +417,13 @@ pub async fn import_preset(app_handle: tauri::AppHandle) -> Result<String, Strin
         };
         
         if file.is_dir() {
-            std::fs::create_dir_all(&outpath).ok();
+            std::fs::create_dir_all(&outpath).map_err(|e| format!("Failed to create directory in preset: {}", e))?;
         } else {
             if let Some(p) = outpath.parent() {
-                std::fs::create_dir_all(p).ok();
+                std::fs::create_dir_all(p).map_err(|e| format!("Failed to create parent directory for {}: {}", outpath.display(), e))?;
             }
-            if let Ok(mut outfile) = std::fs::File::create(&outpath) {
-                std::io::copy(&mut file, &mut outfile).ok();
-            }
+            let mut outfile = std::fs::File::create(&outpath).map_err(|e| format!("Failed to create file {}: {}", outpath.display(), e))?;
+            std::io::copy(&mut file, &mut outfile).map_err(|e| format!("Failed to extract file {}: {}", outpath.display(), e))?;
         }
     }
     
