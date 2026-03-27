@@ -1,12 +1,14 @@
 mod api;
 mod config;
 mod sso;
+mod updater;
 mod vfs;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             sso::authenticate_nexus,
             config::load_config,
@@ -37,7 +39,9 @@ pub fn run() {
             vfs::toggle_all_mods,
             vfs::install_addon,
             vfs::toggle_addon,
-            vfs::remove_addon
+            vfs::remove_addon,
+            updater::check_for_app_update,
+            updater::install_app_update
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

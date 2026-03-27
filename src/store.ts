@@ -15,6 +15,17 @@ export const store = reactive({
   isFetchingOnline: false,
   onlinePageOffset: 0,
   hasMoreOnlineMods: true,
+  isUpdateModalOpen: false,
+  updateInfo: null as null | {
+    currentVersion?: string;
+    version?: string;
+    date?: string;
+    body?: string;
+  },
+  isUpdatingApp: false,
+  updateProgress: null as null | number,
+  updateError: "" as string,
+
   presets: {} as Record<string, string[]>,
   installingModPath: null as string | null,
   awaitingDropForId: null as string | null,

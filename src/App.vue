@@ -9,6 +9,7 @@ import ModGrid from "./components/ModGrid.vue";
 import RightPanel from "./components/RightPanel.vue";
 import SettingsModal from "./components/SettingsModal.vue";
 import InstallModal from "./components/InstallModal.vue";
+import UpdateModal from "./components/UpdateModal.vue";
 
 const isDragging = ref(false);
 
@@ -44,6 +45,19 @@ onMounted(async () => {
     console.error("Failed to load config on startup:", error);
   }
 
+  try {
+    const update = await invoke("check_for_app_update");
+    if (update) {
+      store.updateInfo = update as any;
+      store.isUpdateModalOpen = true;
+      store.updateError = "";
+      store.updateProgress = null;
+    }
+  } catch (e) {
+    console.error("Update check failed:", e);
+  }
+
+
   listen("tauri://drag-enter", () => (isDragging.value = true));
   listen("tauri://drag-leave", () => (isDragging.value = false));
   
@@ -71,7 +85,7 @@ onMounted(async () => {
     <h2>Drop Mod Archive Here</h2>
   </div>
 
-  <div class="app-layout" :class="{ 'modal-open': store.isSettingsOpen || store.installingModPath || store.postInstallModId, 'blur-enabled': store.isBlurEnabled }">
+  <div class="app-layout" :class="{ 'modal-open': store.isSettingsOpen || store.installingModPath || store.postInstallModId || store.isUpdateModalOpen, 'blur-enabled': store.isBlurEnabled }">
     <Sidebar />
     <ModGrid />
     <RightPanel />
@@ -81,6 +95,10 @@ onMounted(async () => {
     </transition>
 
     <InstallModal v-if="store.installingModPath || store.awaitingDropForId || store.postInstallModId" />
+
+    <transition name="fade">
+      <UpdateModal v-if="store.isUpdateModalOpen" />
+    </transition>
   </div>
 </template>
 
