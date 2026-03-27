@@ -18,6 +18,7 @@ pub fn run() {
             config::get_api_key,
             api::fetch_mod_metadata,
             api::open_browser_url,
+            api::open_game_path,
             api::fetch_trending_mods,
             api::fetch_latest_mods,
             api::search_nexus_mods,

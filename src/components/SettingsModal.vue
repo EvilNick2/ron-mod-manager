@@ -42,17 +42,12 @@ async function manualPickGame() {
   }
 }
 
-async function autoDetectGame() {
+async function openGamePath() {
   try {
-    const detected: string | null = await invoke("auto_detect_game_path");
-    if (detected) {
-      pendingGamePath.value = detected;
-    } else {
-      alert("Could not automatically locate Ready or Not across any known Steam Libraries.");
-    }
+    await invoke("open_game_path");
   } catch (e) {
-    console.error("Auto detect failed:", e);
-    alert("System restriction blocked auto-detection. Try picking manually.");
+    console.error("Failed to open game path:", e);
+    alert("Could not open folder: " + e);
   }
 }
 
@@ -150,7 +145,7 @@ async function toggleBlur(state: boolean) {
             <p class="settings-desc">Select the folder where Ready Or Not is installed (contains Paks/mods).</p>
             <div class="path-picker-row" style="margin-bottom: 1rem;">
               <input type="text" v-model="pendingGamePath" placeholder="C:\Program Files (x86)\... or /home/..." class="path-input" />
-              <button class="action-btn" @click="autoDetectGame" title="Scan default Steam directories">Auto-Detect</button>
+              <button class="action-btn" @click="openGamePath" title="Open game folder in explorer">Open Folder</button>
               <button class="action-btn" @click="manualPickGame">Browse...</button>
             </div>
             <button class="action-btn save-btn" @click="saveGamePath" :disabled="pendingGamePath === store.gamePathStore">Save Game Path</button>

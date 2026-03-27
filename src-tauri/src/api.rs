@@ -29,6 +29,24 @@ pub fn open_browser_url(app_handle: tauri::AppHandle, url: String) -> Result<(),
 }
 
 #[tauri::command]
+pub fn open_game_path(app_handle: tauri::AppHandle) -> Result<(), String> {
+    let config = crate::config::load_config(app_handle.clone()).map_err(|e| e.to_string())?;
+    if let Some(path) = config.game_path {
+        let mut paks_mod_dir = std::path::PathBuf::from(path);
+        if !paks_mod_dir.ends_with("Paks") {
+            paks_mod_dir.push("ReadyOrNot");
+            paks_mod_dir.push("Content");
+            paks_mod_dir.push("Paks");
+        }
+        
+        app_handle.opener().open_path(paks_mod_dir.to_string_lossy().to_string(), None::<&str>)
+            .map_err(|e| format!("Failed to open folder: {}", e))
+    } else {
+        Err("Game path is not set yet.".to_string())
+    }
+}
+
+#[tauri::command]
 pub async fn fetch_trending_mods(game_domain: String) -> Result<Value, String> {
     let api_key = crate::config::get_api_key()?.ok_or("No API key found. Please log in first.")?;
 
