@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import json
 import re
 from pathlib import Path
@@ -23,6 +22,22 @@ def prompt(message: str) -> str:
     if not value:
         raise SystemExit("Input cannot be empty.")
     return value
+
+def prompt_multiline(message: str) -> str:
+    print(message)
+    print("Finish by typing a single '.' on its own line.\n")
+
+    lines = []
+    while True:
+        line = input()
+        if line.strip() == ".":
+            break
+        lines.append(line)
+
+    body = "\n".join(lines).strip()
+    if not body:
+        raise SystemExit("Release notes cannot be empty.")
+    return body
 
 def update_json_version(path: Path, version: str) -> None:
     data = json.loads(path.read_text())
@@ -61,20 +76,35 @@ def update_cargo_version(path: Path, version: str) -> None:
     path.write_text("\n".join(new_lines) + "\n")
     print(f"Updated {path.relative_to(REPO_ROOT)} version to {version}")
 
-def escape_for_yaml(value: str) -> str:
-    return json.dumps(value)
+def indent_yaml_line(value: str) -> str:
+    return value if value else ""
+
+def build_release_body_block(indent: str, body: str) -> list[str]:
+    body_lines = [indent_yaml_line(line) for line in body.splitlines()]
+    output = [f"{indent}releaseBody: |-\n"]
+    output.extend(f"{indent}  {line}\n" for line in body_lines)
+    return output
 
 def update_release_body(path: Path, body: str) -> None:
-    escaped_body = escape_for_yaml(body)
     new_lines = []
     replaced = False
+    skipping_existing_block = False
+    block_indent = 0
 
     with path.open() as f:
         for line in f:
+            if skipping_existing_block:
+                current_indent = len(line) - len(line.lstrip())
+                if current_indent > block_indent or line.strip() == "":
+                    continue
+                skipping_existing_block = False
+
             if line.lstrip().startswith("releaseBody:"):
                 indent = " " * (len(line) - len(line.lstrip()))
-                new_lines.append(f"{indent}releaseBody: {escaped_body}\n")
+                block_indent = len(indent)
+                new_lines.extend(build_release_body_block(indent, body))
                 replaced = True
+                skipping_existing_block = True
             else:
                 new_lines.append(line)
 
@@ -89,7 +119,7 @@ def main() -> None:
     print("Local version bump utility\n")
     current_version = get_current_version()
     version = prompt(f"Enter the new version [{current_version}] (e.g. 1.2.3): ")
-    release_body = prompt("Enter the release notes/description: ")
+    release_body = prompt_multiline("Enter the release notes/description:")
 
     update_json_version(PACKAGE_JSON, version)
     update_json_version(PACKAGE_LOCK, version)
