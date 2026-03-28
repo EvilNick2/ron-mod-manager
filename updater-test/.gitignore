@@ -1,0 +1,12 @@
+# Ignore local updater installer binaries
+*.msi
+*.exe
+*.dmg
+*.pkg
+*.deb
+*.rpm
+*.AppImage
+*.appimage
+*.zip
+*.tar.gz
+*.sig

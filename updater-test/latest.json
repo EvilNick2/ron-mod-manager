@@ -1,0 +1,11 @@
+{
+  "version": "1.0.0",
+  "notes": "Test",
+  "pub_date": "2025-12-06T06:44:43.919Z",
+  "platforms": {
+    "windows-x86_64-nsis": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTRHBuWjVkSGMxWUtCWWdQYksrUTNrTnJ6M0hibTJTZHVmS01VT0VRNzFjdzRIUGlqUXdwc3hDVmRObVJIaERvOEs1Z3h0R205c3lRR0dVUmJSU3daM1doWEM3L3VtQ1FnPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzY1NTM3ODQxCWZpbGU6VmVuY29yZCBJbnN0YWxsZXIgR1VJXzEuMC4yX3g2NF9lbi1VUy5tc2kKaTJLNDN2U2VVZmxaTzE2c2wxdFk3UUpMbUVPS0t6c3R4U0trQ2hYY0RrSEw0MzJweDRoQ0FDZkVyK1pVQ0VXRjhTdjNwbUlCeW5hQnRRZFUvcUxaREE9PQo=",
+      "url": "http://localhost:8000/v1.0.1/RoN.Mod.Manager_1.0.2_x64-setup.exe"
+    }
+  }
+}
