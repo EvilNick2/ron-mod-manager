@@ -25,13 +25,13 @@ tauri-plugin-opener = "2"
 tauri-plugin-updater = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "io-util"] }
 tokio-tungstenite = { version = "0.21", features = ["rustls-tls-native-roots"] }
 futures-util = "0.3"
 uuid = { version = "1", features = ["v4", "fast-rng"] }
 reqwest = { version = "0.11", features = ["json", "stream"] }
 rfd = "0.14"
 zip = "8.3.1"
-rar = "0.4"
+rar-stream = { version = "5", features = ["async"] }
 base64 = "0.22"
 keyring = "2"

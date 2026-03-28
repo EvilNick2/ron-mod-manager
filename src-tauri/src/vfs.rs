@@ -1,4 +1,5 @@
 use std::fs;
+use std::sync::Arc;
 use std::path::{Path, PathBuf};
 use serde::{Serialize, Deserialize};
 use tauri::{AppHandle, Manager};
@@ -148,12 +149,27 @@ pub async fn install_mod_archive(app_handle: tauri::AppHandle, archive_path: Str
         let outpath = target_dir.join(file_name);
         std::fs::copy(&archive_path, &outpath).map_err(|e| format!("Failed to copy .pak file: {}", e))?;
     } else if extension == "rar" {
-        // Correct API for rar crate 0.4
-        rar::Archive::extract_all(
-            &archive_path, 
-            &target_dir.to_string_lossy(), 
-            ""
-        ).map_err(|e| format!("Failed to extract RAR: {:?}", e))?;
+        let media = Arc::new(rar_stream::LocalFileMedia::new(&archive_path).map_err(|e| format!("Failed to open RAR: {}", e))?);
+        let pkg = rar_stream::RarFilesPackage::new(vec![media]);
+        let files = pkg.parse(rar_stream::ParseOptions::default()).await
+            .map_err(|e| format!("Failed to parse RAR: {}", e))?;
+
+        for file in files {
+            let outpath = target_dir.join(&file.name);
+            if let Some(parent) = outpath.parent() {
+                std::fs::create_dir_all(parent).map_err(|_| "Failed to create directory in RAR")?;
+            }
+            
+            if file.name.ends_with('/') || file.name.ends_with('\\') {
+                continue;
+            }
+
+            let content = file.read_to_end().await
+                .map_err(|e| format!("Failed to read file {}: {}", file.name, e))?;
+            
+            std::fs::write(&outpath, content)
+                .map_err(|e| format!("Failed to write extracted file {}: {}", file.name, e))?;
+        }
     } else {
         // Assume it's a zip and extract
         let file = std::fs::File::open(&archive_path).map_err(|e| format!("Failed to open archive: {}", e))?;
@@ -560,11 +576,28 @@ pub async fn install_addon(app_handle: tauri::AppHandle, mod_id: String, archive
             }
         }
     } else if extension == "rar" {
-        rar::Archive::extract_all(
-            &archive_path,
-            &addons_dir.to_string_lossy(),
-            ""
-        ).map_err(|e| format!("Failed to extract RAR: {:?}", e))?;
+        let media = Arc::new(rar_stream::LocalFileMedia::new(&archive_path)
+            .map_err(|e| format!("Failed to open RAR: {}", e))?);
+        let pkg = rar_stream::RarFilesPackage::new(vec![media]);
+        let files = pkg.parse(rar_stream::ParseOptions::default()).await
+            .map_err(|e| format!("Failed to parse RAR: {}", e))?;
+
+        for file in files {
+            let outpath = addons_dir.join(&file.name);
+            if let Some(parent) = outpath.parent() {
+                std::fs::create_dir_all(parent).map_err(|_| "Failed to create directory in RAR")?;
+            }
+            
+            if file.name.ends_with('/') || file.name.ends_with('\\') {
+                continue;
+            }
+
+            let content = file.read_to_end().await
+                .map_err(|e| format!("Failed to read file {}: {}", file.name, e))?;
+            
+            std::fs::write(&outpath, content)
+                .map_err(|e| format!("Failed to write extracted file {}: {}", file.name, e))?;
+        }
         
         if let Ok(entries) = std::fs::read_dir(&addons_dir) {
             for entry in entries.filter_map(Result::ok) {
