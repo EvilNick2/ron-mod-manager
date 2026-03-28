@@ -107,7 +107,7 @@ const cleanDescription = computed(() => {
   <aside class="right-panel" v-if="store.selectedMod">
     <div class="panel-header">
       <h2>{{ store.selectedMod.name }}</h2>
-      <a href="#" class="external-link" title="View on Nexus Mods">
+      <a href="#" class="external-link" title="View on Nexus Mods" @click.prevent="invoke('open_browser_url', { url: `https://www.nexusmods.com/readyornot/mods/${store.selectedMod.id}` })">
         <ExternalLink :size="18" color="#3b82f6" />
       </a>
     </div>
