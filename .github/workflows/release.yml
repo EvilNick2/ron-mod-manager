@@ -161,7 +161,9 @@ jobs:
           tagName: ${{ steps.release_tag.outputs.value }}
           releaseName: "RoN Mod Manager v__VERSION__"
           releaseBody: |-
-            Active preset now gets highlighted
+            Open on nexus button on right sidebar now works
+            Mod grid is now sorted alphabetically
+            Presets now get loaded on app launch
           includeUpdaterJson: true
           releaseDraft: false
           prerelease: false
