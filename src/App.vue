@@ -82,7 +82,8 @@ onMounted(async () => {
     const paths = e.payload?.paths || e.payload;
     if (paths && paths.length > 0) {
       const file = paths[0];
-      if (file.toLowerCase().endsWith(".zip") || file.toLowerCase().endsWith(".pak")) {
+      const lowerFile = file.toLowerCase();
+      if (lowerFile.endsWith(".zip") || lowerFile.endsWith(".pak") || lowerFile.endsWith(".rar")) {
         store.installingModPath = file;
       } else {
         console.warn("Unsupported drop file.");

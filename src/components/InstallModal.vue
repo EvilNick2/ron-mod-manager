@@ -154,7 +154,7 @@ async function browseForArchive() {
       
       <div v-else class="archive-info drop-pulse" style="border-style: dashed; justify-content: center; color: var(--text-muted); flex-direction: column; align-items: center; gap: 0.75rem;">
         <FileArchive :size="32" color="#3b82f6" class="icon" />
-        <span>Drop .zip file here or browse</span>
+        <span>Drop .zip, .rar, or .pak here or browse</span>
         <button class="browse-btn" @click="browseForArchive">
           <FolderOpen :size="14" color="#fbbf24" /> Browse for archive
         </button>
