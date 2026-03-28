@@ -47,6 +47,27 @@ pub fn open_game_path(app_handle: tauri::AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
+pub fn launch_game(app_handle: tauri::AppHandle) -> Result<(), String> {
+    let config = crate::config::load_config(app_handle.clone()).map_err(|e| e.to_string())?;
+    let app_id = config.game_app_id.unwrap_or(1144200);
+    
+    let launch_url = if let Some(opts) = config.launch_options {
+        if opts.trim().is_empty() {
+            format!("steam://run/{}", app_id)
+        } else {
+            format!("steam://run/{}//{}", app_id, opts.trim())
+        }
+    } else {
+        format!("steam://run/{}", app_id)
+    };
+    
+    println!("[LAUNCH] Initiating game start for AppID: {} with URL: {}", app_id, launch_url);
+    
+    app_handle.opener().open_url(launch_url, None::<&str>)
+        .map_err(|e| format!("Failed to launch game: {}", e))
+}
+
+#[tauri::command]
 pub async fn fetch_trending_mods(game_domain: String) -> Result<Value, String> {
     let api_key = crate::config::get_api_key()?.ok_or("No API key found. Please log in first.")?;
 
@@ -85,12 +106,16 @@ pub async fn fetch_latest_mods(game_domain: String) -> Result<Value, String> {
 }
 
 #[tauri::command]
-pub async fn search_nexus_mods(offset: u32) -> Result<Value, String> {
+pub async fn search_nexus_mods(app_handle: tauri::AppHandle, offset: u32) -> Result<Value, String> {
     let api_key = crate::config::get_api_key()?.ok_or("No API key found. Please log in first.")?;
+    let config = crate::config::load_config(app_handle.clone()).map_err(|e| e.to_string())?;
+    let game_domain = config.game_domain.unwrap_or_else(|| "readyornot".to_string());
+    
     let client = reqwest::Client::new();
 
     let query = format!(
-        r#"{{ mods(filter: {{ gameDomainName: {{ value: "readyornot" }} }}, sort: {{ downloads: {{ direction: DESC }} }}, count: 20, offset: {}) {{ nodes {{ uid modId name summary pictureUrl version author createdAt updatedAt downloads endorsements }} totalCount }} }}"#,
+        r#"{{ mods(filter: {{ gameDomainName: {{ value: "{}" }} }}, sort: {{ downloads: {{ direction: DESC }} }}, count: 20, offset: {}) {{ nodes {{ uid modId name summary pictureUrl version author createdAt updatedAt downloads endorsements }} totalCount }} }}"#,
+        game_domain,
         offset
     );
 

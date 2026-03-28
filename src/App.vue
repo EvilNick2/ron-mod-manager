@@ -32,6 +32,18 @@ onMounted(async () => {
     if (config.game_path) {
       store.gamePathStore = config.game_path;
     }
+
+    if (config.game_app_id) {
+      store.gameAppIdStore = config.game_app_id;
+    }
+
+    if (config.game_domain) {
+      store.gameDomainStore = config.game_domain;
+    }
+
+    if (config.launch_options) {
+      store.launchOptionsStore = config.launch_options;
+    }
     
     if (config.enable_blur !== undefined && config.enable_blur !== null) {
       store.isBlurEnabled = config.enable_blur;

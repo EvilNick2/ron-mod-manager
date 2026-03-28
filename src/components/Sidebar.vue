@@ -11,7 +11,8 @@ import {
   Save, 
   X,
   CheckCircle,
-  CircleOff
+  CircleOff,
+  Play
 } from 'lucide-vue-next';
 
 async function loginNexus() {
@@ -175,6 +176,16 @@ async function fetchOnlineMods() {
      store.isFetchingOnline = false;
   }
 }
+
+async function launchGame() {
+  try {
+    console.log("[LAUNCH] Sending command to the backend to launch game...");
+    await invoke("launch_game");
+  } catch (e) {
+    console.error("Failed to launch game:", e);
+    alert("Failed to launch game: " + e);
+  }
+}
 </script>
 
 <template>
@@ -255,6 +266,10 @@ async function fetchOnlineMods() {
     </div>
 
     <div class="sidebar-section util-buttons bottom-section">
+      <button class="full-btn launch-btn" @click="launchGame">
+        <Play :size="18" fill="currentColor" /> Launch Game
+      </button>
+
       <button v-if="!store.apiKeyStore" class="full-btn nexus-login" @click="loginNexus">
         Log in to Nexus Mods
       </button>
@@ -452,6 +467,28 @@ async function fetchOnlineMods() {
   border-color: #10b981;
   color: #10b981;
   pointer-events: none;
+}
+
+.launch-btn {
+  background: linear-gradient(135deg, #22c55e 0%, #16a34a 100%);
+  border: none;
+  color: white;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.6rem;
+  box-shadow: 0 4px 15px rgba(34, 197, 94, 0.3);
+  margin-bottom: 0.5rem;
+}
+
+.launch-btn:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 6px 20px rgba(34, 197, 94, 0.4);
+  background: linear-gradient(135deg, #2ae06b 0%, #19bd56 100%);
+}
+
+.launch-btn:active {
+  transform: translateY(0);
 }
 
 /* Presets */

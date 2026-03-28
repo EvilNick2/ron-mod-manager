@@ -7,6 +7,9 @@ use tauri::{AppHandle, Manager};
 #[derive(Serialize, Deserialize, Default, Clone)]
 pub struct AppConfig {
     pub game_path: Option<String>,
+    pub game_app_id: Option<u64>,
+    pub game_domain: Option<String>,
+    pub launch_options: Option<String>,
     pub mod_storage_path: Option<String>,
     pub enable_blur: Option<bool>,
     pub active_preset: Option<String>,

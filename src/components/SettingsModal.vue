@@ -6,6 +6,7 @@ import { X, Globe, Crosshair, Info } from 'lucide-vue-next';
 
 const activeTab = ref("Global");
 const pendingGamePath = ref("");
+const pendingLaunchOptions = ref("");
 
 onMounted(async () => {
   try {
@@ -16,16 +17,17 @@ onMounted(async () => {
       store.modStoragePathStore = config.mod_storage_path;
     }
     
-    if (config.enable_blur !== undefined && config.enable_blur !== null) {
-      store.isBlurEnabled = config.enable_blur;
-    }
-    
     const key: string | null = await invoke("get_api_key");
     if (key) {
       store.apiKeyStore = key;
     }
 
+    if (config.game_domain) {
+      store.gameDomainStore = config.game_domain;
+    }
+
     pendingGamePath.value = store.gamePathStore;
+    pendingLaunchOptions.value = store.launchOptionsStore;
   } catch (error) {
     console.error(error);
   }
@@ -67,16 +69,18 @@ async function pickStorageFolder() {
   }
 }
 
-async function saveGamePath() {
+async function saveGameConfig() {
   try {
-    if (pendingGamePath.value) {
-      store.gamePathStore = pendingGamePath.value;
-      const config: any = await invoke("load_config");
-      config.game_path = pendingGamePath.value;
-      await invoke("save_config", { config });
-    }
+    store.gamePathStore = pendingGamePath.value;
+    store.launchOptionsStore = pendingLaunchOptions.value;
+    
+    const config: any = await invoke("load_config");
+    config.game_path = pendingGamePath.value;
+    config.launch_options = pendingLaunchOptions.value;
+    
+    await invoke("save_config", { config });
   } catch (e) {
-    console.error("Failed to save game path", e);
+    console.error("Failed to save game config", e);
   }
 }
 
@@ -104,8 +108,8 @@ async function toggleBlur(state: boolean) {
         <button class="tab-btn" :class="{ active: activeTab === 'Global' }" @click="activeTab = 'Global'">
           <Globe :size="18" color="#3b82f6" /> Global
         </button>
-        <button class="tab-btn" :class="{ active: activeTab === 'Ready or Not' }" @click="activeTab = 'Ready or Not'">
-          <Crosshair :size="18" color="#ef4444" /> Ready or Not
+        <button class="tab-btn" :class="{ active: activeTab === 'Game' }" @click="activeTab = 'Game'">
+          <Crosshair :size="18" :color="activeTab === 'Game' ? '#ffffff' : '#ef4444'" /> Game Settings
         </button>
       </div>
 
@@ -139,16 +143,36 @@ async function toggleBlur(state: boolean) {
           </div>
         </template>
 
-        <template v-if="activeTab === 'Ready or Not'">
+        <template v-if="activeTab === 'Game'">
           <div class="settings-section col-span-full">
-            <h3>Game Installation Path <Info :size="14" color="#3b82f6" class="info-icon" /></h3>
-            <p class="settings-desc">Select the folder where Ready Or Not is installed (contains Paks/mods).</p>
-            <div class="path-picker-row" style="margin-bottom: 1rem;">
-              <input type="text" v-model="pendingGamePath" placeholder="C:\Program Files (x86)\... or /home/..." class="path-input" />
-              <button class="action-btn" @click="openGamePath" title="Open game folder in explorer">Open Folder</button>
-              <button class="action-btn" @click="manualPickGame">Browse...</button>
+            <div class="field-group">
+              <label>Game Installation Path <Info :size="14" class="info-icon" /></label>
+              <p class="field-desc">Select the folder where the game is installed.</p>
+              <div class="path-picker-row">
+                <input type="text" v-model="pendingGamePath" placeholder="C:\Program Files (x86)\... or /home/..." class="path-input" />
+                <div class="path-actions">
+                  <button class="secondary-action-btn" @click="openGamePath" title="Open game folder">Open</button>
+                  <button class="action-btn" @click="manualPickGame">Browse...</button>
+                </div>
+              </div>
             </div>
-            <button class="action-btn save-btn" @click="saveGamePath" :disabled="pendingGamePath === store.gamePathStore">Save Game Path</button>
+
+
+            <div class="field-group">
+              <label>Steam Launch Options <Info :size="14" class="info-icon" /></label>
+              <p class="field-desc">Arguments like `-dx12`, `-vulkan`, or `-windowed`.</p>
+              <input type="text" v-model="pendingLaunchOptions" placeholder="-dx12 -vulkan etc..." class="path-input" />
+            </div>
+
+            <div class="settings-footer">
+              <button 
+                class="save-btn" 
+                @click="saveGameConfig" 
+                :disabled="pendingGamePath === store.gamePathStore && pendingLaunchOptions === store.launchOptionsStore"
+              >
+                Save Configuration
+              </button>
+            </div>
           </div>
         </template>
       </div>
@@ -266,38 +290,125 @@ async function toggleBlur(state: boolean) {
   margin: 0 0 0.5rem 0;
 }
 
+.field-group {
+  margin-bottom: 1.5rem;
+  display: flex;
+  flex-direction: column;
+}
+
+.field-group label {
+  color: var(--text-main);
+  font-size: 0.95rem;
+  font-weight: 700;
+  margin-bottom: 0.4rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.field-desc {
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  margin-bottom: 0.75rem;
+}
+
+.grid-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1.5rem;
+}
+
 .action-btn {
-  background: var(--bg-card);
+  background: var(--accent-primary);
+  border: 1px solid var(--accent-primary);
+  color: white;
+  padding: 0.75rem 1.5rem;
+  border-radius: 8px;
+  cursor: pointer;
+  font-weight: 700;
+  transition: all 0.2s;
+}
+
+.action-btn:hover {
+  background: var(--accent-hover);
+  transform: translateY(-1px);
+}
+
+.secondary-action-btn {
+  background: var(--bg-hover);
   border: 1px solid var(--border-light);
   color: var(--text-main);
-  padding: 0.75rem 1.5rem;
+  padding: 0.75rem 1.25rem;
   border-radius: 8px;
   cursor: pointer;
   font-weight: 600;
   transition: all 0.2s;
 }
 
-.action-btn:hover {
-  background: var(--bg-hover);
-  border-color: var(--accent-primary);
+.secondary-action-btn:hover {
+  background: var(--bg-card);
+  border-color: var(--text-muted);
 }
 
 .path-picker-row {
   display: flex;
-  gap: 1rem;
+  gap: 0.75rem;
   align-items: center;
+}
+
+.path-actions {
+  display: flex;
+  gap: 0.5rem;
 }
 
 .path-input {
   flex: 1;
-  background: rgba(0,0,0,0.3);
-  color: var(--text-muted);
-  border: 1px solid var(--border-dark);
-  border-radius: 4px;
+  background: rgba(0,0,0,0.4);
+  color: var(--text-main);
+  border: 1px solid var(--border-light);
+  border-radius: 8px;
   padding: 0.75rem 1rem;
-  font-family: monospace;
-  font-size: 0.9rem;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.85rem;
   outline: none;
+  transition: border-color 0.2s, background 0.2s;
+}
+
+.path-input:focus {
+  border-color: var(--accent-primary);
+  background: rgba(0,0,0,0.6);
+}
+
+.settings-footer {
+  margin-top: 1rem;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.save-btn {
+  background: linear-gradient(135deg, var(--accent-primary) 0%, #b91c1c 100%);
+  color: white;
+  border: none;
+  padding: 0.75rem 2.5rem;
+  border-radius: 8px;
+  font-weight: 800;
+  font-size: 0.95rem;
+  cursor: pointer;
+  transition: all 0.2s;
+  box-shadow: 0 4px 15px rgba(230, 29, 54, 0.3);
+}
+
+.save-btn:hover:not(:disabled) {
+  transform: translateY(-2px);
+  box-shadow: 0 6px 20px rgba(230, 29, 54, 0.4);
+  filter: brightness(1.1);
+}
+
+.save-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  filter: grayscale(1);
+  box-shadow: none;
 }
 
 .settings-desc {
@@ -327,7 +438,8 @@ h3 {
 
 .info-icon {
   color: var(--accent-primary);
-  opacity: 0.7;
+  opacity: 0.8;
+  cursor: help;
 }
 
 .tab-btn {
