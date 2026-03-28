@@ -170,6 +170,26 @@ jobs:
           releaseDraft: false
           prerelease: false
 
+  publish-aur:
+    name: Publish to AUR
+    needs: build-and-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Publish AUR package
+        uses: KSXGitHub/github-actions-deploy-aur@v4.1.1
+        with:
+          pkgname: ${{ github.event.repository.name }}-bin
+          pkgbuild: ./aur/PKGBUILD
+          commit_username: ${{ secrets.AUR_USERNAME }}
+          commit_email: ${{ secrets.AUR_EMAIL }}
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_message: Update to ${{ needs.build-and-release.outputs.release_tag }}
+          updpkgsums: true
+
+
   publish-updates:
     name: Publish updater manifest
     needs:
