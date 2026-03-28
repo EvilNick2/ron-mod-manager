@@ -9,6 +9,7 @@ export const store = reactive({
   isSettingsOpen: false,
   isBlurEnabled: true,
   activeDeploymentFilter: "All" as "All" | "Enabled" | "Disabled",
+  activePresetName: "" as string,
   selectedMod: null as any,
   mods: [] as any[],
   onlineMods: [] as any[],

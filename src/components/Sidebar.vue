@@ -26,6 +26,9 @@ async function loginNexus() {
 async function loadPresets() {
   try {
     store.presets = await invoke("load_presets") as Record<string, string[]>;
+    if (store.activePresetName && !store.presets[store.activePresetName]) {
+      store.activePresetName = "";
+    }
   } catch (e) {
     console.error("Failed to load presets:", e);
   }
@@ -54,6 +57,7 @@ async function applyPreset(name: string) {
     await invoke("apply_preset", { modIds });
     const refreshed: any[] = await invoke("scan_local_mods");
     store.mods = refreshed;
+    store.activePresetName = name;
   } catch (e) {
     console.error("Failed to apply preset:", e);
     alert("Failed to apply preset: " + e);
@@ -93,6 +97,9 @@ async function importPreset() {
 async function removePreset(name: string) {
   try {
     await invoke("delete_preset", { name });
+    if (store.activePresetName === name) {
+      store.activePresetName = "";
+    }
     await loadPresets();
   } catch (e) {
     console.error("Failed to delete preset:", e);
@@ -215,7 +222,12 @@ async function fetchOnlineMods() {
       <h3 class="section-label">Presets</h3>
       <div class="preset-list" v-if="Object.keys(store.presets).length > 0">
         <div class="preset-item" v-for="(ids, name) in store.presets" :key="name">
-          <button class="preset-apply-btn" @click="applyPreset(name as string)" :title="`Apply ${name} (${ids.length} mods)`">
+          <button
+            class="preset-apply-btn"
+            :class="{ active: store.activePresetName === name }"
+            @click="applyPreset(name as string)"
+            :title="`Apply ${name} (${ids.length} mods)`"
+          >
             {{ name }}
             <span class="preset-count">{{ ids.length }}</span>
           </button>
@@ -471,6 +483,16 @@ async function fetchOnlineMods() {
 .preset-apply-btn:hover {
   border-color: var(--accent-primary);
   background: var(--bg-hover);
+}
+
+.preset-apply-btn.active {
+  border-color: #22c55e;
+  box-shadow: 0 0 15px rgba(34, 197, 94, 0.2);
+  background: rgba(34, 197, 94, 0.08);
+}
+
+.preset-apply-btn.active .preset-count {
+  color: #22c55e;
 }
 
 .preset-count {
