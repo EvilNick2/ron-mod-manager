@@ -41,6 +41,10 @@ onMounted(async () => {
     if (authKey) {
       store.apiKeyStore = authKey;
     }
+
+    if (config.active_preset) {
+      store.activePresetName = config.active_preset;
+    }
   } catch (error) {
     console.error("Failed to load config on startup:", error);
   }

@@ -344,7 +344,7 @@ pub async fn delete_mod(app_handle: tauri::AppHandle, mod_id: String) -> Result<
 }
 
 #[tauri::command]
-pub async fn apply_preset(app_handle: tauri::AppHandle, mod_ids: Vec<String>) -> Result<(), String> {
+pub async fn apply_preset(app_handle: tauri::AppHandle, name: String, mod_ids: Vec<String>) -> Result<(), String> {
     let all_mods = scan_local_mods(app_handle.clone()).await?;
     let preset_set: std::collections::HashSet<String> = mod_ids.iter().cloned().collect();
     
@@ -357,6 +357,10 @@ pub async fn apply_preset(app_handle: tauri::AppHandle, mod_ids: Vec<String>) ->
     for id in mod_ids {
         toggle_mod(app_handle.clone(), id, true).await?;
     }
+
+    let mut config = crate::config::load_config(app_handle.clone())?;
+    config.active_preset = Some(name);
+    crate::config::save_config(app_handle, config)?;
     
     Ok(())
 }

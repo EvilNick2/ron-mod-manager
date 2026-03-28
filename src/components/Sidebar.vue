@@ -54,7 +54,7 @@ async function applyPreset(name: string) {
   const modIds = store.presets[name];
   if (!modIds) return;
   try {
-    await invoke("apply_preset", { modIds });
+    await invoke("apply_preset", { name, modIds });
     const refreshed: any[] = await invoke("scan_local_mods");
     store.mods = refreshed;
     store.activePresetName = name;
@@ -99,6 +99,9 @@ async function removePreset(name: string) {
     await invoke("delete_preset", { name });
     if (store.activePresetName === name) {
       store.activePresetName = "";
+      const config: any = await invoke("load_config");
+      config.active_preset = null;
+      await invoke("save_config", { config });
     }
     await loadPresets();
   } catch (e) {

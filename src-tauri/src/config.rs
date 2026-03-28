@@ -9,6 +9,7 @@ pub struct AppConfig {
     pub game_path: Option<String>,
     pub mod_storage_path: Option<String>,
     pub enable_blur: Option<bool>,
+    pub active_preset: Option<String>,
     #[serde(default)]
     pub presets: HashMap<String, Vec<String>>,
 }
