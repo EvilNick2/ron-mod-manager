@@ -10,7 +10,7 @@ const activeCategory = ref("All");
 const filteredMods = computed(() => {
   const sourceArray = store.currentMode === 'Online' ? store.onlineMods : store.mods;
   
-  return sourceArray.filter((mod) => {
+  const filtered = sourceArray.filter((mod) => {
     if (store.currentMode === 'Installed') {
       if (store.activeDeploymentFilter === 'Enabled' && !mod.enabled) return false;
       if (store.activeDeploymentFilter === 'Disabled' && mod.enabled) return false;
@@ -34,6 +34,12 @@ const filteredMods = computed(() => {
     
     return searchMatch && categoryMatch;
   });
+
+  if (store.currentMode === 'Installed') {
+    return filtered.sort((a: any, b: any) => a.name.localeCompare(b.name));
+  }
+
+  return filtered;
 });
 
 async function loadMoreMods() {
