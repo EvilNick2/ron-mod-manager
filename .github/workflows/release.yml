@@ -161,11 +161,7 @@ jobs:
           tagName: ${{ steps.release_tag.outputs.value }}
           releaseName: "RoN Mod Manager v__VERSION__"
           releaseBody: |-
-            Added buttons to enable and disable all mods
-            Mod presets not correctly apply themselves on import
-            Replaced auto-detect button with a button that opens the paks directory
-            Users can now add optional addons to mods and individually toggle them
-            Added automatic updater that checks for updates on app launch
+            Active preset now gets highlighted
           includeUpdaterJson: true
           releaseDraft: false
           prerelease: false
