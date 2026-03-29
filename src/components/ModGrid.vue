@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { store } from "../store";
 import { invoke } from "@tauri-apps/api/core";
-import { onMounted, ref, computed } from "vue";
+import { onMounted, onBeforeUnmount, ref, computed, watch } from "vue";
 import { Search, Plus, RefreshCw, X } from 'lucide-vue-next';
 
 const searchQuery = ref("");
 const activeCategory = ref("All");
+let onlineSearchDebounce: ReturnType<typeof setTimeout> | null = null;
 
 const filteredMods = computed(() => {
   const sourceArray = store.currentMode === 'Online' ? store.onlineMods : store.mods;
@@ -46,7 +47,11 @@ async function loadMoreMods() {
   if (store.isFetchingOnline || !store.hasMoreOnlineMods) return;
   store.isFetchingOnline = true;
   try {
-    const result: any = await invoke("search_nexus_mods", { offset: store.onlinePageOffset });
+    console.log("[ONLINE-SEARCH] loadMore query:", searchQuery.value.trim(), "offset:", store.onlinePageOffset);
+    const result: any = await invoke("search_nexus_mods", {
+      offset: store.onlinePageOffset,
+      searchQuery: searchQuery.value.trim() || null
+    });
     const nodes = result?.data?.mods?.nodes || [];
     
     if (nodes.length === 0) {
@@ -85,12 +90,73 @@ async function loadMoreMods() {
   }
 }
 
+async function searchOnlineMods(reset = true) {
+  if (store.currentMode !== "Online") return;
+  store.isFetchingOnline = true;
+  if (reset) {
+    store.onlinePageOffset = 0;
+    store.hasMoreOnlineMods = true;
+  }
+
+  try {
+    const offset = reset ? 0 : store.onlinePageOffset;
+    console.log("[ONLINE-SEARCH] searchOnlineMods query:", searchQuery.value.trim(), "offset:", offset, "reset:", reset);
+    const result: any = await invoke("search_nexus_mods", {
+      offset,
+      searchQuery: searchQuery.value.trim() || null
+    });
+    const nodes = result?.data?.mods?.nodes || [];
+    const formatted = nodes
+        .filter((m: any) => m.modId && m.name)
+        .map((m: any) => ({
+          id: m.modId.toString(),
+          name: m.name,
+          description: m.summary || "",
+          author: m.author || "Unknown",
+          version: m.version || "",
+          is_dir: false,
+          thumbnail_url: m.pictureUrl || "",
+          enabled: false,
+          is_online: true,
+          download_count: m.downloads || 0,
+          endorsement_count: m.endorsements || 0,
+          updated_at: m.updatedAt || "",
+          created_at: m.createdAt || ""
+        }));
+    store.onlineMods = reset ? formatted : [...store.onlineMods, ...formatted];
+    store.onlinePageOffset = offset + 20;
+    store.hasMoreOnlineMods = nodes.length >= 20;
+  } catch (e) {
+    console.error("Failed to search online mods", e);
+  } finally {
+    store.isFetchingOnline = false;
+  }
+}
+
 onMounted(async () => {
   try {
     await refreshMods(true);
   } catch(e) {
     console.error("Failed to scan local mods:", e);
   }
+});
+
+watch(searchQuery, () => {
+  if (store.currentMode !== "Online") return;
+  if (onlineSearchDebounce) clearTimeout(onlineSearchDebounce);
+  onlineSearchDebounce = setTimeout(() => {
+    searchOnlineMods(true);
+  }, 350);
+});
+
+watch(() => store.currentMode, (mode) => {
+  if (mode === "Online") {
+    searchOnlineMods(true);
+  }
+});
+
+onBeforeUnmount(() => {
+  if (onlineSearchDebounce) clearTimeout(onlineSearchDebounce);
 });
 
 function selectMod(mod: any) {

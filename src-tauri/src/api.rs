@@ -2,6 +2,31 @@ use reqwest::header::{HeaderMap, HeaderValue};
 use serde_json::Value;
 use tauri_plugin_opener::OpenerExt;
 
+async fn execute_graphql_query(client: &reqwest::Client, api_key: &str, query: String) -> Result<Value, String> {
+    let body = serde_json::json!({ "query": query });
+    let res = client
+        .post("https://api.nexusmods.com/v2/graphql")
+        .header("apikey", api_key)
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| {
+            println!("[SEARCH] Network error: {}", e);
+            e.to_string()
+        })?;
+
+    println!("[SEARCH] Response status: {}", res.status());
+    if res.status().is_success() {
+        res.json::<Value>().await.map_err(|e| e.to_string())
+    } else {
+        let status = res.status();
+        let body_text = res.text().await.unwrap_or_default();
+        println!("[SEARCH] Error response: {} - {}", status, body_text);
+        Err(format!("Nexus v2 API Error {}: {}", status, body_text))
+    }
+}
+
 #[tauri::command]
 pub async fn fetch_mod_metadata(game_domain: String, mod_id: u32) -> Result<Value, String> {
     let api_key = crate::config::get_api_key()?.ok_or("No API key found. Please log in first.")?;
@@ -106,61 +131,129 @@ pub async fn fetch_latest_mods(game_domain: String) -> Result<Value, String> {
 }
 
 #[tauri::command]
-pub async fn search_nexus_mods(app_handle: tauri::AppHandle, offset: u32) -> Result<Value, String> {
+pub async fn search_nexus_mods(app_handle: tauri::AppHandle, offset: u32, search_query: Option<String>) -> Result<Value, String> {
     let api_key = crate::config::get_api_key()?.ok_or("No API key found. Please log in first.")?;
     let config = crate::config::load_config(app_handle.clone()).map_err(|e| e.to_string())?;
     let game_domain = config.game_domain.unwrap_or_else(|| "readyornot".to_string());
-    
+
     let client = reqwest::Client::new();
+    let normalized_query = search_query.unwrap_or_default().trim().to_string();
+    let escaped_query = normalized_query
+        .replace('\\', "\\\\")
+        .replace('\"', "\\\"");
+    let base_filter_clause = format!(r#"gameDomainName: [{{ op: EQUALS, value: "{}" }}]"#, game_domain);
+    let has_search = !escaped_query.is_empty();
+    let filter_clause = if !has_search {
+        base_filter_clause.clone()
+    } else {
+        format!(
+            r#"gameDomainName: [{{ op: EQUALS, value: "{}" }}], name: [{{ op: WILDCARD, value: "{}" }}]"#,
+            game_domain,
+            escaped_query
+        )
+    };
 
     let query = format!(
-        r#"{{ mods(filter: {{ gameDomainName: {{ value: "{}" }} }}, sort: {{ downloads: {{ direction: DESC }} }}, count: 20, offset: {}) {{ nodes {{ uid modId name summary pictureUrl version author createdAt updatedAt downloads endorsements }} totalCount }} }}"#,
-        game_domain,
+        r#"{{ mods(filter: {{ {} }}, sort: [{{ downloads: {{ direction: DESC }} }}], count: 20, offset: {}) {{ nodes {{ uid modId name summary pictureUrl version author createdAt updatedAt downloads endorsements }} totalCount }} }}"#,
+        filter_clause,
         offset
     );
 
-    println!("[SEARCH] GraphQL query (offset={})", offset);
-    let body = serde_json::json!({ "query": query });
-    let res = client
-        .post("https://api.nexusmods.com/v2/graphql")
-        .header("apikey", &api_key)
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| {
-            println!("[SEARCH] Network error: {}", e);
-            e.to_string()
-        })?;
-
-    println!("[SEARCH] Response status: {}", res.status());
-
-    if res.status().is_success() {
-        let json = res.json::<Value>().await.map_err(|e| e.to_string())?;
-        println!("[SEARCH] Response keys: {:?}", json.as_object().map(|o| o.keys().collect::<Vec<_>>()));
-        if let Some(errors) = json.get("errors") {
-            println!("[SEARCH] GraphQL errors: {}", errors);
-        }
-        if let Some(data) = json.get("data") {
-            if let Some(mods) = data.get("mods") {
-                if let Some(nodes) = mods.get("nodes") {
-                    println!("[SEARCH] Got {} mod nodes", nodes.as_array().map(|a| a.len()).unwrap_or(0));
-                } else {
-                    println!("[SEARCH] No 'nodes' field in mods");
-                }
-            } else {
-                println!("[SEARCH] No 'mods' field in data");
-            }
-        } else {
-            println!("[SEARCH] No 'data' field in response. Full response: {}", json);
-        }
-        Ok(json)
-    } else {
-        let status = res.status();
-        let body_text = res.text().await.unwrap_or_default();
-        println!("[SEARCH] Error response: {} - {}", status, body_text);
-        Err(format!("Nexus v2 API Error {}: {}", status, body_text))
+    println!(
+        "[SEARCH] offset={}, raw_search_query='{}', escaped_search_query='{}'",
+        offset, normalized_query, escaped_query
+    );
+    println!("[SEARCH] GraphQL query body: {}", query);
+    let mut json = execute_graphql_query(&client, &api_key, query).await?;
+    println!("[SEARCH] Response keys: {:?}", json.as_object().map(|o| o.keys().collect::<Vec<_>>()));
+    if let Some(errors) = json.get("errors") {
+        println!("[SEARCH] GraphQL errors: {}", errors);
     }
+    let node_count = json
+        .get("data")
+        .and_then(|d| d.get("mods"))
+        .and_then(|m| m.get("nodes"))
+        .and_then(|n| n.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    println!("[SEARCH] Got {} mod nodes", node_count);
+
+    if has_search && node_count == 0 {
+        let stemmed_query = format!(
+            r#"{{ mods(filter: {{ gameDomainName: [{{ op: EQUALS, value: "{}" }}], nameStemmed: [{{ op: EQUALS, value: "{}" }}] }}, sort: [{{ downloads: {{ direction: DESC }} }}], count: 20, offset: {}) {{ nodes {{ uid modId name summary pictureUrl version author createdAt updatedAt downloads endorsements }} totalCount }} }}"#,
+            game_domain,
+            escaped_query,
+            offset
+        );
+        println!(
+            "[SEARCH] Name wildcard returned 0 nodes. Retrying with nameStemmed query: {}",
+            stemmed_query
+        );
+        json = execute_graphql_query(&client, &api_key, stemmed_query).await?;
+    }
+
+    let retry_node_count = json
+        .get("data")
+        .and_then(|d| d.get("mods"))
+        .and_then(|m| m.get("nodes"))
+        .and_then(|n| n.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+
+    if has_search && retry_node_count == 0 {
+        println!("[SEARCH] Query returned 0 nodes with server-side filters. Falling back to paged browse + local contains filtering.");
+        let lowered_query = normalized_query.to_lowercase();
+        let mut matched_nodes: Vec<Value> = Vec::new();
+
+        for page in 0..30u32 {
+            let page_offset = page * 100;
+            let fallback_query = format!(
+                r#"{{ mods(filter: {{ {} }}, sort: [{{ updatedAt: {{ direction: DESC }} }}], count: 100, offset: {}) {{ nodes {{ uid modId name summary pictureUrl version author createdAt updatedAt downloads endorsements }} totalCount }} }}"#,
+                base_filter_clause, page_offset
+            );
+
+            println!("[SEARCH] Fallback page query offset={}", page_offset);
+            let page_json = execute_graphql_query(&client, &api_key, fallback_query).await?;
+            let page_nodes = page_json
+                .get("data")
+                .and_then(|d| d.get("mods"))
+                .and_then(|m| m.get("nodes"))
+                .and_then(|n| n.as_array())
+                .cloned()
+                .unwrap_or_default();
+
+            if page_nodes.is_empty() {
+                break;
+            }
+
+            for node in page_nodes {
+                let name = node.get("name").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+                let summary = node.get("summary").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+                if name.contains(&lowered_query) || summary.contains(&lowered_query) {
+                    matched_nodes.push(node);
+                }
+            }
+
+            if matched_nodes.len() >= 40 {
+                break;
+            }
+        }
+
+        json = serde_json::json!({
+            "data": {
+                "mods": {
+                    "nodes": matched_nodes,
+                    "totalCount": matched_nodes.len()
+                }
+            }
+        });
+        println!("[SEARCH] Local fallback matched {} nodes", json["data"]["mods"]["totalCount"]);
+    }
+
+    if json.get("data").is_none() {
+        println!("[SEARCH] No 'data' field in response. Full response: {}", json);
+    }
+    Ok(json)
 }
 
 #[tauri::command]
