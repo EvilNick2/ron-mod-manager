@@ -30,6 +30,7 @@ pub fn run() {
             api::search_nexus_mods,
             api::download_online_mod,
             vfs::scan_local_mods,
+            vfs::refresh_installed_mod_updates,
             vfs::install_mod_archive,
             vfs::toggle_mod,
             vfs::pick_mod_archive,

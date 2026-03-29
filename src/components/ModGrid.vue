@@ -87,8 +87,7 @@ async function loadMoreMods() {
 
 onMounted(async () => {
   try {
-    const testMods: any[] = await invoke("scan_local_mods");
-    store.mods = testMods;
+    await refreshMods(true);
   } catch(e) {
     console.error("Failed to scan local mods:", e);
   }
@@ -137,9 +136,31 @@ async function removeMod(mod: any) {
   }
 }
 
-async function refreshMods() {
+async function startModUpdateFlow(mod: any) {
+  const modId = mod?.nexus_mod_id || Number.parseInt(mod?.id, 10);
+  if (!modId || Number.isNaN(modId)) {
+    alert("This mod is missing a Nexus mod ID, so update flow can't be started");
+    return;
+  }
+
+  const filesUrl = `https://www.nexusmods.com/${store.gameDomainStore}/mods/${modId}?tab=files`;
+  try {
+    await invoke("open_browser_url", { url: filesUrl });
+    store.awaitingDropForId = String(modId);
+    store.installingModPath = null;
+  } catch (e: any) {
+    console.error("Failed to start mod update flow:", e);
+    alert("Failed to open Nexus page: " + e);
+  }
+}
+
+async function refreshMods(checkForUpdates = true) {
   try {
     store.mods = await invoke("scan_local_mods");
+    if (checkForUpdates) {
+      await invoke("refresh_installed_mod_updates");
+      store.mods = await invoke("scan_local_mods");
+    }
     if (store.currentMode === 'Online') {
       store.onlineMods = [];
       store.onlinePageOffset = 0;
@@ -148,6 +169,10 @@ async function refreshMods() {
   } catch(e) {
     console.error("Failed to refresh mods:", e);
   }
+}
+
+async function refreshModsFromButton() {
+  await refreshMods(true);
 }
 </script>
 
@@ -163,7 +188,7 @@ async function refreshMods() {
         <Plus :size="18" color="#22c55e" /> Add Mod
       </button>
 
-      <button class="btn" @click="refreshMods" title="Refresh Mod List" style="margin-left: auto;">
+      <button class="btn" @click="refreshModsFromButton" title="Refresh Mod List" style="margin-left: auto;">
         <RefreshCw :size="18" color="#3b82f6" /> Refresh
       </button>
     </header>
@@ -191,6 +216,15 @@ async function refreshMods() {
         @click="selectMod(mod)"
         @contextmenu.prevent="toggleModRightClick(mod)"
       >
+        <button
+          v-if="store.currentMode === 'Installed' && mod.update_available"
+          class="update-available-banner"
+          @click.stop="startModUpdateFlow(mod)"
+          title="Open Nexus files page and import the updated archive"
+        >
+          Update Available
+        </button>
+
         <img :src="mod.thumbnail_url || 'https://images.unsplash.com/photo-1595590424283-b8f17842773f?auto=format&fit=crop&q=80&w=400&h=400'" alt="Mod Cover" class="mod-image" loading="lazy" decoding="async" />
         <div class="mod-info">
           <h3>{{ mod.name }}</h3>
@@ -323,6 +357,28 @@ async function refreshMods() {
   will-change: transform;
   content-visibility: auto;
   contain-intrinsic-size: 240px 240px;
+}
+
+.update-available-banner {
+  position: absolute;
+  top: 0.6rem;
+  left: 0.6rem;
+  z-index: 3;
+  border: 1px solid rgba(16, 185, 129, 0.9);
+  background: rgba(9, 78, 59, 0.9);
+  color: #a7f3d0;
+  font-size: 0.75rem;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  border-radius: 999px;
+  padding: 0.35rem 0.65rem;
+  cursor: pointer;
+}
+
+.update-available-banner:hover {
+  background: rgba(5, 150, 105, 0.9);
+  color: #ecfdf5;
 }
 
 .mod-card:hover {

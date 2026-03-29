@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::path::{Path, PathBuf};
 use serde::{Serialize, Deserialize};
 use tauri::{AppHandle, Manager};
+use serde_json::Value;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AddonInfo {
@@ -16,6 +17,9 @@ pub struct ModInfo {
     pub name: String,
     pub description: String,
     pub version: String,
+    pub latest_version: Option<String>,
+    pub update_available: bool,
+    pub nexus_mod_id: Option<u32>,
     pub author: String,
     pub thumbnail_url: Option<String>,
     pub enabled: bool,
@@ -61,6 +65,9 @@ pub async fn scan_local_mods(app_handle: tauri::AppHandle) -> Result<Vec<ModInfo
                     name: id.clone(),
                     description: "No metadata found.".to_string(),
                     version: "1.0.0".to_string(),
+                    latest_version: None,
+                    update_available: false,
+                    nexus_mod_id: id.parse::<u32>().ok(),
                     author: "Unknown".to_string(),
                     thumbnail_url: None,
                     enabled: false,
@@ -78,8 +85,16 @@ pub async fn scan_local_mods(app_handle: tauri::AppHandle) -> Result<Vec<ModInfo
                         if let Some(author) = parsed.get("author").and_then(|a| a.as_str()) {
                             info.author = author.to_string();
                         }
-                        if let Some(version) = parsed.get("version").and_then(|v| v.as_str()) {
+                        if let Some(version) = parsed.get("version")
+                            .or_else(|| parsed.get("version"))
+                            .and_then(|v| v.as_str()) {
                             info.version = version.to_string();
+                        }
+                        if let Some(update_available) = parsed.get("update_available").and_then(|v| v.as_bool()) {
+                            info.update_available = update_available;
+                        }
+                        if let Some(mod_id) = parsed.get("mod_id").and_then(|v| v.as_u64()) {
+                            info.nexus_mod_id = Some(mod_id as u32);
                         }
                         
                         let thumb_path = path.join("thumbnail.jpg");
@@ -128,6 +143,100 @@ pub async fn scan_local_mods(app_handle: tauri::AppHandle) -> Result<Vec<ModInfo
     }
     
     Ok(mods)
+}
+
+#[tauri::command]
+pub async fn refresh_installed_mod_updates(app_handle: tauri::AppHandle) -> Result<usize, String> {
+    let Some(_api_key) = crate::config::get_api_key()? else {
+        return Ok(0);
+    };
+
+    let config = crate::config::load_config(app_handle.clone())?;
+    let game_domain = config.game_domain.unwrap_or_else(|| "readyornot".to_string());
+    let mods_dir = get_mods_dir(&app_handle)?;
+    let mut updated_count = 0usize;
+
+    let Ok(entries) = fs::read_dir(mods_dir) else {
+        return Ok(0);
+    };
+
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let mod_id_str = entry.file_name().to_string_lossy().to_string();
+        let Ok(mod_id) = mod_id_str.parse::<u32>() else {
+            continue;
+        };
+
+        let fresh = match crate::api::fetch_mod_metadata(game_domain.clone(), mod_id).await {
+            Ok(meta) => meta,
+            Err(e) => {
+                println!("[UPDATE-CHECK] Failed for mod {}: {}", mod_id, e);
+                continue;
+            }
+        };
+
+        let metadata_path = path.join("metadata.json");
+        let existing = fs::read_to_string(&metadata_path)
+            .ok()
+            .and_then(|c| serde_json::from_str::<Value>(&c).ok())
+            .unwrap_or(Value::Object(serde_json::Map::new()));
+
+        let preserved_enabled = existing.get("enabled").cloned();
+        let preserved_addons = existing.get("addons").cloned();
+        let installed_version = existing.get("installed_version")
+            .or_else(|| existing.get("version"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let latest_version = existing.get("version")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let update_available = !installed_version.is_empty()
+            && !latest_version.is_empty()
+            && installed_version != latest_version;
+        let mut merged = fresh;
+
+        if let Some(obj) = merged.as_object_mut() {
+            if let Some(enabled) = preserved_enabled {
+                obj.insert("enabled".to_string(), enabled);
+            }
+            if let Some(addons) = preserved_addons {
+                obj.insert("addons".to_string(), addons);
+            }
+            obj.insert(
+                "installed_version".to_string(),
+                Value::String(if installed_version.is_empty() {
+                    latest_version.clone()
+                } else {
+                    installed_version.clone()
+                }),
+            );
+            obj.insert("latest_version".to_string(), Value::String(latest_version));
+            obj.insert("update_available".to_string(), Value::Bool(update_available));
+            obj.insert("mod_id".to_string(), Value::Number(serde_json::Number::from(mod_id)));
+        }
+
+        if let Ok(json_str) = serde_json::to_string_pretty(&merged) {
+            if fs::write(&metadata_path, json_str).is_ok() {
+                updated_count += 1;
+            }
+        }
+
+        if let Some(pic_url) = merged.get("picture_url").and_then(|p| p.as_str()) {
+            if let Ok(resp) = reqwest::get(pic_url).await {
+                if let Ok(bytes) = resp.bytes().await {
+                    fs::write(path.join("thumbnail.jpg"), bytes).ok();
+                }
+            }
+        }
+    }
+
+    Ok(updated_count)
 }
 
 #[tauri::command]
