@@ -161,9 +161,13 @@ jobs:
           tagName: ${{ steps.release_tag.outputs.value }}
           releaseName: "RoN Mod Manager v__VERSION__"
           releaseBody: |-
-            Open on nexus button on right sidebar now works
-            Mod grid is now sorted alphabetically
-            Presets now get loaded on app launch
+            Added option to launch game from mod manager
+            RAR files now successfully extract without getting corrupted
+            RAR files can now be dropped into the window to prompt import
+            Added styling to scrollbar
+            Mods will now check for updates on app launch and mod refresh
+            Added app taskbar icon
+            Searching the online tab now explicitly queries mods containing that string
           includeUpdaterJson: true
           releaseDraft: false
           prerelease: false
