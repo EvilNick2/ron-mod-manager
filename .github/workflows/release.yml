@@ -176,29 +176,61 @@ jobs:
     name: Publish to AUR
     needs: build-and-release
     runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ needs.build-and-release.outputs.release_tag || 'v1.2.62' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Update pkgver in PKGBUILD
         run: |
-          VERSION="${{ needs.build-and-release.outputs.release_tag }}"
-          VERSION="${VERSION#v}"
+          VERSION="${RELEASE_TAG#v}"
           sed -i "s/^pkgver=.*/pkgver=$VERSION/" aur/PKGBUILD
           sed -i "s/^pkgrel=.*/pkgrel=1/" aur/PKGBUILD
+          URL="https://github.com/${{ github.repository }}/releases/download/v${VERSION}/RoN.Mod.Manager_${VERSION}_amd64.deb"
+          SHA=$(curl -sL "$URL" | sha256sum | awk '{print $1}')
+          sed -i "s|^sha256sums=.*|sha256sums=('$SHA' 'SKIP')|" aur/PKGBUILD
 
+      - name: Publish to AUR
+        if: env.ACT != 'true'
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.AUR_SSH_PRIVATE_KEY }}" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          ssh-keyscan -t rsa,ecdsa,ed25519 aur.archlinux.org >> ~/.ssh/known_hosts
 
-      - name: Publish AUR package
-        uses: KSXGitHub/github-actions-deploy-aur@v4.1.1
-        with:
-          pkgname: ${{ github.event.repository.name }}-bin
-          pkgbuild: ./aur/PKGBUILD
-          commit_username: ${{ secrets.AUR_USERNAME }}
-          commit_email: ${{ secrets.AUR_EMAIL }}
-          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
-          commit_message: Update to ${{ needs.build-and-release.outputs.release_tag }}
-          updpkgsums: true
+          mkdir -p /tmp/aur-pkg
+          cp aur/PKGBUILD /tmp/aur-pkg/PKGBUILD
 
+          docker run --rm \
+            -v /tmp/aur-pkg:/pkg \
+            archlinux:latest \
+            bash -c "
+              pacman -Sy --noconfirm pacman-contrib &&
+              useradd builder &&
+              chown -R builder:builder /pkg &&
+              su builder -c 'cd /pkg && makepkg --printsrcinfo > .SRCINFO'
+            "
+
+          git clone \
+            -c core.sshCommand="ssh -i ~/.ssh/aur -o StrictHostKeyChecking=no" \
+            ssh://aur@aur.archlinux.org/ron-mod-manager-bin.git /tmp/aur-repo
+          cp /tmp/aur-pkg/PKGBUILD /tmp/aur-repo/PKGBUILD
+          cp /tmp/aur-pkg/.SRCINFO /tmp/aur-repo/.SRCINFO
+          cd /tmp/aur-repo
+          git config user.name "${{ secrets.AUR_USERNAME }}"
+          git config user.email "${{ secrets.AUR_EMAIL }}"
+          git config core.sshCommand "ssh -i ~/.ssh/aur -o StrictHostKeyChecking=no"
+          git add PKGBUILD .SRCINFO
+          git diff-index --quiet HEAD || git commit -m "Update to ${{ env.RELEASE_TAG }}"
+          git push
+
+      - name: Print PKGBUILD (local test only)
+        if: env.ACT == 'true'
+        run: |
+          echo "=== Skipping AUR push (running in act) ==="
+          echo "=== Final PKGBUILD contents ==="
+          cat aur/PKGBUILD
 
   publish-updates:
     name: Publish updater manifest
