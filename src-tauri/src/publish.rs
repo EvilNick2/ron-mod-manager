@@ -130,6 +130,8 @@ pub(crate) fn progress_event(pack_id: &str, stage: &str, done: usize, total: usi
         file: file.map(str::to_string),
         bytes_done: bytes.0,
         bytes_total: bytes.1,
+        overall_done: 0,
+        overall_total: 0,
     }
 }
 
@@ -692,6 +694,7 @@ fn run_publish(
     }
 
     let total = plan.uploads.len();
+    let mut sent_all = 0u64;
     let mut done = 0;
     let mut new_ids: BTreeMap<(&str, &str), String> = BTreeMap::new();
     let mut folder_ids: BTreeMap<&str, String> = BTreeMap::new();
@@ -713,11 +716,14 @@ fn run_publish(
             let id = drive.upload(&parent, name, &m.dir.join(&up.path), &mut |n| {
                 sent += n;
                 if throttle.ready() {
-                    progress(progress_event(&pack_id, "uploading", done, total, Some(&up.path), (sent, up.size)));
+                    let event = progress_event(&pack_id, "uploading", done, total, Some(&up.path), (sent, up.size));
+                    progress(event.overall(sent_all + sent.min(up.size), plan.upload_bytes));
                 }
             })?;
             done += 1;
-            progress(progress_event(&pack_id, "uploading", done, total, Some(&up.path), (up.size, up.size)));
+            sent_all += up.size;
+            let event = progress_event(&pack_id, "uploading", done, total, Some(&up.path), (up.size, up.size));
+            progress(event.overall(sent_all, plan.upload_bytes));
             new_ids.insert((m.id.as_str(), up.path.as_str()), id);
         }
         folder_ids.insert(m.id.as_str(), folder_id);
@@ -1312,6 +1318,8 @@ mod tests {
         let last_up = events.iter().rev().find(|p| p.stage == "uploading").unwrap();
         assert_eq!((last_up.done, last_up.total), (5, 5));
         assert_eq!(last_up.bytes_done, last_up.bytes_total);
+        assert!(last_up.overall_total > last_up.bytes_total);
+        assert_eq!(last_up.overall_done, last_up.overall_total);
         let last_del = events.iter().rev().find(|p| p.stage == "deleting").unwrap();
         assert_eq!((last_del.done, last_del.total), (3, 3));
         // the changed pak, the new mod's three files, the changed mod's metadata.json

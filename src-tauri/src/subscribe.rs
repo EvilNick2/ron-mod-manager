@@ -226,7 +226,8 @@ fn stage_remote(
     let manifest = &remote.manifest;
     fs::create_dir_all(staged).map_err(|e| format!("Failed to create staging folder: {}", e))?;
     let total = manifest.mods.iter().map(|m| m.files.len()).sum();
-    let mut fetch = Fetch { drive, manifest, done: 0, total, throttle: Throttle::new(), progress };
+    let bytes_total = manifest.mods.iter().flat_map(|m| &m.files).fold(0u64, |sum, f| sum.saturating_add(f.size));
+    let mut fetch = Fetch { drive, manifest, done: 0, total, bytes_done: 0, bytes_total, throttle: Throttle::new(), progress };
     for m in &manifest.mods {
         let mod_dir = staged.join(&m.id);
         fs::create_dir_all(&mod_dir).map_err(|e| format!("Failed to create {}: {}", mod_dir.display(), e))?;
@@ -247,6 +248,8 @@ struct Fetch<'a> {
     manifest: &'a RemoteManifest,
     done: usize,
     total: usize,
+    bytes_done: u64,
+    bytes_total: u64,
     throttle: Throttle,
     progress: &'a mut dyn FnMut(Progress),
 }
@@ -258,13 +261,15 @@ impl Fetch<'_> {
             return Err(format!("Invalid file path in pack: {}", f.path));
         }
         let (pack_id, done, total) = (self.manifest.pack_id.as_str(), self.done, self.total);
+        let (before, bytes_total) = (self.bytes_done, self.bytes_total);
         let corrupted = || format!("A download from {} was corrupted ({}). Nothing was changed.", self.manifest.name, f.path);
         let mut got = 0u64;
         let (throttle, progress) = (&mut self.throttle, &mut *self.progress);
         let downloaded = self.drive.download(&f.file_id, &dest, f.size, &mut |n| {
             got += n;
             if throttle.ready() {
-                progress(progress_event(pack_id, "downloading", done, total, Some(&f.path), (got, f.size)));
+                let event = progress_event(pack_id, "downloading", done, total, Some(&f.path), (got, f.size));
+                progress(event.overall(before + got.min(f.size), bytes_total));
             }
         });
         let sha = match downloaded {
@@ -275,7 +280,9 @@ impl Fetch<'_> {
             return Err(corrupted());
         }
         self.done += 1;
-        (self.progress)(progress_event(pack_id, "downloading", self.done, total, Some(&f.path), (f.size, f.size)));
+        self.bytes_done = before.saturating_add(f.size);
+        let event = progress_event(pack_id, "downloading", self.done, total, Some(&f.path), (f.size, f.size));
+        (self.progress)(event.overall(self.bytes_done, bytes_total));
         Ok(())
     }
 }
@@ -566,7 +573,8 @@ fn download_changes(
         Stage::Keep => None,
     });
     let total = downloads().map(|(_, d)| d.len()).sum();
-    let mut fetch = Fetch { drive, manifest, done: 0, total, throttle: Throttle::new(), progress };
+    let bytes_total = downloads().flat_map(|(_, d)| d.iter()).fold(0u64, |sum, f| sum.saturating_add(f.size));
+    let mut fetch = Fetch { drive, manifest, done: 0, total, bytes_done: 0, bytes_total, throttle: Throttle::new(), progress };
     for (m, download) in downloads() {
         let mod_dir = staged.join(&m.id);
         fs::create_dir_all(&mod_dir).map_err(|e| format!("Failed to create {}: {}", mod_dir.display(), e))?;
@@ -1008,6 +1016,10 @@ mod tests {
         let last = events.last().unwrap();
         assert_eq!((last.stage.as_str(), last.done, last.total), ("downloading", 5, 5));
         assert_eq!(last.pack_id, PACK);
+        let pack_bytes: u64 = remote.manifest.mods.iter().flat_map(|m| &m.files).map(|f| f.size).sum();
+        assert_eq!((last.overall_done, last.overall_total), (pack_bytes, pack_bytes));
+        let overall: Vec<u64> = events.iter().filter(|p| p.stage == "downloading").map(|p| p.overall_done).collect();
+        assert!(overall.windows(2).all(|w| w[0] <= w[1]), "overall progress went backwards: {:?}", overall);
 
         let pack_dir = mods.join(PACK);
         for m in &remote.manifest.mods {

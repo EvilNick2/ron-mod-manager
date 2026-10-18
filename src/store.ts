@@ -25,6 +25,8 @@ export interface PackProgress {
   file: string | null;
   bytes_done: number;
   bytes_total: number;
+  overall_done: number;
+  overall_total: number;
 }
 
 export interface ModRef {

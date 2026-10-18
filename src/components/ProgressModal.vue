@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed } from "vue";
 import { store } from "../store";
-import { hasVisibleOps, progressLine, progressPercent } from "../packActions";
+import { hasVisibleOps, progressAmount, progressLine, progressPercent } from "../packActions";
 
 const ops = computed(() => Object.keys(store.inFlight)
   .filter((id) => !store.progressHidden[id])
@@ -12,6 +12,7 @@ const ops = computed(() => Object.keys(store.inFlight)
       name: store.packs.find((pack) => pack.pack_id === id)?.name ?? store.opNames[id] ?? id,
       line: p ? progressLine(p) : "Starting...",
       percent: p ? progressPercent(p) : 0,
+      amount: p ? progressAmount(p) : "",
     };
   }));
 
@@ -29,6 +30,7 @@ function hide() {
           <p class="op-name">{{ op.name }}</p>
           <p class="op-line">{{ op.line }}</p>
           <div class="op-track"><div class="op-fill" :style="{ width: op.percent + '%' }"></div></div>
+          <p v-if="op.amount" class="op-amount">{{ op.amount }}</p>
         </div>
         <div class="modal-actions">
           <button class="secondary-btn" @click="hide">Hide</button>
@@ -39,6 +41,13 @@ function hide() {
 </template>
 
 <style scoped>
+.op-amount {
+  margin: 0.4rem 0 0;
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  text-align: right;
+}
+
 .modal-overlay {
   position: fixed;
   top: 0; left: 0; right: 0; bottom: 0;

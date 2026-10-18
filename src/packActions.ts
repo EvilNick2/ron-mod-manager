@@ -142,10 +142,14 @@ export function hasVisibleOps(): boolean {
   return !store.closeBlocked && Object.keys(store.inFlight).some((id) => !store.progressHidden[id]);
 }
 
-// Bytes of the current file when known, else files done
+// Bytes across the whole stage when it moves bytes, else items done
 export function progressPercent(p: PackProgress): number {
-  if (p.bytes_total > 0) return Math.min(100, (p.bytes_done / p.bytes_total) * 100);
+  if (p.overall_total > 0) return Math.min(100, (p.overall_done / p.overall_total) * 100);
   return p.total > 0 ? Math.min(100, (p.done / p.total) * 100) : 0;
+}
+
+export function progressAmount(p: PackProgress): string {
+  return p.overall_total > 0 ? `${formatSize(p.overall_done)} of ${formatSize(p.overall_total)}` : "";
 }
 
 export function progressLine(p: PackProgress): string {

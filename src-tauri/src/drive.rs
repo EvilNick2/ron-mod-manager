@@ -69,6 +69,17 @@ pub struct Progress {
     pub file: Option<String>,
     pub bytes_done: u64,
     pub bytes_total: u64,
+    /// Bytes across the whole stage, zero when the stage does not move bytes
+    pub overall_done: u64,
+    pub overall_total: u64,
+}
+
+impl Progress {
+    pub fn overall(mut self, done: u64, total: u64) -> Progress {
+        self.overall_done = done;
+        self.overall_total = total;
+        self
+    }
 }
 
 pub trait DriveApi {
