@@ -1,5 +1,6 @@
 mod api;
 mod config;
+mod hashing;
 mod packs;
 mod sso;
 mod updater;
