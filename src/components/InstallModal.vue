@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { store } from "../store";
 import { refreshMods } from "../packActions";
+import { showAlert, showConfirm } from "../dialogs";
 import { invoke } from "@tauri-apps/api/core";
 import { computed, ref, watch } from "vue";
 import { Archive, FileArchive, FolderOpen, Puzzle, Trash2, Plus } from 'lucide-vue-next';
@@ -32,7 +33,8 @@ function extractModId(input: string): string | null {
 
 async function startInstall() {
   errorMsg.value = "";
-  if (!store.installingModPath) return;
+  const archivePath = store.installingModPath;
+  if (!archivePath) return;
 
   const modId = extractModId(nexusInput.value);
   if (!modId) {
@@ -42,7 +44,7 @@ async function startInstall() {
 
   const packId = installPackId.value;
   if (packId) {
-    const archive = store.installingModPath.split(/[\\/]/).pop();
+    const archive = archivePath.split(/[\\/]/).pop();
     const root = store.mods.find((m: any) => m.id === modId);
     const packCopy = store.mods.find((m: any) => m.id === `${packId}/${modId}`);
     const packName = store.packs.find((p) => p.pack_id === packId)?.name ?? packId;
@@ -53,14 +55,14 @@ async function startInstall() {
     } else if (root) {
       question = `Replaces the hand installed copy ${root.version} with ${archive}?`;
     }
-    if (question && !confirm(question)) return;
+    if (question && !(await showConfirm(question))) return;
   }
 
   isInstalling.value = true;
   try {
-    console.log("[InstallModal] Starting install for modId:", modId, "path:", store.installingModPath);
+    console.log("[InstallModal] Starting install for modId:", modId, "path:", archivePath);
     await invoke("install_mod_archive", { 
-      archivePath: store.installingModPath, 
+      archivePath, 
       modId: modId
     });
     
@@ -83,7 +85,7 @@ async function startInstall() {
     console.log("[InstallModal] Setting postInstallModId to:", postId);
     store.postInstallModId = postId;
     installPackId.value = "";
-    if (moveWarning) alert(moveWarning);
+    if (moveWarning) await showAlert(moveWarning);
     store.installingModPath = null;
     store.awaitingDropForId = null;
     nexusInput.value = "";

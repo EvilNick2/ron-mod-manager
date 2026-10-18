@@ -6,6 +6,7 @@ import {
   applyPack, loadPacks, loadPresets, refreshMods, publishPack, copyText, folderLink, progressLine, packLabel,
   importArchive, addPackFromLink, updatePack, verifyPack, forkPack, updateLine
 } from "../packActions";
+import { showAlert, showConfirm, showPrompt } from "../dialogs";
 import { 
   Package, 
   Globe, 
@@ -32,11 +33,11 @@ async function loginNexus() {
 }
 
 async function saveCurrentPreset() {
-  const name = prompt("Name this preset:");
+  const name = await showPrompt("Name this preset:");
   if (!name || !name.trim()) return;
   const enabledIds = store.mods.filter((m: any) => m.enabled).map((m: any) => m.id);
   if (enabledIds.length === 0) {
-    alert("No mods are currently enabled to save.");
+    await showAlert("No mods are currently enabled to save.");
     return;
   }
   try {
@@ -56,18 +57,18 @@ async function applyPreset(name: string) {
     await refreshMods();
   } catch (e) {
     console.error("Failed to apply preset:", e);
-    alert("Failed to apply preset: " + e);
+    await showAlert("Failed to apply preset: " + e);
   }
 }
 
 async function exportPreset(name: string) {
   try {
     await invoke("export_preset", { presetName: name });
-    alert(`Successfully exported preset: ${name}`);
+    await showAlert(`Successfully exported preset: ${name}`);
   } catch (e: any) {
     if (e !== "Export cancelled") {
       console.error("Failed to export preset:", e);
-      alert("Failed to export preset: " + e);
+      await showAlert("Failed to export preset: " + e);
     }
   }
 }
@@ -90,7 +91,7 @@ async function onApplyPack(pack: PackManifest) {
     await applyPack(pack);
   } catch (e) {
     console.error("Failed to apply pack:", e);
-    alert("Failed to apply pack: " + e);
+    await showAlert("Failed to apply pack: " + e);
   }
 }
 
@@ -99,27 +100,27 @@ function showPack(pack: PackManifest) {
 }
 
 async function exportPack(pack: PackManifest) {
-  const version = prompt("Version for this export:", pack.version ?? "");
+  const version = await showPrompt("Version for this export:", pack.version ?? "");
   if (version === null) return;
   try {
     await invoke("export_preset", { presetName: `pack:${pack.pack_id}`, version: version.trim() || undefined });
-    alert(`Successfully exported modpack: ${pack.name}`);
+    await showAlert(`Successfully exported modpack: ${pack.name}`);
   } catch (e: any) {
     if (e !== "Export cancelled") {
       console.error("Failed to export pack:", e);
-      alert("Failed to export pack: " + e);
+      await showAlert("Failed to export pack: " + e);
     }
   }
 }
 
 async function removePack(pack: PackManifest) {
-  if (!confirm(`Delete ${packLabel(pack.name, pack.version)} and its ${pack.mod_ids.length} mods from disk?`)) return;
+  if (!(await showConfirm(`Delete ${packLabel(pack.name, pack.version)} and its ${pack.mod_ids.length} mods from disk?`, { danger: true, confirmLabel: "Delete" }))) return;
   try {
     await invoke("delete_pack", { packId: pack.pack_id });
     await refreshMods();
   } catch (e) {
     console.error("Failed to delete pack:", e);
-    alert("Failed to delete pack: " + e);
+    await showAlert("Failed to delete pack: " + e);
   }
 }
 
@@ -130,7 +131,7 @@ async function importPreset() {
   } catch (e: any) {
     if (e !== "Import cancelled") {
       console.error("Failed to import preset:", e);
-      alert("Failed to import preset: " + e);
+      await showAlert("Failed to import preset: " + e);
     }
     return;
   }
@@ -194,7 +195,7 @@ async function bulkToggleMods(enable: boolean) {
     await refreshMods();
   } catch (e: any) {
     console.error("Bulk toggle failed:", e);
-    alert("Bulk Action Failed: " + e);
+    await showAlert("Bulk Action Failed: " + e);
   } finally {
     store.isFetchingOnline = false;
   }
@@ -214,7 +215,7 @@ async function fetchOnlineMods() {
   if (store.onlineMods.length > 0) return;
   
   if (!store.apiKeyStore) {
-    alert("You must log into Nexus Mods to browse online mods.");
+    await showAlert("You must log into Nexus Mods to browse online mods.");
     return;
   }
 
@@ -265,7 +266,7 @@ async function launchGame() {
     await invoke("launch_game");
   } catch (e) {
     console.error("Failed to launch game:", e);
-    alert("Failed to launch game: " + e);
+    await showAlert("Failed to launch game: " + e);
   }
 }
 </script>

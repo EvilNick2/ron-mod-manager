@@ -5,6 +5,7 @@ import {
   applyPack, refreshMods as rescanMods, publishPack, copyText, folderLink, progressLine, checkPackUpdates, updatePack,
   updateLine, isLinked
 } from "../packActions";
+import { showAlert, showConfirm } from "../dialogs";
 import { invoke } from "@tauri-apps/api/core";
 import { onMounted, onBeforeUnmount, ref, computed, watch } from "vue";
 import { Search, Plus, RefreshCw, X, ChevronDown, ChevronRight } from 'lucide-vue-next';
@@ -171,7 +172,7 @@ async function setSectionEnabled(section: Section, enable: boolean) {
     }
   } catch (e: any) {
     console.error("Section toggle failed:", e);
-    alert("Failed to update mods: " + e);
+    await showAlert("Failed to update mods: " + e);
   }
   try {
     await rescanMods();
@@ -196,7 +197,7 @@ async function applySectionPack(section: Section) {
     await applyPack(pack);
   } catch (e: any) {
     console.error("Failed to apply pack:", e);
-    alert("Failed to apply pack: " + e);
+    await showAlert("Failed to apply pack: " + e);
   }
 }
 
@@ -327,7 +328,7 @@ async function toggleModRightClick(mod: any) {
     mod.enabled = newState;
   } catch (e: any) {
     console.error("Right-click deploy failed:", e);
-    alert("Failed to toggle mod deployment: " + e);
+    await showAlert("Failed to toggle mod deployment: " + e);
     return;
   }
   if (store.currentMode !== 'Installed') return;
@@ -335,7 +336,7 @@ async function toggleModRightClick(mod: any) {
     await rescanMods();
   } catch (e: any) {
     console.error("Refresh after toggle failed:", e);
-    alert("Mod toggled, but the list could not be refreshed: " + e);
+    await showAlert("Mod toggled, but the list could not be refreshed: " + e);
   }
 }
 
@@ -351,13 +352,13 @@ async function manualPickArchive() {
 }
 
 async function removeMod(mod: any) {
-  if (!confirm(`Are you absolutely sure you want to completely remove ${mod.name}?`)) return;
+  if (!(await showConfirm(`Are you absolutely sure you want to completely remove ${mod.name}?`, { danger: true, confirmLabel: "Remove" }))) return;
   
   try {
     await invoke("delete_mod", { modId: mod.id });
   } catch (e: any) {
     console.error("Engine failed to purge mod:", e);
-    alert("Purge Failure: " + e);
+    await showAlert("Purge Failure: " + e);
   }
   try {
     await rescanMods();
@@ -369,7 +370,7 @@ async function removeMod(mod: any) {
 async function startModUpdateFlow(mod: any) {
   const modId = mod?.nexus_mod_id || Number.parseInt(mod?.id, 10);
   if (!modId || Number.isNaN(modId)) {
-    alert("This mod is missing a Nexus mod ID, so update flow can't be started");
+    await showAlert("This mod is missing a Nexus mod ID, so update flow can't be started");
     return;
   }
 
@@ -380,7 +381,7 @@ async function startModUpdateFlow(mod: any) {
     store.installingModPath = null;
   } catch (e: any) {
     console.error("Failed to start mod update flow:", e);
-    alert("Failed to open Nexus page: " + e);
+    await showAlert("Failed to open Nexus page: " + e);
   }
 }
 

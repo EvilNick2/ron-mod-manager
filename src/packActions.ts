@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { store, type ModRef, type PackManifest, type PackProgress, type PackRef, type UpdateCheck } from "./store";
+import { showAlert, showConfirm, showCopy, showPrompt } from "./dialogs";
 
 type PublishOutcome =
   | { kind: "Published"; folder_id: string; version: string; uploaded: number; deleted: number }
@@ -104,17 +105,20 @@ export async function copyText(text: string): Promise<void> {
     await writeText(text);
   } catch (e) {
     console.error("Clipboard write failed:", e);
-    prompt("Copy this link:", text);
+    await showCopy(text);
   }
 }
 
-export function beginOp(packId: string): void {
+export function beginOp(packId: string, name?: string): void {
   store.inFlight[packId] = true;
+  if (name) store.opNames[packId] = name;
 }
 
 export function endOp(packId: string): void {
   delete store.inFlight[packId];
   delete store.packProgress[packId];
+  delete store.opNames[packId];
+  delete store.progressHidden[packId];
 }
 
 // Rounds ties to even like Rust's {:.N}. A tie is exact only when x * 2^(digits+1) is an odd integer.
@@ -132,6 +136,16 @@ export function formatSize(bytes: number): string {
   if (bytes >= gib) return `${toFixedEven(bytes / gib, 1)} GB`;
   if (bytes >= mib) return `${toFixedEven(bytes / mib, 0)} MB`;
   return `${Math.ceil(bytes / 1024)} KB`;
+}
+
+export function hasVisibleOps(): boolean {
+  return !store.closeBlocked && Object.keys(store.inFlight).some((id) => !store.progressHidden[id]);
+}
+
+// Bytes of the current file when known, else files done
+export function progressPercent(p: PackProgress): number {
+  if (p.bytes_total > 0) return Math.min(100, (p.bytes_done / p.bytes_total) * 100);
+  return p.total > 0 ? Math.min(100, (p.done / p.total) * 100) : 0;
 }
 
 export function progressLine(p: PackProgress): string {
@@ -171,39 +185,42 @@ function suggestVersion(current: string | null | undefined): string {
   return `${parts[0]}.${parts[1]}.${parts[2] + 1}`;
 }
 
-function askVersion(pack: PackManifest): string | null {
-  let value = suggestVersion(pack.version);
-  let message = VERSION_HELP;
-  for (;;) {
-    const input = prompt(message, value);
-    if (input === null) return null;
-    const version = input.trim();
-    if (SEMVER.test(version)) return version;
-    value = version;
-    message = `${version || "That"} is not a valid version. Use MAJOR.MINOR.PATCH, for example 1.4.2.\n\n${VERSION_HELP}`;
-  }
+async function askVersion(pack: PackManifest): Promise<string | null> {
+  const input = await showPrompt(VERSION_HELP, suggestVersion(pack.version), {
+    title: `Publish ${pack.name}`,
+    confirmLabel: "Publish",
+    validate: (v) => {
+      const version = v.trim();
+      return SEMVER.test(version) ? null : `${version || "That"} is not a valid version. Use MAJOR.MINOR.PATCH, for example 1.4.2.`;
+    },
+  });
+  return input === null ? null : input.trim();
 }
 
 export async function publishPack(pack: PackManifest): Promise<boolean> {
-  const version = askVersion(pack);
+  const version = await askVersion(pack);
   if (version === null) return false;
-  let outcome: PublishOutcome;
-  beginOp(pack.pack_id);
+  let outcome: PublishOutcome | null = null;
+  let failed: { error: unknown } | null = null;
+  beginOp(pack.pack_id, pack.name);
   try {
     outcome = await invoke("publish_pack_cmd", { packId: pack.pack_id, version }) as PublishOutcome;
   } catch (e) {
     console.error("Failed to publish pack:", e);
-    alert("Failed to publish: " + e);
-    return false;
+    failed = { error: e };
   } finally {
     endOp(pack.pack_id);
     await refreshMods().catch((e) => console.error("Failed to refresh mods:", e));
   }
+  if (failed !== null || outcome === null) {
+    await showAlert("Failed to publish: " + failed?.error);
+    return false;
+  }
   if (outcome.kind === "Published") {
     await copyText(folderLink(outcome.folder_id));
-    alert(`Published ${pack.name} ${outcome.version}. The link is copied, share it with your players.`);
+    await showAlert(`Published ${pack.name} ${outcome.version}. The link is copied, share it with your players.`);
   } else {
-    alert("Nothing to publish");
+    await showAlert("Nothing to publish");
   }
   return true;
 }
@@ -247,7 +264,7 @@ async function finishImport(summary: ImportSummary, imported: { label: string })
   if (summary.failed_deletes.length > 0) {
     message += `\nThese folders could not be deleted: ${summary.failed_deletes.join(", ")}`;
   }
-  alert(message);
+  await showAlert(message);
 }
 
 export async function importArchive(archivePath: string): Promise<void> {
@@ -257,17 +274,17 @@ export async function importArchive(archivePath: string): Promise<void> {
     const preview = await invoke("inspect_preset_archive", { archivePath }) as ImportPreview;
     const installed = store.packs.find((p) => p.pack_id === preview.pack.pack_id);
     const question = importQuestion(preview, installed);
-    if (question && !confirm(question)) return;
+    if (question && !(await showConfirm(question))) return;
 
     const summary = await invoke("import_preset", { archivePath }) as ImportSummary;
     await finishImport(summary, imported);
   } catch (e: any) {
     if (imported.label) {
       console.error("Import follow-up failed:", e);
-      alert(`${imported.label} was imported, but the next step failed: ${e}`);
+      await showAlert(`${imported.label} was imported, but the next step failed: ${e}`);
     } else if (e !== "Import cancelled") {
       console.error("Failed to import preset:", e);
-      alert("Failed to import preset: " + e);
+      await showAlert("Failed to import preset: " + e);
     }
   }
   if (imported.label) await checkPackUpdates();
@@ -292,7 +309,7 @@ export function updateLine(check: UpdateCheck): string {
 }
 
 export async function addPackFromLink(): Promise<void> {
-  const link = prompt("Paste the modpack's Google Drive link:");
+  const link = await showPrompt("Paste the modpack's Google Drive link:", "", { title: "Add Modpack" });
   if (!link || !link.trim()) return;
   const imported = { label: "" };
   try {
@@ -301,7 +318,7 @@ export async function addPackFromLink(): Promise<void> {
     const preview = result.preview;
     const { name, version } = preview.pack;
     if (store.inFlight[preview.pack.pack_id]) {
-      alert(`${name} is busy, try again when it finishes`);
+      await showAlert(`${name} is busy, try again when it finishes`);
       return;
     }
     const installed = store.packs.find((p) => p.pack_id === preview.pack.pack_id);
@@ -312,10 +329,14 @@ export async function addPackFromLink(): Promise<void> {
       question = `Update ${name}${from}${to}?`;
     }
     if (!question) question = `Import ${packLabel(name, version)}?`;
-    if (!confirm(`${question} Downloads ${formatSize(result.download_bytes)}.`)) return;
+    if (!(await showConfirm(`${question} Downloads ${formatSize(result.download_bytes)}.`))) return;
 
     const packId = preview.pack.pack_id;
-    beginOp(packId);
+    if (store.inFlight[packId]) {
+      await showAlert(`${name} is busy, try again when it finishes`);
+      return;
+    }
+    beginOp(packId, name);
     let summary: ImportSummary;
     try {
       summary = await invoke("add_pack_from_link", { link }) as ImportSummary;
@@ -326,35 +347,36 @@ export async function addPackFromLink(): Promise<void> {
   } catch (e: any) {
     if (imported.label) {
       console.error("Add from link follow-up failed:", e);
-      alert(`${imported.label} was imported, but the next step failed: ${e}`);
+      await showAlert(`${imported.label} was imported, but the next step failed: ${e}`);
     } else {
       console.error("Failed to add the modpack:", e);
-      alert("Failed to add the modpack: " + e);
+      await showAlert("Failed to add the modpack: " + e);
     }
   }
   if (imported.label) await checkPackUpdates();
 }
 
 async function runPackUpdate(pack: PackManifest, run: () => Promise<UpdateSummary>, failure: string): Promise<void> {
-  let summary: UpdateSummary;
-  beginOp(pack.pack_id);
+  let summary: UpdateSummary | null = null;
+  let failed: { error: unknown } | null = null;
+  beginOp(pack.pack_id, pack.name);
   try {
     summary = await run();
   } catch (e) {
     console.error(failure, e);
-    alert(failure + e);
-    return;
-  } finally {
-    endOp(pack.pack_id);
-    await refreshMods().catch((e) => console.error("Failed to refresh mods:", e));
-    await loadPresets().catch((e) => console.error("Failed to load presets:", e));
-    await checkPackUpdates();
+    failed = { error: e };
   }
+  endOp(pack.pack_id);
+  if (failed !== null) await showAlert(failure + failed.error);
+  await refreshMods().catch((e) => console.error("Failed to refresh mods:", e));
+  await loadPresets().catch((e) => console.error("Failed to load presets:", e));
+  await checkPackUpdates();
+  if (summary === null) return;
   if (summary.failed_deletes.length > 0) {
     console.warn(`Folders left behind after updating ${pack.name}:`, summary.failed_deletes);
   }
   if (summary.not_enabled.length > 0) {
-    alert(`${pack.name} was updated, but these mods could not be turned on: ${summary.not_enabled.join(", ")}`);
+    await showAlert(`${pack.name} was updated, but these mods could not be turned on: ${summary.not_enabled.join(", ")}`);
   }
 }
 
@@ -362,32 +384,34 @@ export async function updatePack(pack: PackManifest): Promise<void> {
   const check = store.packUpdates[pack.pack_id];
   if (check?.status !== "available" || store.inFlight[pack.pack_id]) return;
   const question = `Update ${pack.name} to ${check.remote_version}? ${check.added.length} mods added, ${check.changed.length} updated, ${check.removed.length} removed and deleted from disk. Downloads ${formatSize(check.download_bytes)}.`;
-  if (!confirm(question)) return;
+  if (!(await showConfirm(question))) return;
+  if (store.inFlight[pack.pack_id]) return;
   await runPackUpdate(pack, () => invoke("update_linked_pack", { packId: pack.pack_id }), "Failed to update: ");
 }
 
 export async function verifyPack(pack: PackManifest): Promise<void> {
   if (store.inFlight[pack.pack_id]) return;
   let broken: string[];
-  beginOp(pack.pack_id);
+  beginOp(pack.pack_id, pack.name);
   try {
     broken = await invoke("verify_linked_pack", { packId: pack.pack_id }) as string[];
   } catch (e) {
     console.error("Failed to verify:", e);
-    alert("Failed to verify: " + e);
-    return;
-  } finally {
     endOp(pack.pack_id);
+    await showAlert("Failed to verify: " + e);
+    return;
   }
+  endOp(pack.pack_id);
   if (broken.length === 0) {
-    alert("All files match.");
+    await showAlert("All files match.");
     return;
   }
   const check = store.packUpdates[pack.pack_id];
   const question = check?.status === "available"
     ? `Redownload ${broken.length} mods? This also installs the update to ${check.remote_version}.`
     : `Redownload ${broken.length} mods?`;
-  if (!confirm(question)) return;
+  if (!(await showConfirm(question))) return;
+  if (store.inFlight[pack.pack_id]) return;
   await runPackUpdate(
     pack,
     () => invoke("redownload_mods", { packId: pack.pack_id, modIds: broken }),
@@ -402,20 +426,23 @@ export async function forkPack(pack: PackManifest): Promise<void> {
     size = await invoke("get_pack_size", { packId: pack.pack_id }) as number;
   } catch (e) {
     console.error("Failed to fork:", e);
-    alert("Failed to fork: " + e);
+    await showAlert("Failed to fork: " + e);
     return;
   }
-  const name = prompt("Name for the fork:", `${pack.name} (fork)`);
-  if (name === null) return;
-  if (!confirm(`Forking copies ${formatSize(size)} of mods. Continue?`)) return;
-  beginOp(pack.pack_id);
+  const name = await showPrompt("Name for the fork:", `${pack.name} (fork)`, { title: `Fork ${pack.name}` });
+  if (name === null || store.inFlight[pack.pack_id]) return;
+  if (!(await showConfirm(`Forking copies ${formatSize(size)} of mods. Continue?`))) return;
+  if (store.inFlight[pack.pack_id]) return;
+  let failed: { error: unknown } | null = null;
+  beginOp(pack.pack_id, pack.name);
   try {
     await invoke("fork_pack", { packId: pack.pack_id, name });
   } catch (e) {
     console.error("Failed to fork:", e);
-    alert("Failed to fork: " + e);
+    failed = { error: e };
   } finally {
     endOp(pack.pack_id);
     await refreshMods().catch((e) => console.error("Failed to refresh mods:", e));
   }
+  if (failed !== null) await showAlert("Failed to fork: " + failed.error);
 }

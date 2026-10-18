@@ -2,7 +2,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { computed, ref } from "vue";
 import { store, type PackRef } from "../store";
-import { loadPacks, publishPack, progressLine } from "../packActions";
+import { loadPacks, publishPack, progressLine, progressPercent } from "../packActions";
+import { showAlert } from "../dialogs";
 
 const busy = ref(false);
 
@@ -12,9 +13,7 @@ const progress = computed(() => Object.values(store.packProgress).map((p) => ({
   key: p.pack_id,
   name: store.packs.find((pack) => pack.pack_id === p.pack_id)?.name ?? p.pack_id,
   line: progressLine(p),
-  percent: p.bytes_total > 0
-    ? Math.min(100, (p.bytes_done / p.bytes_total) * 100)
-    : p.total > 0 ? Math.min(100, (p.done / p.total) * 100) : 0,
+  percent: progressPercent(p),
 })));
 
 function joinNames(packs: PackRef[]): string {
@@ -39,7 +38,7 @@ async function forceClose() {
     await invoke("force_close");
   } catch (e) {
     console.error("Failed to close:", e);
-    alert("Failed to close: " + e);
+    await showAlert("Failed to close: " + e);
   }
 }
 
@@ -52,7 +51,7 @@ async function uploadNow() {
     for (const entry of dirty) {
       const pack = store.packs.find((p) => p.pack_id === entry.pack_id);
       if (!pack) {
-        alert(`Could not find ${entry.name} to upload it.`);
+        await showAlert(`Could not find ${entry.name} to upload it.`);
         return;
       }
       if (!(await publishPack(pack))) return;
@@ -60,7 +59,7 @@ async function uploadNow() {
     await forceClose();
   } catch (e) {
     console.error("Failed to upload before closing:", e);
-    alert("Failed to upload: " + e);
+    await showAlert("Failed to upload: " + e);
   } finally {
     busy.value = false;
   }

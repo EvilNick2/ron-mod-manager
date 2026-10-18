@@ -50,6 +50,19 @@ export interface CloseBlocked {
   uploading: PackRef[];
 }
 
+export interface DialogRequest {
+  id: number;
+  kind: "alert" | "confirm" | "prompt" | "copy";
+  title: string;
+  message: string;
+  value: string;
+  confirmLabel: string;
+  cancelLabel: string;
+  danger: boolean;
+  validate?: (v: string) => string | null;
+  resolve: (result: boolean | string | null) => void;
+}
+
 export const store = reactive({
   apiKeyStore: "",
   currentMode: "Installed",
@@ -89,6 +102,9 @@ export const store = reactive({
   google: { signInAvailable: false, linksAvailable: false, email: null as string | null },
   packProgress: {} as Record<string, PackProgress>,
   inFlight: {} as Record<string, true>,
+  opNames: {} as Record<string, string>,
+  progressHidden: {} as Record<string, true>,
+  dialogs: [] as DialogRequest[],
   packUpdates: {} as Record<string, UpdateCheck>,
   closeBlocked: null as CloseBlocked | null
 });

@@ -3,7 +3,7 @@ import { onMounted, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { store, type PackProgress, type CloseBlocked } from "./store";
-import { loadGoogleStatus, checkPackUpdates } from "./packActions";
+import { loadGoogleStatus, checkPackUpdates, hasVisibleOps } from "./packActions";
 
 import Sidebar from "./components/Sidebar.vue";
 import ModGrid from "./components/ModGrid.vue";
@@ -12,6 +12,8 @@ import SettingsModal from "./components/SettingsModal.vue";
 import InstallModal from "./components/InstallModal.vue";
 import UpdateModal from "./components/UpdateModal.vue";
 import CloseGuardModal from "./components/CloseGuardModal.vue";
+import ProgressModal from "./components/ProgressModal.vue";
+import DialogModal from "./components/DialogModal.vue";
 
 const isDragging = ref(false);
 
@@ -119,7 +121,7 @@ onMounted(async () => {
     <h2>Drop Mod Archive Here</h2>
   </div>
 
-  <div class="app-layout" :class="{ 'modal-open': store.isSettingsOpen || store.installingModPath || store.postInstallModId || store.isUpdateModalOpen || store.closeBlocked, 'blur-enabled': store.isBlurEnabled }">
+  <div class="app-layout" :class="{ 'modal-open': store.isSettingsOpen || store.installingModPath || store.postInstallModId || store.isUpdateModalOpen || store.closeBlocked || hasVisibleOps() || store.dialogs.length > 0, 'blur-enabled': store.isBlurEnabled }">
     <Sidebar />
     <ModGrid />
     <RightPanel />
@@ -137,6 +139,9 @@ onMounted(async () => {
     <transition name="fade">
       <CloseGuardModal v-if="store.closeBlocked" />
     </transition>
+
+    <ProgressModal />
+    <DialogModal />
   </div>
 </template>
 

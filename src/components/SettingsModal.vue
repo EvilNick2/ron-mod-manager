@@ -2,6 +2,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { store } from "../store";
 import { refreshMods, loadGoogleStatus } from "../packActions";
+import { showAlert } from "../dialogs";
 import { onMounted, ref } from "vue";
 import { X, Globe, Crosshair, Info } from 'lucide-vue-next';
 
@@ -51,7 +52,7 @@ async function openGamePath() {
     await invoke("open_game_path");
   } catch (e) {
     console.error("Failed to open game path:", e);
-    alert("Could not open folder: " + e);
+    await showAlert("Could not open folder: " + e);
   }
 }
 
@@ -93,7 +94,7 @@ async function signInGoogle() {
     await loadGoogleStatus();
   } catch (e) {
     console.error("Google sign-in failed:", e);
-    alert("Failed to sign in with Google: " + e);
+    await showAlert("Failed to sign in with Google: " + e);
   } finally {
     googleBusy.value = false;
   }
@@ -106,7 +107,7 @@ async function signOutGoogle() {
     await loadGoogleStatus();
   } catch (e) {
     console.error("Google sign-out failed:", e);
-    alert("Failed to sign out of Google: " + e);
+    await showAlert("Failed to sign out of Google: " + e);
   } finally {
     googleBusy.value = false;
   }

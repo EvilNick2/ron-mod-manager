@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { store } from "../store";
 import { refreshMods, isLinked } from "../packActions";
+import { showAlert, showConfirm } from "../dialogs";
 import { invoke } from "@tauri-apps/api/core";
 import { ref, computed } from "vue";
 import { ExternalLink, Download, PackageSearch, X, Plus, Puzzle, Trash2 } from 'lucide-vue-next';
@@ -66,7 +67,7 @@ async function toggleAddon(filename: string, enable: boolean) {
 
 async function deleteAddon(filename: string) {
   if (!store.selectedMod) return;
-  if (!confirm(`Remove addon "${filename}"?`)) return;
+  if (!(await showConfirm(`Remove addon "${filename}"?`, { danger: true, confirmLabel: "Remove" }))) return;
   try {
     await invoke("remove_addon", { modId: store.selectedMod.id, filename });
     await refreshMods();
@@ -95,7 +96,7 @@ async function handleMoveError(e: any): Promise<boolean> {
   const match = msg.match(/^Moved to (\S+)/);
   if (!match) return false;
   await reselect(match[1]);
-  alert(msg);
+  await showAlert(msg);
   return true;
 }
 
@@ -109,7 +110,7 @@ async function addToPack(event: Event) {
   const pack = store.packs.find((p) => p.pack_id === packId);
   const existing = store.mods.find((m: any) =>
     m.pack?.pack_id === packId && sel.nexus_mod_id != null && m.nexus_mod_id === sel.nexus_mod_id);
-  if (existing && !confirm(`Replaces ${existing.version} in ${pack?.name ?? packId} with ${sel.version}?`)) return;
+  if (existing && !(await showConfirm(`Replaces ${existing.version} in ${pack?.name ?? packId} with ${sel.version}?`))) return;
   try {
     const newKey: string = await invoke("move_to_pack", { key: sel.id, packId });
     await reselect(newKey);
@@ -128,10 +129,10 @@ async function removeFromPack() {
       newKey = await invoke("remove_from_pack", { key: sel.id, replaceRoot: false });
     } catch (e: any) {
       if (String(e) !== "root-exists") throw e;
-      if (confirm("A hand installed copy already exists. Replace it with this one?")) {
+      if (await showConfirm("A hand installed copy already exists. Replace it with this one?", { confirmLabel: "Replace", cancelLabel: "No" })) {
         newKey = await invoke("remove_from_pack", { key: sel.id, replaceRoot: true });
       } else {
-        if (!confirm("Delete this pack copy instead?")) return;
+        if (!(await showConfirm("Delete this pack copy instead?", { danger: true, confirmLabel: "Delete" }))) return;
         await invoke("delete_mod", { modId: sel.id });
         await refreshMods();
         return;
