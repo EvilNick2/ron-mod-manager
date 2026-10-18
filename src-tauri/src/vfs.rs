@@ -289,7 +289,17 @@ pub async fn install_mod_archive(app_handle: tauri::AppHandle, archive_path: Str
         return Err(format!("Archives can only be installed to a loose mod, not {}", mod_id));
     }
     let target_dir = resolve_key(&mods_dir, &mod_id)?;
-    
+    let paks_dir = get_paks_dir(&app_handle).ok();
+
+    let was_enabled = fs::read_to_string(target_dir.join("metadata.json"))
+        .ok()
+        .and_then(|c| serde_json::from_str::<Value>(&c).ok())
+        .and_then(|v| v.get("enabled").and_then(Value::as_bool))
+        .unwrap_or(false);
+    if let Some(paks_dir) = &paks_dir {
+        unlink_mod(paks_dir, &mod_id)?;
+    }
+
     if target_dir.exists() {
         std::fs::remove_dir_all(&target_dir).ok();
     }
@@ -346,6 +356,13 @@ pub async fn install_mod_archive(app_handle: tauri::AppHandle, archive_path: Str
                     }
                 }
             }
+        }
+    }
+
+    set_enabled_flag(&target_dir, was_enabled);
+    if was_enabled {
+        if let Some(paks_dir) = &paks_dir {
+            enable_key(&mods_dir, paks_dir, &mod_id)?;
         }
     }
     
@@ -597,25 +614,90 @@ pub async fn delete_mod(app_handle: tauri::AppHandle, mod_id: String) -> Result<
     Ok(())
 }
 
-#[tauri::command]
-pub async fn apply_preset(app_handle: tauri::AppHandle, name: String, mod_ids: Vec<String>) -> Result<(), String> {
-    let all_mods = scan_local_mods(app_handle.clone()).await?;
-    let preset_set: std::collections::HashSet<String> = mod_ids.iter().cloned().collect();
-    
-    for m in &all_mods {
-        if !preset_set.contains(&m.id) && m.enabled {
-            toggle_mod(app_handle.clone(), m.id.clone(), false).await?;
+#[derive(Serialize, Debug, Default)]
+pub struct ApplySummary {
+    pub enabled: usize,
+    pub disabled: usize,
+    pub missing: usize,
+}
+
+// `disabled` counts mods that had links in Paks or were flagged enabled, not every mod outside the set
+fn apply_keys(mods_dir: &Path, paks_dir: &Path, keys: &[String]) -> Result<ApplySummary, String> {
+    let wanted: std::collections::HashSet<&String> = keys.iter().collect();
+    let mut summary = ApplySummary::default();
+
+    for m in scan_dir(mods_dir) {
+        if wanted.contains(&m.id) || parse_key(&m.id).is_err() {
+            continue;
+        }
+        let had_links = unlink_mod(paks_dir, &m.id)? > 0;
+        disable_key(mods_dir, paks_dir, &m.id)?;
+        if had_links || m.enabled {
+            summary.disabled += 1;
         }
     }
-    
-    for id in mod_ids {
-        toggle_mod(app_handle.clone(), id, true).await?;
+
+    sweep_orphans(paks_dir, mods_dir);
+
+    for key in keys {
+        if resolve_key(mods_dir, key).map(|p| p.is_dir()).unwrap_or(false) {
+            enable_key(mods_dir, paks_dir, key)?;
+            summary.enabled += 1;
+        } else {
+            summary.missing += 1;
+        }
     }
+    Ok(summary)
+}
+
+#[tauri::command]
+pub async fn apply_preset(app_handle: tauri::AppHandle, name: String, mod_ids: Vec<String>) -> Result<ApplySummary, String> {
+    let config = crate::config::load_config(app_handle.clone()).map_err(|e| e.to_string())?;
+    config.game_path.ok_or("Game installation path is not set! Please configure it in the Settings tab.")?;
+    let paks_dir = get_paks_dir(&app_handle)?;
+    let mods_dir = get_mods_dir(&app_handle)?;
+    let summary = apply_keys(&mods_dir, &paks_dir, &mod_ids)?;
 
     let mut config = crate::config::load_config(app_handle.clone())?;
     config.active_preset = Some(name);
     crate::config::save_config(app_handle, config)?;
-    
+
+    Ok(summary)
+}
+
+#[tauri::command]
+pub fn load_packs(app_handle: tauri::AppHandle) -> Result<Vec<crate::packs::PackManifest>, String> {
+    let mods_dir = get_mods_dir(&app_handle)?;
+    let mut packs: Vec<_> = child_dirs(&mods_dir)?
+        .into_iter()
+        .filter_map(|name| read_manifest(&mods_dir.join(name)))
+        .collect();
+    packs.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(packs)
+}
+
+#[tauri::command]
+pub async fn delete_pack(app_handle: tauri::AppHandle, pack_id: String) -> Result<(), String> {
+    let mods_dir = get_mods_dir(&app_handle)?;
+    let pack_dir = mods_dir.join(&pack_id);
+    if parse_key(&format!("{}/1", pack_id)).is_err() || read_manifest(&pack_dir).is_none() {
+        return Err(format!("No modpack folder for {:?}", pack_id));
+    }
+    if let Ok(paks_dir) = get_paks_dir(&app_handle) {
+        for name in child_dirs(&pack_dir)? {
+            let key = format!("{}/{}", pack_id, name);
+            if parse_key(&key).is_ok() {
+                disable_key(&mods_dir, &paks_dir, &key)?;
+            }
+        }
+    }
+    fs::remove_dir_all(&pack_dir).map_err(|e| format!("Failed to remove modpack folder: {}", e))?;
+
+    let mut config = crate::config::load_config(app_handle.clone())?;
+    if config.active_preset.as_deref() == Some(&format!("pack:{}", pack_id)) {
+        config.active_preset = None;
+        crate::config::save_config(app_handle, config)?;
+    }
     Ok(())
 }
 
@@ -636,9 +718,8 @@ fn zip_dir(
             };
             
             if path.is_dir() {
-                let dir_prefix = format!("{}/", new_prefix);
-                writer.add_directory(&dir_prefix, options).map_err(|e| e.to_string())?;
-                zip_dir(&path, &dir_prefix, writer, options)?;
+                writer.add_directory(&format!("{}/", new_prefix), options).map_err(|e| e.to_string())?;
+                zip_dir(&path, &new_prefix, writer, options)?;
             } else {
                 writer.start_file(&new_prefix, options).map_err(|e| e.to_string())?;
                 if let Ok(mut f) = std::fs::File::open(&path) {
@@ -650,15 +731,83 @@ fn zip_dir(
     Ok(())
 }
 
+fn write_pack_zip(out: &Path, preset_json: &Value, folders: &[(String, PathBuf)]) -> Result<(), String> {
+    let file = std::fs::File::create(out).map_err(|e| e.to_string())?;
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Stored);
+
+    zip.start_file("preset.json", options).map_err(|e| e.to_string())?;
+    std::io::Write::write_all(&mut zip, preset_json.to_string().as_bytes()).map_err(|e| e.to_string())?;
+
+    for (name, src) in folders {
+        zip.add_directory(&format!("{}/", name), options).map_err(|e| e.to_string())?;
+        zip_dir(src, name, &mut zip, options)?;
+    }
+
+    zip.finish().map_err(|e| format!("Failed to complete zip: {}", e))?;
+    Ok(())
+}
+
+// The preset.json and the (zip folder name, source folder) pairs for `pack:<id>` or a saved preset
+fn export_plan(
+    mods_dir: &Path,
+    presets: &std::collections::HashMap<String, Vec<String>>,
+    name: &str,
+    version: Option<String>,
+) -> Result<(Value, Vec<(String, PathBuf)>), String> {
+    let (preset_json, keys) = if let Some(pack_id) = name.strip_prefix("pack:") {
+        if parse_key(&format!("{}/1", pack_id)).is_err() {
+            return Err("Modpack not found".to_string());
+        }
+        let manifest = read_manifest(&mods_dir.join(pack_id)).ok_or("Modpack not found")?;
+        let json = serde_json::json!({
+            "name": manifest.name,
+            "pack_id": pack_id,
+            "version": version.or(manifest.version.clone()),
+            "mod_ids": manifest.mod_ids,
+        });
+        let keys = manifest.mod_ids.iter().map(|id| format!("{}/{}", pack_id, id)).collect::<Vec<_>>();
+        (json, keys)
+    } else {
+        let keys = presets.get(name).ok_or("Preset not found")?.clone();
+        (Value::Null, keys)
+    };
+
+    let mut seen = std::collections::HashSet::new();
+    let mut nexus_ids = Vec::new();
+    let mut folders = Vec::new();
+    for key in &keys {
+        let nexus_id = key.rsplit('/').next().unwrap_or(key).to_string();
+        if !seen.insert(nexus_id.clone()) {
+            return Err(format!("Two mods in this preset share Nexus id {}", nexus_id));
+        }
+        let src = resolve_key(mods_dir, key)?;
+        if src.is_dir() {
+            folders.push((nexus_id.clone(), src));
+        }
+        nexus_ids.push(nexus_id);
+    }
+
+    let preset_json = if preset_json.is_null() {
+        serde_json::json!({ "name": name, "mod_ids": nexus_ids })
+    } else {
+        preset_json
+    };
+    Ok((preset_json, folders))
+}
+
 #[tauri::command]
-pub async fn export_preset(app_handle: tauri::AppHandle, preset_name: String) -> Result<(), String> {
+pub async fn export_preset(app_handle: tauri::AppHandle, preset_name: String, version: Option<String>) -> Result<(), String> {
     let config = crate::config::load_config(app_handle.clone())?;
-    let mod_ids = config.presets.get(&preset_name).ok_or("Preset not found")?;
-    
+    let mods_dir = get_mods_dir(&app_handle)?;
+    let (preset_json, folders) = export_plan(&mods_dir, &config.presets, &preset_name, version)?;
+    let file_name = preset_json["name"].as_str().unwrap_or("preset").to_string();
+
     let result = rfd::AsyncFileDialog::new()
         .set_title("Export Preset Zip Archive")
         .add_filter("zip", &["zip"])
-        .set_file_name(&format!("{}.zip", preset_name))
+        .set_file_name(&format!("{}.zip", file_name))
         .save_file()
         .await;
         
@@ -666,34 +815,8 @@ pub async fn export_preset(app_handle: tauri::AppHandle, preset_name: String) ->
         Some(f) => f.path().to_path_buf(),
         None => return Err("Export cancelled".to_string()),
     };
-    
-    let mods_dir = get_mods_dir(&app_handle)?;
-    
-    let file = std::fs::File::create(&save_path).map_err(|e| e.to_string())?;
-    let mut zip = zip::ZipWriter::new(file);
-    let options = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Stored);
-        
-    let preset_json_content = serde_json::json!({
-        "name": preset_name,
-        "mod_ids": mod_ids
-    }).to_string();
-    
-    zip.start_file("preset.json", options.clone()).map_err(|e| e.to_string())?;
-    std::io::Write::write_all(&mut zip, preset_json_content.as_bytes()).map_err(|e| e.to_string())?;
-    
-    for mod_id in mod_ids {
-        let mod_dir = mods_dir.join(mod_id);
-        if !mod_dir.exists() { continue; }
-        
-        let prefix = format!("{}/", mod_id);
-        zip.add_directory(&prefix, options.clone()).map_err(|e| e.to_string())?;
-        zip_dir(&mod_dir, &mod_id, &mut zip, options.clone())?;
-    }
-    
-    zip.finish().map_err(|e| format!("Failed to complete zip: {}", e))?;
-    
-    Ok(())
+
+    write_pack_zip(&save_path, &preset_json, &folders)
 }
 
 #[tauri::command]
@@ -1771,5 +1894,82 @@ mod tests {
         assert_eq!(r.unwrap_err(), "Close Ready or Not and try again");
         assert_eq!((tree(&m), tree(&p)), before);
         assert!(no_staging_left(&m));
+    }
+
+    fn cs_pack(m: &Path) {
+        use crate::packs::{write_manifest, PackManifest};
+        put(m, "CS/3311/addons/x.pak", b"x");
+        put(m, "CS/3311/a.pak", b"a");
+        write_manifest(&m.join("CS"), &PackManifest {
+            pack_id: "CS".into(), name: "Casual Shitters".into(), version: Some("1.5".into()),
+            mod_ids: vec!["3311".into()], imported_at: 0 }).unwrap();
+    }
+
+    #[test]
+    fn apply_disables_by_folder_not_flag() {
+        let m = scratch("apply-mods");
+        let p = scratch("apply-paks");
+        put(&m, "5543/a.pak", b"a");
+        put(&m, "5543/metadata.json", br#"{"enabled": false}"#);
+        put(&m, "3063/b.pak", b"b");
+        fs::create_dir_all(&p).unwrap();
+        create_link(&m.join("5543/a.pak"), &p.join("5543_a.pak")).unwrap();
+
+        let s = apply_keys(&m, &p, &["3063".to_string()]).unwrap();
+        assert!(names(&p).iter().all(|n| !n.starts_with("5543_")));
+        assert!(names(&p).iter().any(|n| n.starts_with("3063_")));
+        assert!(s.disabled >= 1);
+        assert_eq!((s.enabled, s.missing), (1, 0));
+    }
+
+    #[test]
+    fn apply_counts_missing_keys() {
+        let m = scratch("apply-missing-mods");
+        let p = scratch("apply-missing-paks");
+        fs::create_dir_all(&m).unwrap();
+        let s = apply_keys(&m, &p, &["CS/9999".to_string()]).unwrap();
+        assert_eq!((s.enabled, s.missing), (0, 1));
+    }
+
+    #[test]
+    fn exported_zip_has_no_double_slash() {
+        let m = scratch("export-mods");
+        let out = scratch("export-out").join("cs.zip");
+        cs_pack(&m);
+        let (json, folders) = export_plan(&m, &Default::default(), "pack:CS", None).unwrap();
+        assert_eq!(json["version"], "1.5");
+        assert_eq!(json["mod_ids"], serde_json::json!(["3311"]));
+        write_pack_zip(&out, &json, &folders).unwrap();
+        let zip = zip::ZipArchive::new(fs::File::open(&out).unwrap()).unwrap();
+        let entries: Vec<_> = zip.file_names().map(String::from).collect();
+        assert!(entries.iter().all(|n| !n.contains("//")), "{:?}", entries);
+        assert!(entries.contains(&"3311/addons/x.pak".to_string()));
+    }
+
+    #[test]
+    fn export_then_import_round_trips_identity() {
+        use crate::packs::read_manifest;
+        let m = scratch("round-mods");
+        let out = scratch("round-out").join("cs.zip");
+        cs_pack(&m);
+        let (json, folders) = export_plan(&m, &Default::default(), "pack:CS", Some("1.6".into())).unwrap();
+        write_pack_zip(&out, &json, &folders).unwrap();
+
+        let m2 = scratch("round-mods2");
+        let p2 = scratch("round-paks2");
+        fs::create_dir_all(&m2).unwrap();
+        import_from_archive(&out, &m2, &p2).unwrap();
+        let man = read_manifest(&m2.join("CS")).unwrap();
+        assert_eq!(man.pack_id, "CS");
+        assert_eq!(man.version, Some("1.6".to_string()));
+    }
+
+    #[test]
+    fn export_refuses_shared_nexus_ids() {
+        let m = scratch("export-collide");
+        let mut presets = std::collections::HashMap::new();
+        presets.insert("mine".to_string(), vec!["3063".to_string(), "CS/3063".to_string()]);
+        let e = export_plan(&m, &presets, "mine", None).unwrap_err();
+        assert_eq!(e, "Two mods in this preset share Nexus id 3063");
     }
 }

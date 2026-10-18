@@ -37,6 +37,8 @@ pub fn run() {
             vfs::pick_mod_archive,
             vfs::delete_mod,
             vfs::apply_preset,
+            vfs::load_packs,
+            vfs::delete_pack,
             vfs::export_preset,
             vfs::pick_preset_archive,
             vfs::inspect_preset_archive,
