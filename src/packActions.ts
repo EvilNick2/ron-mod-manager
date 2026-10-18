@@ -99,6 +99,8 @@ export function progressLine(p: PackProgress): string {
   switch (p.stage) {
     case "hashing":
       return `Checking mods ${count}`;
+    case "checking_drive":
+      return "Checking Drive";
     case "deleting":
       return `Deleting ${count}`;
     case "uploading":

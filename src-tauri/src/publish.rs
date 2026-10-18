@@ -71,6 +71,8 @@ pub struct RemoteState {
     pub manifest: Option<RemoteManifest>,
     pub mods: BTreeMap<String, RemoteModFolder>,
     pub strays: Vec<String>,
+    // Built from a ready manifest, so dirs only holds subfolders looked up so far
+    pub lazy_dirs: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -202,20 +204,102 @@ fn parse_manifest(bytes: &[u8]) -> Result<Option<RemoteManifest>, String> {
     Ok(serde_json::from_value(value).ok())
 }
 
-pub fn read_remote(drive: &dyn DriveApi, pack_folder: &str) -> Result<RemoteState, String> {
+// The manifest, read once, and the pack folder's other children
+fn read_pack_folder(drive: &dyn DriveApi, pack_folder: &str) -> Result<(RemoteState, Vec<RemoteFile>), String> {
     let mut state = RemoteState::default();
+    let mut rest = Vec::new();
     for child in drive.list(pack_folder)? {
         if !child.is_folder() && child.name == MANIFEST_NAME && state.manifest_file_id.is_none() {
             state.manifest = parse_manifest(&drive.read(&child.id)?)?;
             state.manifest_file_id = Some(child.id);
-        } else if child.is_folder() && is_mod_folder_name(&child.name) && !state.mods.contains_key(&child.name) {
-            let mut folder = RemoteModFolder { folder_id: child.id.clone(), ..Default::default() };
-            read_mod_folder(drive, &child.id, "", &mut folder, &mut state.strays)?;
-            state.mods.insert(child.name, folder);
+        } else {
+            rest.push(child);
+        }
+    }
+    Ok((state, rest))
+}
+
+// The mod folders a ready manifest describes, or None when it cannot be trusted
+fn mods_from_manifest(manifest: &RemoteManifest, children: &[RemoteFile]) -> Option<BTreeMap<String, RemoteModFolder>> {
+    if manifest.status != "ready" || manifest.format != FORMAT {
+        return None;
+    }
+    let mut mods = BTreeMap::new();
+    for m in &manifest.mods {
+        let listed = children.iter().any(|c| c.is_folder() && c.id == m.folder_id && c.name == m.id);
+        if !listed || !is_mod_folder_name(&m.id) {
+            return None;
+        }
+        let mut folder = RemoteModFolder { folder_id: m.folder_id.clone(), ..Default::default() };
+        for f in &m.files {
+            let file = RemoteFile {
+                id: f.file_id.clone(),
+                name: f.path.rsplit('/').next().unwrap_or(&f.path).to_string(),
+                mime_type: "application/octet-stream".to_string(),
+                size: Some(f.size),
+                sha256: Some(f.sha256.clone()),
+                resource_key: None,
+            };
+            if folder.files.insert(f.path.clone(), file).is_some() {
+                return None;
+            }
+        }
+        if mods.insert(m.id.clone(), folder).is_some() {
+            return None;
+        }
+    }
+    Some(mods)
+}
+
+fn list_mod_folders(
+    drive: &dyn DriveApi,
+    state: &mut RemoteState,
+    children: Vec<RemoteFile>,
+    pack_id: &str,
+    progress: &mut dyn FnMut(Progress),
+) -> Result<(), String> {
+    let total = 1 + children.iter().filter(|c| c.is_folder() && is_mod_folder_name(&c.name)).count();
+    let mut done = 1;
+    let mut throttle = Throttle::new();
+    for child in children {
+        if child.is_folder() && is_mod_folder_name(&child.name) {
+            if !state.mods.contains_key(&child.name) {
+                let mut folder = RemoteModFolder { folder_id: child.id.clone(), ..Default::default() };
+                read_mod_folder(drive, &child.id, "", &mut folder, &mut state.strays)?;
+                state.mods.insert(child.name, folder);
+            } else {
+                state.strays.push(child.id);
+            }
+            done += 1;
+            if done < total && throttle.ready() {
+                progress(progress_event(pack_id, "checking_drive", done, total, None, (0, 0)));
+            }
         } else {
             state.strays.push(child.id);
         }
     }
+    progress(progress_event(pack_id, "checking_drive", total, total, None, (0, 0)));
+    Ok(())
+}
+
+// A ready manifest is trusted for the mod folders and their files, anything else lists every folder
+pub fn read_remote(
+    drive: &dyn DriveApi,
+    pack_folder: &str,
+    pack_id: &str,
+    progress: &mut dyn FnMut(Progress),
+) -> Result<RemoteState, String> {
+    progress(progress_event(pack_id, "checking_drive", 0, 1, None, (0, 0)));
+    let (mut state, children) = read_pack_folder(drive, pack_folder)?;
+    if let Some(mods) = state.manifest.as_ref().and_then(|m| mods_from_manifest(m, &children)) {
+        let kept: BTreeSet<&str> = mods.values().map(|f| f.folder_id.as_str()).collect();
+        state.strays.extend(children.iter().filter(|c| !kept.contains(c.id.as_str())).map(|c| c.id.clone()));
+        state.mods = mods;
+        state.lazy_dirs = true;
+        progress(progress_event(pack_id, "checking_drive", 1, 1, None, (0, 0)));
+        return Ok(state);
+    }
+    list_mod_folders(drive, &mut state, children, pack_id, progress)?;
     Ok(state)
 }
 
@@ -358,11 +442,13 @@ fn write_remote_manifest(
     }
 }
 
+// With lookup set, a subfolder missing from dirs is searched for on Drive before it is created
 fn ensure_dir(
     drive: &dyn DriveApi,
     mod_folder: &str,
     dirs: &mut BTreeMap<String, String>,
     dir: &str,
+    mut lookup: bool,
 ) -> Result<String, String> {
     let mut parent = mod_folder.to_string();
     for (i, part) in dir.split('/').enumerate() {
@@ -370,13 +456,54 @@ fn ensure_dir(
         parent = match dirs.get(&path) {
             Some(id) => id.clone(),
             None => {
-                let id = drive.create_folder(Some(&parent), part)?;
+                let found = if lookup { drive.find_folder(Some(&parent), part)? } else { None };
+                let id = match found {
+                    Some(id) => id,
+                    None => {
+                        lookup = false;
+                        drive.create_folder(Some(&parent), part)?
+                    }
+                };
                 dirs.insert(path, id.clone());
                 id
             }
         };
     }
     Ok(parent)
+}
+
+fn find_dir(drive: &dyn DriveApi, mod_folder: &str, dirs: &mut BTreeMap<String, String>, dir: &str) -> Result<Option<String>, String> {
+    let mut parent = mod_folder.to_string();
+    for (i, part) in dir.split('/').enumerate() {
+        let path = dir.split('/').take(i + 1).collect::<Vec<_>>().join("/");
+        parent = match dirs.get(&path) {
+            Some(id) => id.clone(),
+            None => match drive.find_folder(Some(&parent), part)? {
+                Some(id) => {
+                    dirs.insert(path, id.clone());
+                    id
+                }
+                None => return Ok(None),
+            },
+        };
+    }
+    Ok(Some(parent))
+}
+
+// Looks up the ids of subfolders this publish empties, which plan_publish deletes
+fn resolve_emptied_dirs(drive: &dyn DriveApi, local: &[LocalMod], remote: &mut RemoteState) -> Result<(), String> {
+    for m in local {
+        let Some(folder) = remote.mods.get_mut(&m.id) else { continue };
+        let needed: BTreeSet<&str> = m.files.iter().flat_map(|f| parent_dirs(&f.path)).collect();
+        let held: BTreeSet<String> = folder.files.keys().flat_map(|p| parent_dirs(p)).map(str::to_string).collect();
+        for dir in &held {
+            let parent_kept = dir.rsplit_once('/').is_none_or(|(p, _)| needed.contains(p));
+            if !needed.contains(dir.as_str()) && parent_kept {
+                find_dir(drive, &folder.folder_id, &mut folder.dirs, dir)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn set_dirty(pack_dir: &Path, dirty: bool) -> Result<(), String> {
@@ -424,9 +551,10 @@ fn locate_remote(
     drive: &dyn DriveApi,
     published: Option<&str>,
     pack_id: &str,
+    progress: &mut dyn FnMut(Progress),
 ) -> Result<(Option<String>, RemoteState, bool), String> {
     if let Some(id) = published {
-        match read_remote(drive, id) {
+        match read_remote(drive, id, pack_id, progress) {
             Ok(state) if !is_empty(&state) => return Ok((Some(id.to_string()), state, true)),
             Ok(state) => {
                 if find_pack_folder(drive, pack_id)?.as_deref() == Some(id) {
@@ -439,7 +567,7 @@ fn locate_remote(
     }
     let by_name = find_pack_folder(drive, pack_id)?;
     let state = match &by_name {
-        Some(id) => read_remote(drive, id)?,
+        Some(id) => read_remote(drive, id, pack_id, progress)?,
         None => RemoteState::default(),
     };
     Ok((by_name, state, false))
@@ -481,7 +609,10 @@ fn run_publish(
 
     // Folders are only looked up here, creating them waits until the space check passes
     let published = manifest.published.as_ref().map(|p| p.folder_id.as_str());
-    let (known_folder, remote, from_record) = locate_remote(drive, published, &pack_id)?;
+    let (known_folder, mut remote, from_record) = locate_remote(drive, published, &pack_id, progress)?;
+    if remote.lazy_dirs {
+        resolve_emptied_dirs(drive, &local, &mut remote)?;
+    }
     let plan = plan_publish(&local, &remote);
     let share = !from_record;
 
@@ -549,9 +680,10 @@ fn run_publish(
             None => drive.create_folder(Some(&pack_folder), &m.id)?,
         };
         let mut dirs = existing.map(|f| f.dirs.clone()).unwrap_or_default();
+        let lookup = remote.lazy_dirs && existing.is_some();
         for up in plan.uploads.iter().filter(|u| u.mod_id == m.id) {
             let (parent, name) = match up.path.rsplit_once('/') {
-                Some((dir, name)) => (ensure_dir(drive, &folder_id, &mut dirs, dir)?, name),
+                Some((dir, name)) => (ensure_dir(drive, &folder_id, &mut dirs, dir, lookup)?, name),
                 None => (folder_id.clone(), up.path.as_str()),
             };
             let mut sent = 0u64;
@@ -1599,5 +1731,174 @@ mod tests {
         let man = packs::read_manifest(&pack_dir).unwrap();
         assert_eq!(man.published, Some(Published { folder_id: "F".into(), dirty: true }));
         assert_eq!(man.local_hashes.len(), 5);
+    }
+
+    fn full_listing(fake: &FakeDrive, folder: &str) -> RemoteState {
+        let (mut state, rest) = read_pack_folder(fake, folder).unwrap();
+        list_mod_folders(fake, &mut state, rest, PACK, &mut no_progress()).unwrap();
+        state
+    }
+
+    fn file_facts(state: &RemoteState) -> Vec<(String, String, Option<u64>, Option<String>)> {
+        state
+            .mods
+            .iter()
+            .flat_map(|(id, m)| m.files.iter().map(move |(p, f)| (format!("{}/{}", id, p), f.id.clone(), f.size, f.sha256.clone())))
+            .collect()
+    }
+
+    #[test]
+    fn ready_manifest_skips_listing() {
+        let pack_dir = pack_fixture("trusted", &base_mods());
+        let fake = FakeDrive::new();
+        publish(&fake, &pack_dir, "1.0").unwrap();
+        let folder = pack_folder(&fake);
+        let old_pak = remote_manifest(&fake).mods[0].files.iter().find(|f| f.path == A_PAK).unwrap().file_id.clone();
+        fs::write(pack_dir.join("3063").join(A_PAK), "vests-v2").unwrap();
+
+        let lists = fake.lists();
+        let trusted = read_remote(&fake, &folder, PACK, &mut no_progress()).unwrap();
+        assert_eq!(fake.lists() - lists, 1);
+        let listed = full_listing(&fake, &folder);
+        assert_eq!(file_facts(&trusted), file_facts(&listed));
+        let mods = local(&pack_dir);
+        assert_eq!(plan_publish(&mods, &trusted), plan_publish(&mods, &listed));
+
+        let (lists, finds, uploads) = (fake.lists(), fake.finds(), fake.uploads());
+        let mut events = Vec::new();
+        let out = publish_pack(&fake, &pack_dir, "1.1", 1792364400, &mut |p: Progress| events.push(p)).unwrap();
+        assert_eq!(fake.lists() - lists, 1);
+        assert_eq!(fake.finds() - finds, 0);
+        let checks: Vec<(usize, usize)> = events.iter().filter(|p| p.stage == "checking_drive").map(|p| (p.done, p.total)).collect();
+        assert_eq!(checks, [(0, 1), (1, 1)]);
+        // the changed pak and its mod's metadata.json
+        assert_eq!(fake.uploads() - uploads, 2);
+        assert_eq!(out, PublishOutcome::Published { folder_id: folder.clone(), version: "1.1".into(), uploaded: 2, deleted: 2 });
+        assert!(fake.read(&old_pak).is_err());
+        assert_eq!(fake.file_bytes(&folder, &format!("3063/{}", A_PAK)).unwrap(), b"vests-v2");
+        assert_eq!(fake.tree(&folder).len(), 9);
+        let man = remote_manifest(&fake);
+        assert_eq!((man.status.as_str(), man.version.as_str()), ("ready", "1.1"));
+        assert_manifest_matches_drive(&fake);
+        assert_eq!(file_facts(&read_remote(&fake, &folder, PACK, &mut no_progress()).unwrap()), file_facts(&full_listing(&fake, &folder)));
+    }
+
+    #[test]
+    fn updating_manifest_uses_full_listing() {
+        let pack_dir = pack_fixture("untrusted", &base_mods());
+        let fake = FakeDrive::new();
+        publish(&fake, &pack_dir, "1.0").unwrap();
+        let folder = pack_folder(&fake);
+        fs::write(pack_dir.join("3063").join(A_PAK), "vests-v2").unwrap();
+        fake.fail_uploads_after(0);
+        assert!(publish(&fake, &pack_dir, "1.1").is_err());
+        assert_eq!(remote_manifest(&fake).status, "updating");
+
+        let lists = fake.lists();
+        let mut events = Vec::new();
+        let state = read_remote(&fake, &folder, PACK, &mut |p: Progress| events.push(p)).unwrap();
+        // the pack folder, both mod folders and 3311/addons
+        assert_eq!(fake.lists() - lists, 4);
+        assert!(state.mods["3311"].dirs.contains_key("addons"));
+        let last = events.iter().rev().find(|p| p.stage == "checking_drive").unwrap();
+        assert_eq!((last.done, last.total), (3, 3));
+
+        publish(&fake, &pack_dir, "1.1").unwrap();
+        let man = remote_manifest(&fake);
+        assert_eq!((man.status.as_str(), man.version.as_str()), ("ready", "1.1"));
+        assert_eq!(fake.tree(&folder).len(), 9);
+        assert_manifest_matches_drive(&fake);
+    }
+
+    #[test]
+    fn manifest_missing_file_heals() {
+        for case in ["file", "mod folder"] {
+            let pack_dir = pack_fixture("heal", &base_mods());
+            let fake = FakeDrive::new();
+            publish(&fake, &pack_dir, "1.0").unwrap();
+            let folder = pack_folder(&fake);
+            let blood = remote_manifest(&fake).mods[1].clone();
+            let gone = match case {
+                "file" => blood.files.iter().find(|f| f.path == B_PAK).unwrap().file_id.clone(),
+                _ => blood.folder_id.clone(),
+            };
+            fake.delete(&gone).unwrap();
+            fs::write(pack_dir.join("3311").join(B_PAK), "blood-v2").unwrap();
+
+            if publish(&fake, &pack_dir, "1.1").is_err() {
+                assert_eq!(remote_manifest(&fake).status, "updating", "{case}");
+                publish(&fake, &pack_dir, "1.1").unwrap();
+            }
+            let man = remote_manifest(&fake);
+            assert_eq!((man.status.as_str(), man.version.as_str()), ("ready", "1.1"), "{case}");
+            assert_eq!(
+                fake.tree(&folder),
+                vec![
+                    "3063/".to_string(),
+                    "3063/metadata.json".into(),
+                    format!("3063/{}", A_PAK),
+                    "3311/".into(),
+                    "3311/addons/".into(),
+                    format!("3311/addons/{}", W_PAK),
+                    "3311/metadata.json".into(),
+                    format!("3311/{}", B_PAK),
+                    "manifest.json".into(),
+                ],
+                "{case}"
+            );
+            assert_eq!(fake.file_bytes(&folder, &format!("3311/{}", B_PAK)).unwrap(), b"blood-v2", "{case}");
+            assert_eq!(man.mods.iter().map(|m| m.files.len()).sum::<usize>(), 5, "{case}");
+            assert_manifest_matches_drive(&fake);
+        }
+    }
+
+    #[test]
+    fn upload_into_addon_subfolder_with_ready_manifest() {
+        let pack_dir = pack_fixture("addonup", &base_mods());
+        let fake = FakeDrive::new();
+        publish(&fake, &pack_dir, "1.0").unwrap();
+        let folder = pack_folder(&fake);
+        let addons = fake.find_folder(Some(&remote_manifest(&fake).mods[1].folder_id), "addons").unwrap().unwrap();
+        fs::write(pack_dir.join("3311/addons").join(W_PAK), "wound-v2").unwrap();
+
+        let lists = fake.lists();
+        publish(&fake, &pack_dir, "1.1").unwrap();
+        assert_eq!(fake.lists() - lists, 1);
+        assert_eq!(fake.tree(&folder).iter().filter(|p| *p == "3311/addons/").count(), 1);
+        assert_eq!(fake.tree(&folder).len(), 9);
+        assert_eq!(fake.file_bytes(&addons, W_PAK).unwrap(), b"wound-v2");
+        assert_manifest_matches_drive(&fake);
+    }
+
+    #[test]
+    fn emptied_addon_subfolder_is_deleted_with_ready_manifest() {
+        let pack_dir = pack_fixture("addongone", &base_mods());
+        let fake = FakeDrive::new();
+        publish(&fake, &pack_dir, "1.0").unwrap();
+        let folder = pack_folder(&fake);
+        fs::remove_dir_all(pack_dir.join("3311/addons")).unwrap();
+
+        publish(&fake, &pack_dir, "1.1").unwrap();
+        assert!(!fake.tree(&folder).iter().any(|p| p.contains("addons")), "{:?}", fake.tree(&folder));
+        assert_eq!(fake.tree(&folder).len(), 7);
+        assert_manifest_matches_drive(&fake);
+    }
+
+    #[test]
+    fn mod_folder_missing_from_manifest_is_swept() {
+        let pack_dir = pack_fixture("extrafolder", &base_mods());
+        let fake = FakeDrive::new();
+        publish(&fake, &pack_dir, "1.0").unwrap();
+        let folder = pack_folder(&fake);
+        let extra = fake.create_folder(Some(&folder), "4040").unwrap();
+        fake.create_bytes(&extra, "left.pak", b"x").unwrap();
+        fs::write(pack_dir.join("3063").join(A_PAK), "vests-v2").unwrap();
+
+        let state = read_remote(&fake, &folder, PACK, &mut no_progress()).unwrap();
+        assert!(state.lazy_dirs);
+        assert_eq!(state.strays, [extra]);
+        publish(&fake, &pack_dir, "1.1").unwrap();
+        assert!(!fake.tree(&folder).iter().any(|p| p.starts_with("4040")));
+        assert_manifest_matches_drive(&fake);
     }
 }

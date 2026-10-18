@@ -501,6 +501,8 @@ pub mod fake {
         fail_after: Cell<Option<usize>>,
         uploads: Cell<usize>,
         downloads: Cell<usize>,
+        lists: Cell<usize>,
+        finds: Cell<usize>,
     }
 
     impl FakeDrive {
@@ -512,6 +514,8 @@ pub mod fake {
                 fail_after: Cell::new(None),
                 uploads: Cell::new(0),
                 downloads: Cell::new(0),
+                lists: Cell::new(0),
+                finds: Cell::new(0),
             }
         }
 
@@ -533,6 +537,14 @@ pub mod fake {
         /// Counts download calls only, read is not counted
         pub fn downloads(&self) -> usize {
             self.downloads.get()
+        }
+
+        pub fn lists(&self) -> usize {
+            self.lists.get()
+        }
+
+        pub fn finds(&self) -> usize {
+            self.finds.get()
         }
 
         pub fn tree(&self, folder_id: &str) -> Vec<String> {
@@ -628,6 +640,7 @@ pub mod fake {
 
     impl DriveApi for FakeDrive {
         fn list(&self, folder_id: &str) -> Result<Vec<RemoteFile>, String> {
+            self.lists.set(self.lists.get() + 1);
             self.check_parent(folder_id)?;
             Ok(self
                 .nodes
@@ -664,6 +677,7 @@ pub mod fake {
         }
 
         fn find_folder(&self, parent: Option<&str>, name: &str) -> Result<Option<String>, String> {
+            self.finds.set(self.finds.get() + 1);
             let parent = parent.unwrap_or(ROOT);
             Ok(self.nodes.borrow().iter().find(|n| n.folder && n.parent == parent && n.name == name).map(|n| n.id.clone()))
         }
