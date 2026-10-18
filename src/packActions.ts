@@ -112,8 +112,39 @@ export function progressLine(p: PackProgress): string {
   }
 }
 
+// MAJOR.MINOR.PATCH with no leading zeros, matching parse_semver in publish.rs
+const SEMVER = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
+
+const VERSION_HELP = [
+  "Version to publish, as MAJOR.MINOR.PATCH:",
+  "- PATCH (1.4.2 to 1.4.3): fixes, mod updates, addon or setting tweaks",
+  "- MINOR (1.4.2 to 1.5.0): mods added, nothing removed",
+  "- MAJOR (1.4.2 to 2.0.0): mods removed or swapped, players may need to redo their setup",
+].join("\n");
+
+// Next patch after the current version. Older versions like "1.5" are padded first.
+function suggestVersion(current: string | null | undefined): string {
+  const parts = (current ?? "").trim().split(".").map((p) => (/^\d+$/.test(p) ? Number(p) : NaN));
+  if (parts.length === 0 || parts.length > 3 || parts.some(Number.isNaN)) return "1.0.0";
+  while (parts.length < 3) parts.push(0);
+  return `${parts[0]}.${parts[1]}.${parts[2] + 1}`;
+}
+
+function askVersion(pack: PackManifest): string | null {
+  let value = suggestVersion(pack.version);
+  let message = VERSION_HELP;
+  for (;;) {
+    const input = prompt(message, value);
+    if (input === null) return null;
+    const version = input.trim();
+    if (SEMVER.test(version)) return version;
+    value = version;
+    message = `${version || "That"} is not a valid version. Use MAJOR.MINOR.PATCH, for example 1.4.2.\n\n${VERSION_HELP}`;
+  }
+}
+
 export async function publishPack(pack: PackManifest): Promise<boolean> {
-  const version = prompt("Version to publish:", pack.version ?? "");
+  const version = askVersion(pack);
   if (version === null) return false;
   let outcome: PublishOutcome;
   beginOp(pack.pack_id);

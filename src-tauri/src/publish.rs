@@ -417,6 +417,22 @@ pub fn check_space(quota: &Quota, needed: u64) -> Result<(), String> {
     Ok(())
 }
 
+// MAJOR.MINOR.PATCH with no leading zeros, as semver.org defines the core version
+pub fn parse_semver(version: &str) -> Option<(u64, u64, u64)> {
+    let parts: Vec<&str> = version.split('.').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let mut nums = [0u64; 3];
+    for (n, part) in nums.iter_mut().zip(&parts) {
+        if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) || (part.len() > 1 && part.starts_with('0')) {
+            return None;
+        }
+        *n = part.parse().ok()?;
+    }
+    Some((nums[0], nums[1], nums[2]))
+}
+
 pub fn format_size(bytes: u64) -> String {
     const MIB: u64 = 1024 * 1024;
     const GIB: u64 = 1024 * MIB;
@@ -618,15 +634,21 @@ fn run_publish(
 
     if let (Some(old), Some(folder)) = (&remote.manifest, &known_folder) {
         let moves = !plan.uploads.is_empty() || !plan.deletes.is_empty();
-        if old.version == version {
-            if old.status == "ready" && !moves {
-                if share {
-                    drive.share_anyone(folder)?;
-                }
-                mark_published(pack_dir, folder, version)?;
-                sweep(drive, &remote.strays);
-                return Ok(PublishOutcome::NothingToPublish { folder_id: folder.clone() });
+        if let (Some(new), Some(prev)) = (parse_semver(version), parse_semver(&old.version)) {
+            if new < prev && !old.mods.is_empty() {
+                return Err(format!("Version {} is lower than the published version {}", version, old.version));
             }
+        }
+        // A new version number alone gives players nothing to download, so it is not published
+        if old.status == "ready" && !moves {
+            if share {
+                drive.share_anyone(folder)?;
+            }
+            mark_published(pack_dir, folder, &old.version)?;
+            sweep(drive, &remote.strays);
+            return Ok(PublishOutcome::NothingToPublish { folder_id: folder.clone() });
+        }
+        if old.version == version {
             // An updating manifest with no mods is a failed first publish, any version finishes it
             if old.status == "ready" || !old.mods.is_empty() {
                 return Err(format!("Version {} is already published. Enter a new version.", version));
@@ -845,6 +867,9 @@ pub async fn publish_pack_cmd(app_handle: tauri::AppHandle, pack_id: String, ver
     let version = version.trim().to_string();
     if version.is_empty() {
         return Err("Enter a version".to_string());
+    }
+    if parse_semver(&version).is_none() {
+        return Err(format!("{} is not a valid version. Use MAJOR.MINOR.PATCH, for example 1.4.2", version));
     }
     let mods_dir = crate::vfs::get_mods_dir(&app_handle)?;
     let pack_dir = mods_dir.join(&pack_id);
@@ -1145,6 +1170,33 @@ mod tests {
             check_space(&one_free, space_needed(&plan(3 * GIB, GIB))).unwrap_err(),
             "Publishing needs 2.0 GB more, your Drive has 1.0 GB free."
         );
+    }
+
+    #[test]
+    fn parse_semver_cases() {
+        assert_eq!(parse_semver("1.4.2"), Some((1, 4, 2)));
+        assert_eq!(parse_semver("0.0.0"), Some((0, 0, 0)));
+        assert_eq!(parse_semver("10.20.300"), Some((10, 20, 300)));
+        for bad in ["", "1", "1.4", "1.4.2.0", "01.4.2", "1.04.2", "1.4.x", "v1.4.2", "1.4.2-beta", " 1.4.2", "1..2"] {
+            assert_eq!(parse_semver(bad), None, "{bad}");
+        }
+        assert!(parse_semver("1.10.0") > parse_semver("1.9.9"));
+    }
+
+    #[test]
+    fn lower_version_refused() {
+        let pack_dir = pack_fixture("semver-lower", &base_mods());
+        let fake = FakeDrive::new();
+        publish(&fake, &pack_dir, "1.2.0").unwrap();
+        fs::write(pack_dir.join("3063").join(A_PAK), "vests-v2").unwrap();
+        assert_eq!(
+            publish(&fake, &pack_dir, "1.1.9").unwrap_err(),
+            "Version 1.1.9 is lower than the published version 1.2.0"
+        );
+        assert!(matches!(publish(&fake, &pack_dir, "1.2.1").unwrap(), PublishOutcome::Published { .. }));
+        assert!(matches!(publish(&fake, &pack_dir, "1.2.2").unwrap(), PublishOutcome::NothingToPublish { .. }));
+        assert_eq!(remote_manifest(&fake).version, "1.2.1");
+        assert_eq!(packs::read_manifest(&pack_dir).unwrap().version.as_deref(), Some("1.2.1"));
     }
 
     #[test]
