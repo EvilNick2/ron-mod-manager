@@ -424,7 +424,7 @@ fn entry_present(path: &Path) -> bool {
     path.symlink_metadata().is_ok()
 }
 
-fn unlink_mod(paks_dir: &Path, key: &str) -> Result<usize, String> {
+pub(crate) fn unlink_mod(paks_dir: &Path, key: &str) -> Result<usize, String> {
     let prefix = link_prefix(key);
     let entries = match fs::read_dir(paks_dir) {
         Ok(e) => e,
@@ -449,7 +449,7 @@ fn unlink_mod(paks_dir: &Path, key: &str) -> Result<usize, String> {
 }
 
 #[cfg(unix)]
-fn sweep_orphans(paks_dir: &Path, mods_dir: &Path) -> usize {
+pub(crate) fn sweep_orphans(paks_dir: &Path, mods_dir: &Path) -> usize {
     if !mods_dir.exists() {
         return 0;
     }
@@ -473,11 +473,11 @@ fn sweep_orphans(paks_dir: &Path, mods_dir: &Path) -> usize {
 }
 
 #[cfg(windows)]
-fn sweep_orphans(_paks_dir: &Path, _mods_dir: &Path) -> usize {
+pub(crate) fn sweep_orphans(_paks_dir: &Path, _mods_dir: &Path) -> usize {
     0
 }
 
-fn set_enabled_flag(mod_dir: &Path, enabled: bool) {
+pub(crate) fn set_enabled_flag(mod_dir: &Path, enabled: bool) {
     let metadata_path = mod_dir.join("metadata.json");
     let mut parsed = fs::read_to_string(&metadata_path)
         .ok()
@@ -491,7 +491,7 @@ fn set_enabled_flag(mod_dir: &Path, enabled: bool) {
     }
 }
 
-fn enable_key(mods_dir: &Path, paks_dir: &Path, key: &str) -> Result<(), String> {
+pub(crate) fn enable_key(mods_dir: &Path, paks_dir: &Path, key: &str) -> Result<(), String> {
     parse_key(key)?;
     let mod_dir = resolve_key(mods_dir, key)?;
 
@@ -646,7 +646,7 @@ pub async fn delete_mod(app_handle: tauri::AppHandle, mod_id: String) -> Result<
     Ok(())
 }
 
-fn flag_enabled(mod_dir: &Path) -> bool {
+pub(crate) fn flag_enabled(mod_dir: &Path) -> bool {
     read_meta(mod_dir).and_then(|m| m.get("enabled").and_then(Value::as_bool)).unwrap_or(false)
 }
 
@@ -1097,19 +1097,19 @@ pub struct ImportSummary {
     pub failed_deletes: Vec<String>,
 }
 
-struct PackArchive {
-    pack: PackRef,
+pub(crate) struct PackArchive {
+    pub(crate) pack: PackRef,
     // mod folder id and that folder's metadata.json, in numeric order
-    folders: Vec<(String, Option<Value>)>,
+    pub(crate) folders: Vec<(String, Option<Value>)>,
 }
 
-struct ImportPlan {
-    installed: Option<PathBuf>,
-    installed_version: Option<String>,
-    added: Vec<ModRef>,
-    removed: Vec<ModRef>,
-    changed: Vec<ModRef>,
-    superseded: Vec<ModRef>,
+pub(crate) struct ImportPlan {
+    pub(crate) installed: Option<PathBuf>,
+    pub(crate) installed_version: Option<String>,
+    pub(crate) added: Vec<ModRef>,
+    pub(crate) removed: Vec<ModRef>,
+    pub(crate) changed: Vec<ModRef>,
+    pub(crate) superseded: Vec<ModRef>,
 }
 
 fn is_numeric(s: &str) -> bool {
@@ -1120,16 +1120,16 @@ fn numeric_order(a: &String, b: &String) -> std::cmp::Ordering {
     (a.len(), a).cmp(&(b.len(), b))
 }
 
-fn read_meta(mod_dir: &Path) -> Option<Value> {
+pub(crate) fn read_meta(mod_dir: &Path) -> Option<Value> {
     serde_json::from_str(&fs::read_to_string(mod_dir.join("metadata.json")).ok()?).ok()
 }
 
-fn meta_version(meta: Option<&Value>) -> Option<String> {
+pub(crate) fn meta_version(meta: Option<&Value>) -> Option<String> {
     let meta = meta?;
     meta.get("installed_version").or_else(|| meta.get("version")).and_then(|v| v.as_str()).map(str::to_string)
 }
 
-fn mod_ref(key: String, id: &str, meta: Option<&Value>) -> ModRef {
+pub(crate) fn mod_ref(key: String, id: &str, meta: Option<&Value>) -> ModRef {
     let name = meta.and_then(|m| m.get("name")).and_then(|n| n.as_str()).unwrap_or(id).to_string();
     ModRef { key, nexus_mod_id: id.parse().ok(), name, version: meta_version(meta) }
 }
@@ -1196,7 +1196,7 @@ fn read_pack_archive(zip: &mut zip::ZipArchive<fs::File>) -> Result<PackArchive,
     Ok(PackArchive { pack: crate::packs::pack_identity(&preset), folders })
 }
 
-fn child_dirs(dir: &Path) -> Result<Vec<String>, String> {
+pub(crate) fn child_dirs(dir: &Path) -> Result<Vec<String>, String> {
     let entries = fs::read_dir(dir).map_err(|e| format!("Failed to read {}: {}", dir.display(), e))?;
     let mut out = Vec::new();
     for entry in entries {
@@ -1224,7 +1224,7 @@ fn installed_pack_dir(mods_dir: &Path, pack_id: &str) -> Result<Option<PathBuf>,
     }
 }
 
-fn plan_import(archive: &PackArchive, mods_dir: &Path) -> Result<ImportPlan, String> {
+pub(crate) fn plan_import(archive: &PackArchive, mods_dir: &Path) -> Result<ImportPlan, String> {
     let pack_id = &archive.pack.pack_id;
     let installed = installed_pack_dir(mods_dir, pack_id)?;
     let installed_version = installed.as_deref().and_then(read_manifest).and_then(|m| m.version);
@@ -1272,7 +1272,7 @@ fn inspect_archive(archive: &Path, mods_dir: &Path) -> Result<ImportPreview, Str
     })
 }
 
-fn clear_enabled_flag(mod_dir: &Path) -> Result<(), String> {
+pub(crate) fn clear_enabled_flag(mod_dir: &Path) -> Result<(), String> {
     let path = mod_dir.join("metadata.json");
     let Some(mut meta) = read_meta(mod_dir) else {
         return Ok(());
@@ -1331,7 +1331,7 @@ fn stage_pack(zip: &mut zip::ZipArchive<fs::File>, archive: &PackArchive, staged
 }
 
 // Removes the staging folder on a failed import and returns the error to report.
-fn abandon_staging(staging: &Path, err: String) -> String {
+pub(crate) fn abandon_staging(staging: &Path, err: String) -> String {
     match fs::remove_dir_all(staging) {
         Ok(()) => err,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => err,
@@ -1352,7 +1352,7 @@ fn relink(mods_dir: &Path, paks_dir: &Path, keys: &[String], err: String) -> Str
     }
 }
 
-enum SwapError {
+pub(crate) enum SwapError {
     // the library is as it was, staging can be deleted
     RolledBack(String),
     // the old pack is only inside staging, which must be kept
@@ -1360,7 +1360,7 @@ enum SwapError {
 }
 
 // The installed folder name for a pack id. On a case-insensitive filesystem it can differ from the id in case only.
-fn pack_folder_name(mods_dir: &Path, pack_id: &str) -> String {
+pub(crate) fn pack_folder_name(mods_dir: &Path, pack_id: &str) -> String {
     let dirs = child_dirs(mods_dir).unwrap_or_default();
     if dirs.iter().any(|n| n == pack_id) {
         return pack_id.to_string();
@@ -1369,13 +1369,13 @@ fn pack_folder_name(mods_dir: &Path, pack_id: &str) -> String {
 }
 
 // Keys of the installed pack, built from its folder name on disk so old links match their real prefix.
-fn old_pack_keys(mods_dir: &Path, pack_id: &str) -> Result<Vec<String>, String> {
+pub(crate) fn old_pack_keys(mods_dir: &Path, pack_id: &str) -> Result<Vec<String>, String> {
     let folder = pack_folder_name(mods_dir, pack_id);
     Ok(child_dirs(&mods_dir.join(&folder))?.iter().map(|c| format!("{}/{}", folder, c)).collect())
 }
 
 // Unlinks the old pack, sets it aside inside staging and moves the staged pack in.
-fn swap_pack(mods_dir: &Path, paks_dir: &Path, staging: &Path, staged: &Path, target: &Path, pack_id: &str) -> Result<(), SwapError> {
+pub(crate) fn swap_pack(mods_dir: &Path, paks_dir: &Path, staging: &Path, staged: &Path, target: &Path, pack_id: &str) -> Result<(), SwapError> {
     let old_keys = old_pack_keys(mods_dir, pack_id).map_err(SwapError::RolledBack)?;
     let old_dir = mods_dir.join(pack_folder_name(mods_dir, pack_id));
     let mut linked: Vec<String> = Vec::new();
@@ -1416,15 +1416,34 @@ fn import_from_archive(archive: &Path, mods_dir: &Path, paks_dir: &Path) -> Resu
         return Err(abandon_staging(&staging, e));
     }
 
+    if let Some(published) = plan.installed.as_deref().and_then(crate::packs::read_manifest).and_then(|m| m.published) {
+        let carried = crate::packs::read_manifest(&staged)
+            .ok_or_else(|| "Failed to read the staged pack".to_string())
+            .and_then(|mut man| {
+                man.published = Some(crate::packs::Published { dirty: true, ..published });
+                crate::packs::write_manifest(&staged, &man)
+            });
+        if let Err(e) = carried {
+            return Err(abandon_staging(&staging, e));
+        }
+    }
+
+    finish_import(&archive, plan, mods_dir, paks_dir, &staging)
+}
+
+// Swaps the pack staged at staging/<pack id> into the library and cleans up after it.
+pub(crate) fn finish_import(archive: &PackArchive, plan: ImportPlan, mods_dir: &Path, paks_dir: &Path, staging: &Path) -> Result<ImportSummary, String> {
+    let pack_id = archive.pack.pack_id.clone();
+    let staged = staging.join(&pack_id);
     let target = mods_dir.join(&pack_id);
     if plan.installed.is_some() {
-        match swap_pack(mods_dir, paks_dir, &staging, &staged, &target, &pack_id) {
+        match swap_pack(mods_dir, paks_dir, staging, &staged, &target, &pack_id) {
             Ok(()) => {}
-            Err(SwapError::RolledBack(e)) => return Err(abandon_staging(&staging, e)),
+            Err(SwapError::RolledBack(e)) => return Err(abandon_staging(staging, e)),
             Err(SwapError::Stranded(e)) => return Err(e),
         }
     } else if let Err(e) = fs::rename(&staged, &target) {
-        return Err(abandon_staging(&staging, format!("Failed to move the new pack into place: {}", e)));
+        return Err(abandon_staging(staging, format!("Failed to move the new pack into place: {}", e)));
     }
 
     let mut failed_deletes: Vec<String> = Vec::new();
@@ -1439,7 +1458,7 @@ fn import_from_archive(archive: &Path, mods_dir: &Path, paks_dir: &Path) -> Resu
 
     sweep_orphans(paks_dir, mods_dir);
 
-    if let Err(e) = fs::remove_dir_all(&staging) {
+    if let Err(e) = fs::remove_dir_all(staging) {
         if e.kind() != std::io::ErrorKind::NotFound {
             failed_deletes.push(staging.display().to_string());
         }
@@ -1452,7 +1471,7 @@ fn import_from_archive(archive: &Path, mods_dir: &Path, paks_dir: &Path) -> Resu
         removed_keys: plan.removed.into_iter().map(|m| m.key).collect(),
         superseded_ids,
         failed_deletes,
-        pack: archive.pack,
+        pack: archive.pack.clone(),
     })
 }
 
@@ -1991,6 +2010,35 @@ mod tests {
         }
         assert_eq!(read_json(&m.join("CS/3063/metadata.json"))["addons"], serde_json::json!({"x.pak": {"enabled": true}}));
         assert!(no_staging_left(&m));
+    }
+
+    #[test]
+    fn zip_import_keeps_published_and_marks_dirty() {
+        use crate::packs::{read_manifest, write_manifest, Published};
+        let (m, p, z) = (scratch("mods"), scratch("paks"), scratch("zips"));
+        upgrade_setup(&m, &p, &z);
+        let mut man = read_manifest(&m.join("CS")).unwrap();
+        man.published = Some(Published { folder_id: "F".into(), dirty: false });
+        write_manifest(&m.join("CS"), &man).unwrap();
+        import_from_archive(&z.join("v16.zip"), &m, &p).unwrap();
+        let after = read_manifest(&m.join("CS")).unwrap();
+        assert_eq!(after.published, Some(Published { folder_id: "F".into(), dirty: true }));
+    }
+
+    #[test]
+    fn zip_import_drops_source() {
+        use crate::packs::{read_manifest, write_manifest, InstalledMod, PackSource};
+        let (m, p, z) = (scratch("mods"), scratch("paks"), scratch("zips"));
+        upgrade_setup(&m, &p, &z);
+        let mut man = read_manifest(&m.join("CS")).unwrap();
+        man.source = Some(PackSource { kind: "drive".into(), folder_id: "F".into(), resource_key: None });
+        man.installed_hashes.insert("3063".into(), InstalledMod::default());
+        write_manifest(&m.join("CS"), &man).unwrap();
+        import_from_archive(&z.join("v16.zip"), &m, &p).unwrap();
+        let after = read_manifest(&m.join("CS")).unwrap();
+        assert!(after.source.is_none());
+        assert!(after.installed_hashes.is_empty());
+        assert!(after.published.is_none());
     }
 
     #[test]
