@@ -113,17 +113,27 @@ pub struct HttpDrive {
 
 fn build_client() -> Client {
     Client::builder()
+        .user_agent(concat!("RON-Mod-Manager/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_secs(30))
         .timeout(Duration::from_secs(300))
         .build()
         .unwrap_or_else(|_| Client::new())
 }
 
+pub const BLOCKED: &str = "Google is blocking requests from your network for now, as it thinks they are automated. Wait a few minutes and try again. VPNs and shared networks make this more likely.";
+
 fn drive_error(status: u16, body: &str) -> String {
-    let message = serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| v["error"]["message"].as_str().map(str::to_string))
-        .unwrap_or_else(|| body.trim().to_string());
+    let json = serde_json::from_str::<serde_json::Value>(body).ok();
+    if let Some(message) = json.as_ref().and_then(|v| v["error"]["message"].as_str()) {
+        return format!("Google Drive error {}: {}", status, message);
+    }
+    let body = body.trim();
+    if body.contains("automated queries") {
+        return BLOCKED.to_string();
+    }
+    // Never show a raw HTML page to the user
+    let message = if body.starts_with('<') { "unexpected web page in the response" } else { body };
+    let message: String = message.chars().take(300).collect();
     format!("Google Drive error {}: {}", status, message)
 }
 
@@ -755,6 +765,19 @@ mod tests {
     #[test]
     fn escape_query_quotes() {
         assert_eq!(escape_query("it's a\\b"), "it\\'s a\\\\b");
+    }
+
+    #[test]
+    fn drive_error_never_shows_html() {
+        let sorry = "<html><head><title>Sorry...</title></head><body><p>... but your computer or network may be sending automated queries.</p></body></html>";
+        assert_eq!(drive_error(403, sorry), BLOCKED);
+        assert!(!is_rate_limited(403, sorry));
+        assert_eq!(drive_error(502, "<html><body>Bad gateway</body></html>"), "Google Drive error 502: unexpected web page in the response");
+        assert_eq!(
+            drive_error(404, r#"{"error":{"message":"File not found: abc"}}"#),
+            "Google Drive error 404: File not found: abc"
+        );
+        assert_eq!(drive_error(400, " plain text "), "Google Drive error 400: plain text");
     }
 
     #[test]
