@@ -6,9 +6,11 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::drive::{DriveApi, Progress, Quota, RemoteFile};
+use tauri::Emitter;
+
+use crate::drive::{DriveApi, HttpDrive, Progress, Quota, RemoteFile};
 use crate::hashing::{self, FileEntry};
-use crate::packs::{self, Published};
+use crate::packs::{self, PackRef, Published};
 
 pub const ROOT_FOLDER: &str = "RoNMM";
 pub const MANIFEST_NAME: &str = "manifest.json";
@@ -604,6 +606,61 @@ fn run_publish(
         uploaded: plan.uploads.len(),
         deleted: plan.deletes.len(),
     })
+}
+
+pub fn dirty_packs(mods_dir: &Path) -> Vec<PackRef> {
+    let Ok(entries) = std::fs::read_dir(mods_dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PackRef> = entries
+        .filter_map(Result::ok)
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| {
+            let manifest = packs::read_manifest(&e.path())?;
+            if !manifest.published.as_ref().is_some_and(|p| p.dirty) {
+                return None;
+            }
+            Some(PackRef { pack_id: e.file_name().to_string_lossy().to_string(), name: manifest.name, version: manifest.version })
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+#[tauri::command]
+pub fn list_dirty_packs(app_handle: tauri::AppHandle) -> Result<Vec<PackRef>, String> {
+    let mods_dir = crate::vfs::get_mods_dir(&app_handle)?;
+    Ok(dirty_packs(&mods_dir))
+}
+
+#[tauri::command]
+pub fn force_close(window: tauri::Window) -> Result<(), String> {
+    window.destroy().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn publish_pack_cmd(app_handle: tauri::AppHandle, pack_id: String, version: String) -> Result<PublishOutcome, String> {
+    let version = version.trim().to_string();
+    if version.is_empty() {
+        return Err("Enter a version".to_string());
+    }
+    let mods_dir = crate::vfs::get_mods_dir(&app_handle)?;
+    let pack_dir = mods_dir.join(&pack_id);
+    if packs::parse_key(&format!("{}/1", pack_id)).is_err() || packs::read_manifest(&pack_dir).is_none() {
+        return Err(format!("No modpack folder for {:?}", pack_id));
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        // Fail early with a clear sign-in error before any Drive call
+        crate::google::access_token()?;
+        let drive = HttpDrive::signed_in(Box::new(crate::google::access_token));
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let mut emit = |p: Progress| {
+            let _ = app_handle.emit("pack-progress", p);
+        };
+        publish_pack(&drive, &pack_dir, &version, now, &mut emit)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[cfg(test)]
@@ -1333,5 +1390,22 @@ mod tests {
             "Casual Shitters is linked to its creator. Fork it to make changes."
         );
         assert!(fake.tree("root").is_empty());
+    }
+
+    #[test]
+    fn dirty_packs_lists_only_dirty() {
+        let mods = scratch("dirty-packs");
+        let mk = |id: &str, name: &str, published: Option<Published>| {
+            let dir = mods.join(id);
+            fs::create_dir_all(&dir).unwrap();
+            let man = PackManifest { pack_id: id.into(), name: name.into(), published, ..Default::default() };
+            packs::write_manifest(&dir, &man).unwrap();
+        };
+        mk("zeta", "Zeta", Some(Published { folder_id: "f1".into(), dirty: true }));
+        mk("alpha", "Alpha", Some(Published { folder_id: "f2".into(), dirty: true }));
+        mk("clean", "Clean", Some(Published { folder_id: "f3".into(), dirty: false }));
+        mk("local", "Local", None);
+        let names: Vec<_> = dirty_packs(&mods).into_iter().map(|p| p.name).collect();
+        assert_eq!(names, vec!["Alpha", "Zeta"]);
     }
 }

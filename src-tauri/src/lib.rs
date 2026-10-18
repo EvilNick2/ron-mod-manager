@@ -9,11 +9,24 @@ mod sso;
 mod updater;
 mod vfs;
 
+use tauri::{Emitter, Manager};
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let app = window.app_handle();
+                let Ok(mods_dir) = vfs::get_mods_dir(app) else { return };
+                let dirty = publish::dirty_packs(&mods_dir);
+                if !dirty.is_empty() {
+                    api.prevent_close();
+                    let _ = window.emit("close-blocked", dirty);
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             sso::authenticate_nexus,
             config::load_config,
@@ -26,6 +39,9 @@ pub fn run() {
             google::google_status,
             google::google_sign_in,
             google::google_sign_out,
+            publish::publish_pack_cmd,
+            publish::list_dirty_packs,
+            publish::force_close,
             config::save_preset,
             config::delete_preset,
             config::load_presets,
