@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { store } from "../store";
-import { refreshMods } from "../packActions";
+import { refreshMods, isLinked } from "../packActions";
 import { invoke } from "@tauri-apps/api/core";
 import { ref, computed } from "vue";
 import { ExternalLink, Download, PackageSearch, X, Plus, Puzzle, Trash2 } from 'lucide-vue-next';
@@ -74,6 +74,10 @@ async function deleteAddon(filename: string) {
     errorMsg.value = "Failed to remove addon: " + e;
   }
 }
+
+const locked = computed(() => !!store.selectedMod?.pack && isLinked(store.selectedMod.pack.pack_id));
+
+const editablePacks = computed(() => store.packs.filter((p) => !p.source));
 
 const alsoIn = computed(() => {
   const sel = store.selectedMod;
@@ -247,15 +251,15 @@ const cleanDescription = computed(() => {
       </div>
 
       <select
-        v-if="!store.selectedMod.is_online && !store.selectedMod.pack && store.packs.length"
+        v-if="!store.selectedMod.is_online && !store.selectedMod.pack && editablePacks.length"
         class="pack-select"
         @change="addToPack"
       >
         <option value="">Add to modpack</option>
-        <option v-for="p in store.packs" :key="p.pack_id" :value="p.pack_id">{{ p.name }}</option>
+        <option v-for="p in editablePacks" :key="p.pack_id" :value="p.pack_id">{{ p.name }}</option>
       </select>
       <button
-        v-if="!store.selectedMod.is_online && store.selectedMod.pack"
+        v-if="!store.selectedMod.is_online && store.selectedMod.pack && !locked"
         class="pack-btn"
         @click="removeFromPack"
       >
@@ -274,8 +278,12 @@ const cleanDescription = computed(() => {
           <div v-if="!store.selectedMod.addons?.length" class="no-addons">
             No addons installed
           </div>
-          <div v-for="addon in store.selectedMod.addons" :key="addon.filename" class="addon-row" @contextmenu.prevent="toggleAddon(addon.filename, !addon.enabled)">
+          <div v-for="addon in store.selectedMod.addons" :key="addon.filename" class="addon-row" @contextmenu.prevent="!locked && toggleAddon(addon.filename, !addon.enabled)">
+            <span v-if="locked" class="addon-toggle addon-locked" :class="{ 'addon-enabled': addon.enabled }">
+              <span class="addon-dot"></span>
+            </span>
             <button 
+              v-else
               class="addon-toggle" 
               :class="{ 'addon-enabled': addon.enabled }"
               @click="toggleAddon(addon.filename, !addon.enabled)"
@@ -284,11 +292,11 @@ const cleanDescription = computed(() => {
               <span class="addon-dot"></span>
             </button>
             <span class="addon-name">{{ addon.filename.replace('.pak', '') }}</span>
-            <button class="addon-delete" @click="deleteAddon(addon.filename)" title="Remove addon">
+            <button v-if="!locked" class="addon-delete" @click="deleteAddon(addon.filename)" title="Remove addon">
               <Trash2 :size="14" color="#ef4444" />
             </button>
           </div>
-          <button class="add-addon-btn" @click="pickAddonFile">
+          <button v-if="!locked" class="add-addon-btn" @click="pickAddonFile">
             <Plus :size="14" color="#22c55e" /> Add Addon
           </button>
         </div>
@@ -621,6 +629,10 @@ const cleanDescription = computed(() => {
   padding: 0.2rem;
   display: flex;
   align-items: center;
+}
+
+.addon-locked {
+  cursor: default;
 }
 
 .addon-dot {

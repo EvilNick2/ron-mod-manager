@@ -1,8 +1,11 @@
 <script setup lang="ts">
-import { computed, onMounted } from 'vue';
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 import { invoke } from "@tauri-apps/api/core";
 import { store, type PackManifest } from "../store";
-import { applyPack, loadPacks, refreshMods, publishPack, copyText, folderLink, progressLine } from "../packActions";
+import {
+  applyPack, loadPacks, loadPresets, refreshMods, publishPack, copyText, folderLink, progressLine, packLabel,
+  importArchive, addPackFromLink, updatePack, verifyPack, forkPack, updateLine
+} from "../packActions";
 import { 
   Package, 
   Globe, 
@@ -15,7 +18,8 @@ import {
   CircleOff,
   Play,
   CloudUpload,
-  Link
+  Link,
+  MoreHorizontal
 } from 'lucide-vue-next';
 
 async function loginNexus() {
@@ -24,18 +28,6 @@ async function loginNexus() {
     store.apiKeyStore = apiKey;
   } catch (error) {
     console.error(error);
-  }
-}
-
-async function loadPresets() {
-  try {
-    store.presets = await invoke("load_presets") as Record<string, string[]>;
-    const active = store.activePresetName;
-    if (active && !active.startsWith("pack:") && !store.presets[active]) {
-      store.activePresetName = "";
-    }
-  } catch (e) {
-    console.error("Failed to load presets:", e);
   }
 }
 
@@ -89,17 +81,8 @@ async function onCopyLink(pack: PackManifest) {
   await copyText(folderLink(pack.published.folder_id));
 }
 
-function packLabel(name: string, version: string | null) {
-  return version ? `${name} ${version}` : name;
-}
-
 function versionLabel(version: string | null) {
   return version ? `v${version.replace(/^[vV]/, "")}` : "";
-}
-
-function nameList(names: string[]) {
-  const shown = names.slice(0, 10).join(", ");
-  return names.length > 10 ? `${shown} and ${names.length - 10} more` : shown;
 }
 
 async function onApplyPack(pack: PackManifest) {
@@ -141,59 +124,52 @@ async function removePack(pack: PackManifest) {
 }
 
 async function importPreset() {
-  let imported = "";
+  let archivePath: string | null;
   try {
-    const archivePath: string | null = await invoke("pick_preset_archive");
-    if (!archivePath) return;
-
-    await loadPacks();
-    const preview: any = await invoke("inspect_preset_archive", { archivePath });
-    const installed = store.packs.find((p) => p.pack_id === preview.pack.pack_id);
-    const name: string = preview.pack.name;
-    const version: string | null = preview.pack.version;
-    const removed: any[] = preview.removed;
-    const superseded: any[] = preview.superseded;
-    const supersededText = `${superseded.length} installed mods are also in this pack and their old copies will be deleted from disk.`;
-
-    let question = "";
-    if (removed.length + superseded.length > 0) {
-      if (installed) {
-        const from = installed.version ? ` from ${installed.version}` : "";
-        const to = version ? ` to ${version}` : "";
-        question = `Update ${name}${from}${to}? ${preview.added.length} mods added, ${preview.changed.length} updated`;
-        question += removed.length > 0
-          ? `, ${removed.length} removed and deleted from disk: ${nameList(removed.map((m: any) => m.name))}.`
-          : ".";
-        if (superseded.length > 0) question += ` ${supersededText}`;
-      } else {
-        question = `Import ${packLabel(name, version)}? ${supersededText}`;
-      }
-    }
-    if (question && !confirm(question)) return;
-
-    const summary: any = await invoke("import_preset", { archivePath });
-    imported = packLabel(summary.pack.name, summary.pack.version);
-
-    await loadPresets();
-    await loadPacks();
-    const pack = store.packs.find((p) => p.pack_id === summary.pack.pack_id);
-    if (pack) await applyPack(pack);
-    else await refreshMods();
-
-    let message = `${imported} installed${pack ? " and active" : ""}.`;
-    if (summary.failed_deletes.length > 0) {
-      message += `\nThese folders could not be deleted: ${summary.failed_deletes.join(", ")}`;
-    }
-    alert(message);
+    archivePath = await invoke("pick_preset_archive");
   } catch (e: any) {
-    if (imported) {
-      console.error("Import follow-up failed:", e);
-      alert(`${imported} was imported, but the next step failed: ${e}`);
-    } else if (e !== "Import cancelled") {
+    if (e !== "Import cancelled") {
       console.error("Failed to import preset:", e);
       alert("Failed to import preset: " + e);
     }
+    return;
   }
+  if (archivePath) await importArchive(archivePath);
+}
+
+const addingFromLink = ref(false);
+
+async function onAddFromLink() {
+  addingFromLink.value = true;
+  try {
+    await addPackFromLink();
+  } finally {
+    addingFromLink.value = false;
+  }
+}
+
+const openMenu = ref<string | null>(null);
+
+function toggleMenu(pack: PackManifest) {
+  openMenu.value = openMenu.value === pack.pack_id ? null : pack.pack_id;
+}
+
+function closeMenu() {
+  openMenu.value = null;
+}
+
+// Capture phase, so buttons that stop propagation still close the menu
+function onDocumentClick(e: MouseEvent) {
+  const id = openMenu.value;
+  if (id === null) return;
+  const anchor = (e.target as Element | null)?.closest?.("[data-menu-anchor]");
+  if (anchor?.getAttribute("data-menu-anchor") === id) return;
+  closeMenu();
+}
+
+function fromMenu(action: (pack: PackManifest) => Promise<void>, pack: PackManifest) {
+  closeMenu();
+  action(pack);
 }
 
 async function removePreset(name: string) {
@@ -225,8 +201,13 @@ async function bulkToggleMods(enable: boolean) {
 }
 
 onMounted(() => {
+  document.addEventListener("click", onDocumentClick, { capture: true });
   loadPresets();
   loadPacks().catch((e) => console.error("Failed to load packs:", e));
+});
+
+onBeforeUnmount(() => {
+  document.removeEventListener("click", onDocumentClick, { capture: true });
 });
 
 async function fetchOnlineMods() {
@@ -367,16 +348,47 @@ async function launchGame() {
               <button v-if="pack.published" class="pack-icon-btn" @click.stop="onCopyLink(pack)" title="Copy share link">
                 <Link :size="13" color="#a1a1aa" />
               </button>
+              <div v-if="pack.source" class="pack-menu-anchor" :data-menu-anchor="pack.pack_id">
+                <button
+                  class="pack-icon-btn"
+                  @click.stop="toggleMenu(pack)"
+                  :disabled="!!store.inFlight[pack.pack_id]"
+                  title="More"
+                >
+                  <MoreHorizontal :size="13" color="#a1a1aa" />
+                </button>
+                <div v-if="openMenu === pack.pack_id" class="pack-menu" @click.stop>
+                  <button class="pack-menu-item" @click="fromMenu(verifyPack, pack)">Verify files</button>
+                  <button class="pack-menu-item" @click="fromMenu(forkPack, pack)">Fork</button>
+                </div>
+              </div>
               <button class="pack-icon-btn pack-icon-delete" @click.stop="removePack(pack)" title="Delete Modpack">
                 <X :size="13" color="#ef4444" />
               </button>
             </div>
           </div>
           <span v-if="pack.published?.dirty" class="pack-dirty">Changes not uploaded</span>
+          <div v-if="store.packUpdates[pack.pack_id]?.status === 'available'" class="pack-update">
+            <span class="pack-update-text">{{ updateLine(store.packUpdates[pack.pack_id]) }}</span>
+            <button
+              class="pack-update-btn"
+              @click.stop="updatePack(pack)"
+              :disabled="!!store.inFlight[pack.pack_id]"
+            >Update</button>
+          </div>
+          <span v-else-if="store.packUpdates[pack.pack_id]?.status === 'updating'" class="pack-update-text">Being updated by its creator</span>
           <p v-if="store.packProgress[pack.pack_id]" class="pack-progress">{{ progressLine(store.packProgress[pack.pack_id]) }}</p>
         </div>
       </div>
       <p v-else class="preset-empty">No modpacks imported yet.</p>
+      <button
+        v-if="store.google.linksAvailable"
+        class="full-btn secondary-btn preset-save-btn add-link-btn"
+        @click="onAddFromLink"
+        :disabled="addingFromLink"
+      >
+        <Link :size="16" color="#3b82f6" /> Add from link
+      </button>
 
       <h3 class="section-label">Presets</h3>
       <div class="preset-list" v-if="Object.keys(store.presets).length > 0">
@@ -812,6 +824,82 @@ async function launchGame() {
 
 .pack-progress-orphan {
   margin-bottom: 0.5rem;
+}
+
+.pack-menu-anchor {
+  position: relative;
+}
+
+.pack-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  min-width: 120px;
+  background: var(--bg-dark);
+  border: 1px solid var(--border-light);
+  border-radius: 6px;
+  padding: 0.25rem;
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.4);
+}
+
+.pack-menu-item {
+  background: transparent;
+  border: none;
+  color: var(--text-main);
+  text-align: left;
+  font-size: 0.75rem;
+  padding: 0.4rem 0.6rem;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.pack-menu-item:hover {
+  background: var(--bg-hover);
+}
+
+.pack-update {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.4rem;
+}
+
+.pack-update-text {
+  color: #3b82f6;
+  font-size: 0.7rem;
+  font-weight: 600;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.pack-update-btn {
+  background: rgba(59, 130, 246, 0.12);
+  border: 1px solid rgba(59, 130, 246, 0.5);
+  color: #3b82f6;
+  border-radius: 5px;
+  font-size: 0.7rem;
+  font-weight: 700;
+  padding: 0.1rem 0.5rem;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.pack-update-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.add-link-btn {
+  width: 100%;
+  margin-bottom: 0.75rem;
+}
+
+.add-link-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 .pack-icon-delete:hover {

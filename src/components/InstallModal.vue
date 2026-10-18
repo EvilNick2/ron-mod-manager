@@ -2,7 +2,7 @@
 import { store } from "../store";
 import { refreshMods } from "../packActions";
 import { invoke } from "@tauri-apps/api/core";
-import { ref, watch } from "vue";
+import { computed, ref, watch } from "vue";
 import { Archive, FileArchive, FolderOpen, Puzzle, Trash2, Plus } from 'lucide-vue-next';
 
 const nexusInput = ref("");
@@ -10,6 +10,7 @@ const isInstalling = ref(false);
 const errorMsg = ref("");
 const installPackId = ref("");
 const postInstallAddons = ref<string[]>([]);
+const editablePacks = computed(() => store.packs.filter((p) => !p.source));
 
 watch(() => store.awaitingDropForId, (newId) => {
   if (newId) {
@@ -209,11 +210,11 @@ async function browseForArchive() {
         />
       </div>
       
-      <div class="input-group" v-if="store.packs.length">
+      <div class="input-group" v-if="editablePacks.length">
         <label>Install into</label>
         <select v-model="installPackId" class="dark-input" :disabled="isInstalling">
           <option value="">None</option>
-          <option v-for="p in store.packs" :key="p.pack_id" :value="p.pack_id">{{ p.name }}</option>
+          <option v-for="p in editablePacks" :key="p.pack_id" :value="p.pack_id">{{ p.name }}</option>
         </select>
       </div>
       

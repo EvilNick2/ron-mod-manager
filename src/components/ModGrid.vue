@@ -1,7 +1,10 @@
 <script setup lang="ts">
 import { store } from "../store";
 import { sectionMods, LOOSE_ID, type Section } from "../modSections";
-import { applyPack, refreshMods as rescanMods, publishPack, copyText, folderLink, progressLine } from "../packActions";
+import {
+  applyPack, refreshMods as rescanMods, publishPack, copyText, folderLink, progressLine, checkPackUpdates, updatePack,
+  updateLine, isLinked
+} from "../packActions";
 import { invoke } from "@tauri-apps/api/core";
 import { onMounted, onBeforeUnmount, ref, computed, watch } from "vue";
 import { Search, Plus, RefreshCw, X, ChevronDown, ChevronRight } from 'lucide-vue-next';
@@ -400,6 +403,7 @@ async function refreshMods(checkForUpdates = true) {
 
 async function refreshModsFromButton() {
   await refreshMods(true);
+  await checkPackUpdates();
 }
 </script>
 
@@ -447,6 +451,10 @@ async function refreshModsFromButton() {
           <span v-if="section.isActive" class="section-active-tag">active</span>
           <span v-if="packOf(section)?.published?.dirty" class="section-dirty-tag">Changes not uploaded</span>
           <span class="section-count">{{ sectionCount(section) }}</span>
+          <template v-if="packOf(section) && store.packUpdates[section.id]">
+            <span v-if="store.packUpdates[section.id].status === 'available'" class="section-update-tag">{{ updateLine(store.packUpdates[section.id]) }}</span>
+            <span v-else-if="store.packUpdates[section.id].status === 'updating'" class="section-update-tag">Being updated by its creator</span>
+          </template>
           <span v-if="store.packProgress[section.id]" class="section-progress">{{ progressLine(store.packProgress[section.id]) }}</span>
           <div class="section-actions">
             <template v-if="packOf(section)">
@@ -457,6 +465,12 @@ async function refreshModsFromButton() {
                 :disabled="!!store.inFlight[section.id]"
               >Publish</button>
               <button v-if="packOf(section)!.published" class="section-btn" @click="copySectionLink(section)">Copy link</button>
+              <button
+                v-if="store.packUpdates[section.id]?.status === 'available'"
+                class="section-btn"
+                @click="updatePack(packOf(section)!)"
+                :disabled="!!store.inFlight[section.id]"
+              >Update</button>
             </template>
             <template v-if="section.id === LOOSE_ID">
               <button v-if="!filterActive" class="section-btn" @click="setSectionEnabled(section, true)">Enable all</button>
@@ -493,7 +507,7 @@ async function refreshModsFromButton() {
               <div v-if="store.currentMode === 'Installed' && enabledInTitle(mod, section)" class="enabled-in">Enabled in {{ enabledInTitle(mod, section) }}</div>
               <h3>{{ mod.name }}</h3>
             </div>
-            <button v-if="!mod.is_online" class="delete-mod" @click.stop="removeMod(mod)" title="Remove Mod Completely">
+            <button v-if="!mod.is_online && !(mod.pack && isLinked(mod.pack.pack_id))" class="delete-mod" @click.stop="removeMod(mod)" title="Remove Mod Completely">
               <X :size="16" color="#ffffff" />
             </button>
           </div>
@@ -665,6 +679,17 @@ async function refreshModsFromButton() {
   padding: 0.1rem 0.6rem;
   font-size: 0.75rem;
   font-weight: 700;
+}
+
+.section-update-tag {
+  background: rgba(59, 130, 246, 0.12);
+  color: #3b82f6;
+  border: 1px solid rgba(59, 130, 246, 0.5);
+  border-radius: 99px;
+  padding: 0.1rem 0.6rem;
+  font-size: 0.75rem;
+  font-weight: 700;
+  white-space: nowrap;
 }
 
 .section-progress {

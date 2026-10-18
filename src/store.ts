@@ -27,6 +27,24 @@ export interface PackProgress {
   bytes_total: number;
 }
 
+export interface ModRef {
+  key: string;
+  nexus_mod_id: number | null;
+  name: string;
+  version: string | null;
+}
+
+export interface UpdateCheck {
+  pack_id: string;
+  status: "current" | "available" | "updating";
+  installed_version: string | null;
+  remote_version: string | null;
+  added: ModRef[];
+  changed: ModRef[];
+  removed: ModRef[];
+  download_bytes: number;
+}
+
 export interface CloseBlocked {
   dirty: PackRef[];
   uploading: PackRef[];
@@ -71,5 +89,6 @@ export const store = reactive({
   google: { signInAvailable: false, linksAvailable: false, email: null as string | null },
   packProgress: {} as Record<string, PackProgress>,
   inFlight: {} as Record<string, true>,
+  packUpdates: {} as Record<string, UpdateCheck>,
   closeBlocked: null as CloseBlocked | null
 });

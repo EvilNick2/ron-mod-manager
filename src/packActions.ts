@@ -1,10 +1,51 @@
 import { invoke } from "@tauri-apps/api/core";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
-import { store, type PackManifest, type PackProgress } from "./store";
+import { store, type ModRef, type PackManifest, type PackProgress, type PackRef, type UpdateCheck } from "./store";
 
 type PublishOutcome =
   | { kind: "Published"; folder_id: string; version: string; uploaded: number; deleted: number }
   | { kind: "NothingToPublish"; folder_id: string };
+
+export interface ImportPreview {
+  pack: PackRef;
+  installed_version: string | null;
+  added: ModRef[];
+  removed: ModRef[];
+  changed: ModRef[];
+  superseded: ModRef[];
+}
+
+export interface ImportSummary {
+  pack: PackRef;
+  keys: string[];
+  added: number;
+  changed: number;
+  removed_keys: string[];
+  superseded_ids: string[];
+  failed_deletes: string[];
+}
+
+interface UpdateSummary {
+  pack: PackRef;
+  downloaded: number;
+  added: number;
+  changed: number;
+  removed_keys: string[];
+  failed_deletes: string[];
+  not_enabled: string[];
+}
+
+export async function loadPresets(): Promise<void> {
+  try {
+    store.presets = await invoke("load_presets") as Record<string, string[]>;
+    const active = store.activePresetName;
+    if (active && !active.startsWith("pack:") && !store.presets[active]) {
+      store.activePresetName = "";
+    }
+  } catch (e) {
+    console.error("Failed to load presets:", e);
+  }
+}
 
 export async function loadPacks(): Promise<void> {
   store.packs = await invoke("load_packs") as PackManifest[];
@@ -165,4 +206,216 @@ export async function publishPack(pack: PackManifest): Promise<boolean> {
     alert("Nothing to publish");
   }
   return true;
+}
+
+export function packLabel(name: string, version: string | null): string {
+  return version ? `${name} ${version}` : name;
+}
+
+export function nameList(names: string[]): string {
+  const shown = names.slice(0, 10).join(", ");
+  return names.length > 10 ? `${shown} and ${names.length - 10} more` : shown;
+}
+
+// The confirm text for importing a pack, or "" when nothing on disk is replaced
+export function importQuestion(preview: ImportPreview, installed: PackManifest | undefined): string {
+  const { name, version } = preview.pack;
+  const { removed, superseded } = preview;
+  if (removed.length + superseded.length === 0) return "";
+  const supersededText = `${superseded.length} installed mods are also in this pack and their old copies will be deleted from disk.`;
+  if (!installed) return `Import ${packLabel(name, version)}? ${supersededText}`;
+  const from = installed.version ? ` from ${installed.version}` : "";
+  const to = version ? ` to ${version}` : "";
+  let question = `Update ${name}${from}${to}? ${preview.added.length} mods added, ${preview.changed.length} updated`;
+  question += removed.length > 0
+    ? `, ${removed.length} removed and deleted from disk: ${nameList(removed.map((m) => m.name))}.`
+    : ".";
+  if (superseded.length > 0) question += ` ${supersededText}`;
+  return question;
+}
+
+// Applies a freshly imported pack and tells the player. Sets the label first so a caller can name the pack in errors.
+async function finishImport(summary: ImportSummary, imported: { label: string }): Promise<void> {
+  imported.label = packLabel(summary.pack.name, summary.pack.version);
+  await loadPresets();
+  await loadPacks();
+  const pack = store.packs.find((p) => p.pack_id === summary.pack.pack_id);
+  if (pack) await applyPack(pack);
+  else await refreshMods();
+
+  let message = `${imported.label} installed${pack ? " and active" : ""}.`;
+  if (summary.failed_deletes.length > 0) {
+    message += `\nThese folders could not be deleted: ${summary.failed_deletes.join(", ")}`;
+  }
+  alert(message);
+}
+
+export async function importArchive(archivePath: string): Promise<void> {
+  const imported = { label: "" };
+  try {
+    await loadPacks();
+    const preview = await invoke("inspect_preset_archive", { archivePath }) as ImportPreview;
+    const installed = store.packs.find((p) => p.pack_id === preview.pack.pack_id);
+    const question = importQuestion(preview, installed);
+    if (question && !confirm(question)) return;
+
+    const summary = await invoke("import_preset", { archivePath }) as ImportSummary;
+    await finishImport(summary, imported);
+  } catch (e: any) {
+    if (imported.label) {
+      console.error("Import follow-up failed:", e);
+      alert(`${imported.label} was imported, but the next step failed: ${e}`);
+    } else if (e !== "Import cancelled") {
+      console.error("Failed to import preset:", e);
+      alert("Failed to import preset: " + e);
+    }
+  }
+  if (imported.label) await checkPackUpdates();
+}
+
+let updateCheckSeq = 0;
+
+export async function checkPackUpdates(): Promise<void> {
+  if (!store.google.linksAvailable) return;
+  const seq = ++updateCheckSeq;
+  try {
+    const checks = await invoke("check_pack_updates") as UpdateCheck[];
+    if (seq !== updateCheckSeq) return;
+    store.packUpdates = Object.fromEntries(checks.map((c) => [c.pack_id, c]));
+  } catch (e) {
+    console.error("Failed to check modpack updates:", e);
+  }
+}
+
+export function updateLine(check: UpdateCheck): string {
+  return `Update available: ${check.installed_version ?? "none"} to ${check.remote_version ?? "none"}`;
+}
+
+export async function addPackFromLink(): Promise<void> {
+  const link = prompt("Paste the modpack's Google Drive link:");
+  if (!link || !link.trim()) return;
+  const imported = { label: "" };
+  try {
+    await loadPacks();
+    const result = await invoke("inspect_pack_link", { link }) as { preview: ImportPreview; download_bytes: number };
+    const preview = result.preview;
+    const { name, version } = preview.pack;
+    if (store.inFlight[preview.pack.pack_id]) {
+      alert(`${name} is busy, try again when it finishes`);
+      return;
+    }
+    const installed = store.packs.find((p) => p.pack_id === preview.pack.pack_id);
+    let question = importQuestion(preview, installed);
+    if (!question && installed) {
+      const from = installed.version ? ` from ${installed.version}` : "";
+      const to = version ? ` to ${version}` : "";
+      question = `Update ${name}${from}${to}?`;
+    }
+    if (!question) question = `Import ${packLabel(name, version)}?`;
+    if (!confirm(`${question} Downloads ${formatSize(result.download_bytes)}.`)) return;
+
+    const packId = preview.pack.pack_id;
+    beginOp(packId);
+    let summary: ImportSummary;
+    try {
+      summary = await invoke("add_pack_from_link", { link }) as ImportSummary;
+    } finally {
+      endOp(packId);
+    }
+    await finishImport(summary, imported);
+  } catch (e: any) {
+    if (imported.label) {
+      console.error("Add from link follow-up failed:", e);
+      alert(`${imported.label} was imported, but the next step failed: ${e}`);
+    } else {
+      console.error("Failed to add the modpack:", e);
+      alert("Failed to add the modpack: " + e);
+    }
+  }
+  if (imported.label) await checkPackUpdates();
+}
+
+async function runPackUpdate(pack: PackManifest, run: () => Promise<UpdateSummary>, failure: string): Promise<void> {
+  let summary: UpdateSummary;
+  beginOp(pack.pack_id);
+  try {
+    summary = await run();
+  } catch (e) {
+    console.error(failure, e);
+    alert(failure + e);
+    return;
+  } finally {
+    endOp(pack.pack_id);
+    await refreshMods().catch((e) => console.error("Failed to refresh mods:", e));
+    await loadPresets().catch((e) => console.error("Failed to load presets:", e));
+    await checkPackUpdates();
+  }
+  if (summary.failed_deletes.length > 0) {
+    console.warn(`Folders left behind after updating ${pack.name}:`, summary.failed_deletes);
+  }
+  if (summary.not_enabled.length > 0) {
+    alert(`${pack.name} was updated, but these mods could not be turned on: ${summary.not_enabled.join(", ")}`);
+  }
+}
+
+export async function updatePack(pack: PackManifest): Promise<void> {
+  const check = store.packUpdates[pack.pack_id];
+  if (check?.status !== "available" || store.inFlight[pack.pack_id]) return;
+  const question = `Update ${pack.name} to ${check.remote_version}? ${check.added.length} mods added, ${check.changed.length} updated, ${check.removed.length} removed and deleted from disk. Downloads ${formatSize(check.download_bytes)}.`;
+  if (!confirm(question)) return;
+  await runPackUpdate(pack, () => invoke("update_linked_pack", { packId: pack.pack_id }), "Failed to update: ");
+}
+
+export async function verifyPack(pack: PackManifest): Promise<void> {
+  if (store.inFlight[pack.pack_id]) return;
+  let broken: string[];
+  beginOp(pack.pack_id);
+  try {
+    broken = await invoke("verify_linked_pack", { packId: pack.pack_id }) as string[];
+  } catch (e) {
+    console.error("Failed to verify:", e);
+    alert("Failed to verify: " + e);
+    return;
+  } finally {
+    endOp(pack.pack_id);
+  }
+  if (broken.length === 0) {
+    alert("All files match.");
+    return;
+  }
+  const check = store.packUpdates[pack.pack_id];
+  const question = check?.status === "available"
+    ? `Redownload ${broken.length} mods? This also installs the update to ${check.remote_version}.`
+    : `Redownload ${broken.length} mods?`;
+  if (!confirm(question)) return;
+  await runPackUpdate(
+    pack,
+    () => invoke("redownload_mods", { packId: pack.pack_id, modIds: broken }),
+    "Failed to verify: ",
+  );
+}
+
+export async function forkPack(pack: PackManifest): Promise<void> {
+  if (store.inFlight[pack.pack_id]) return;
+  let size: number;
+  try {
+    size = await invoke("get_pack_size", { packId: pack.pack_id }) as number;
+  } catch (e) {
+    console.error("Failed to fork:", e);
+    alert("Failed to fork: " + e);
+    return;
+  }
+  const name = prompt("Name for the fork:", `${pack.name} (fork)`);
+  if (name === null) return;
+  if (!confirm(`Forking copies ${formatSize(size)} of mods. Continue?`)) return;
+  beginOp(pack.pack_id);
+  try {
+    await invoke("fork_pack", { packId: pack.pack_id, name });
+  } catch (e) {
+    console.error("Failed to fork:", e);
+    alert("Failed to fork: " + e);
+  } finally {
+    endOp(pack.pack_id);
+    await refreshMods().catch((e) => console.error("Failed to refresh mods:", e));
+  }
 }

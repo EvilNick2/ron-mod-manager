@@ -3,7 +3,7 @@ import { onMounted, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { store, type PackProgress, type CloseBlocked } from "./store";
-import { loadGoogleStatus } from "./packActions";
+import { loadGoogleStatus, checkPackUpdates } from "./packActions";
 
 import Sidebar from "./components/Sidebar.vue";
 import ModGrid from "./components/ModGrid.vue";
@@ -76,6 +76,7 @@ onMounted(async () => {
   } catch (e) {
     console.error("Failed to load Google status:", e);
   }
+  checkPackUpdates();
 
   try {
     const update = await invoke("check_for_app_update");
