@@ -81,6 +81,65 @@ pub fn link_prefix(key: &str) -> String {
     format!("{}_", key.replace('/', "."))
 }
 
+fn is_version_token(t: &str) -> bool {
+    let b = t.as_bytes();
+    let mut i = usize::from(matches!(b.first(), Some(b'v' | b'V')));
+    loop {
+        let start = i;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == start {
+            return false;
+        }
+        if i < b.len() && b[i] == b'.' {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    i == b.len() || (i + 1 == b.len() && b[i].is_ascii_alphabetic())
+}
+
+pub fn split_version(name: &str) -> (String, Option<String>) {
+    let name = name.trim();
+    if let Some((rest, token)) = name.rsplit_once(char::is_whitespace) {
+        if is_version_token(token) {
+            let version = token.strip_prefix(['v', 'V']).unwrap_or(token);
+            return (rest.trim().to_string(), Some(version.to_string()));
+        }
+    }
+    (name.to_string(), None)
+}
+
+pub fn slugify(name: &str) -> String {
+    let slug = name
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    if slug.is_empty() {
+        "pack".to_string()
+    } else if all_digits(&slug) {
+        format!("pack-{}", slug)
+    } else {
+        slug
+    }
+}
+
+pub fn pack_identity(preset: &serde_json::Value) -> PackRef {
+    let text = |key: &str| preset.get(key).and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+    let (name, split) = split_version(text("name").unwrap_or(""));
+    match text("pack_id") {
+        Some(id) => PackRef {
+            pack_id: slugify(id),
+            name,
+            version: text("version").map(str::to_string).or(split),
+        },
+        None => PackRef { pack_id: slugify(&name), name, version: split },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,6 +181,24 @@ mod tests {
         for bad in ["..", "../5543", "a/b/1", "Casual-Shitters/x", "123/45", "", "notes", "Foo_Bar/1"] {
             assert!(parse_key(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn pack_identity_from_names() {
+        use serde_json::json;
+        let id = |v: serde_json::Value| { let r = pack_identity(&v); (r.pack_id, r.name, r.version) };
+        let s = |x: &str| x.to_string();
+        assert_eq!(id(json!({"name": "Casual Shitters v1.5"})), (s("Casual-Shitters"), s("Casual Shitters"), Some(s("1.5"))));
+        assert_eq!(id(json!({"name": "Casual Shitters 1.5"})), (s("Casual-Shitters"), s("Casual Shitters"), Some(s("1.5"))));
+        assert_eq!(id(json!({"name": "Pack V2"})), (s("Pack"), s("Pack"), Some(s("2"))));
+        assert_eq!(id(json!({"name": "Night Ops 2.0b"})), (s("Night-Ops"), s("Night Ops"), Some(s("2.0b"))));
+        assert_eq!(id(json!({"name": "No Version Here"})), (s("No-Version-Here"), s("No Version Here"), None));
+        assert_eq!(id(json!({"name": "1.5"})), (s("1-5"), s("1.5"), None));
+        assert_eq!(id(json!({"name": "2024"})), (s("pack-2024"), s("2024"), None));
+        assert_eq!(id(json!({"name": "!!!"})).0, "pack");
+        assert_eq!(id(json!({"name": "\u{041f}\u{0430}\u{043a} v2"})).0, "pack");
+        assert_eq!(id(json!({"name": "Renamed v9", "pack_id": "Casual-Shitters", "version": "1.6"})),
+            (s("Casual-Shitters"), s("Renamed"), Some(s("1.6"))));
     }
 
     #[test]
