@@ -29,7 +29,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "
 tokio-tungstenite = { version = "0.21", features = ["rustls-tls-native-roots"] }
 futures-util = "0.3"
 uuid = { version = "1", features = ["v4", "fast-rng"] }
-reqwest = { version = "0.11", features = ["json", "stream"] }
+reqwest = { version = "0.11", features = ["json", "stream", "blocking"] }
 rfd = "0.14"
 zip = "8.3.1"
 unrar = "0.5.8"

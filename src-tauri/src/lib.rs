@@ -1,5 +1,6 @@
 mod api;
 mod config;
+mod google;
 mod hashing;
 mod packs;
 mod sso;
@@ -20,6 +21,9 @@ pub fn run() {
             config::get_default_storage_path,
             config::auto_detect_game_path,
             config::get_api_key,
+            google::google_status,
+            google::google_sign_in,
+            google::google_sign_out,
             config::save_preset,
             config::delete_preset,
             config::load_presets,
