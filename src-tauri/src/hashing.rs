@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
+use crate::packs::CachedHash;
+
 pub const META_FILES: [&str; 2] = ["metadata.json", "thumbnail.jpg"];
 
 const CHUNK_SIZE: usize = 1024 * 1024;
@@ -82,6 +84,72 @@ pub fn hash_mod_files(
     let mut entries = Vec::new();
     for (path, full_path, size) in list_mod_files(mod_dir)? {
         let sha256 = sha256_file(&full_path)?;
+        on_file(&path);
+        entries.push(FileEntry { path, size, sha256 });
+    }
+    Ok(entries)
+}
+
+pub fn mtime_ns(path: &Path) -> Option<u64> {
+    let modified = fs::metadata(path).ok()?.modified().ok()?;
+    to_ns(modified)
+}
+
+fn to_ns(time: std::time::SystemTime) -> Option<u64> {
+    let since = time.duration_since(std::time::UNIX_EPOCH).ok()?;
+    u64::try_from(since.as_nanos()).ok()
+}
+
+fn stat(path: &Path) -> (Option<u64>, Option<u64>) {
+    match fs::metadata(path) {
+        Ok(m) => (Some(m.len()), m.modified().ok().and_then(to_ns)),
+        Err(_) => (None, None),
+    }
+}
+
+// Timestamps move in coarse ticks, so a file this new could still change without its mtime moving
+const RACY_NS: u64 = 2_000_000_000;
+
+// The mtime a freshly hashed file is cached under, or None when it must be hashed again next time:
+// mtime unreadable, size or mtime changed while it was read, or mtime too close to now
+fn cache_mtime(before: (u64, Option<u64>), after: (Option<u64>, Option<u64>), now_ns: u64) -> Option<u64> {
+    let mtime = before.1?;
+    if after != (Some(before.0), Some(mtime)) || now_ns.saturating_sub(mtime) < RACY_NS {
+        return None;
+    }
+    Some(mtime)
+}
+
+// Like hash_mod_files, but a file whose size and mtime match its cache entry keeps the cached
+// sha256 without being read. Files safe to trust next time are recorded in fresh.
+pub fn hash_mod_files_cached(
+    mod_dir: &Path,
+    mod_id: &str,
+    cache: &BTreeMap<String, CachedHash>,
+    fresh: &mut BTreeMap<String, CachedHash>,
+    on_file: &mut dyn FnMut(&str),
+) -> Result<Vec<FileEntry>, String> {
+    let mut entries = Vec::new();
+    for (path, full_path, size) in list_mod_files(mod_dir)? {
+        let key = format!("{}/{}", mod_id, path);
+        let mtime = mtime_ns(&full_path);
+        let hit = cache
+            .get(&key)
+            .filter(|c| mtime.is_some_and(|m| c.size == size && c.mtime_ns == m));
+        let sha256 = match hit {
+            Some(c) => {
+                fresh.insert(key, c.clone());
+                c.sha256.clone()
+            }
+            None => {
+                let sha256 = sha256_file(&full_path)?;
+                let now = to_ns(std::time::SystemTime::now()).unwrap_or(0);
+                if let Some(mtime_ns) = cache_mtime((size, mtime), stat(&full_path), now) {
+                    fresh.insert(key, CachedHash { size, mtime_ns, sha256: sha256.clone() });
+                }
+                sha256
+            }
+        };
         on_file(&path);
         entries.push(FileEntry { path, size, sha256 });
     }
@@ -295,5 +363,34 @@ mod tests {
         let meta: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(dir.join("metadata.json")).unwrap()).unwrap();
         assert_eq!(meta["name"], "Mod");
+    }
+
+    #[test]
+    fn cache_mtime_rules() {
+        let old = 1_000_000_000_000;
+        let now = old + 60_000_000_000;
+        assert_eq!(cache_mtime((3, Some(old)), (Some(3), Some(old)), now), Some(old));
+        assert_eq!(cache_mtime((3, None), (Some(3), None), now), None);
+        assert_eq!(cache_mtime((3, Some(old)), (Some(4), Some(old)), now), None);
+        assert_eq!(cache_mtime((3, Some(old)), (Some(3), Some(old + 1)), now), None);
+        assert_eq!(cache_mtime((3, Some(old)), (None, None), now), None);
+        assert_eq!(cache_mtime((3, Some(now - 1_999_999_999)), (Some(3), Some(now - 1_999_999_999)), now), None);
+        assert_eq!(cache_mtime((3, Some(now + 5)), (Some(3), Some(now + 5)), now), None);
+    }
+
+    #[test]
+    fn recent_mtime_is_not_cached() {
+        let dir = scratch("cache-recent");
+        fs::write(dir.join("new.pak"), b"new").unwrap();
+        fs::write(dir.join("old.pak"), b"old").unwrap();
+        let now = std::time::SystemTime::now();
+        let set = |name: &str, t| File::options().write(true).open(dir.join(name)).unwrap().set_modified(t).unwrap();
+        set("new.pak", now);
+        set("old.pak", now - std::time::Duration::from_secs(60));
+
+        let mut fresh = BTreeMap::new();
+        let files = hash_mod_files_cached(&dir, "1", &BTreeMap::new(), &mut fresh, &mut |_| {}).unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(fresh.keys().collect::<Vec<_>>(), ["1/old.pak"]);
     }
 }

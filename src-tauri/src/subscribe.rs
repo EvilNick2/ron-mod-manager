@@ -315,6 +315,7 @@ fn write_staged_manifest(remote: &RemotePack, mod_ids: Vec<String>, staged: &Pat
             }),
             installed_hashes,
             published: None,
+            local_hashes: BTreeMap::new(),
         },
     )
 }

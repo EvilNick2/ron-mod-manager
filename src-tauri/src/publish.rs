@@ -135,12 +135,13 @@ pub fn hash_local_pack(pack_dir: &Path, pack_id: &str, progress: &mut dyn FnMut(
     let manifest = packs::read_manifest(pack_dir).ok_or_else(|| format!("Could not read pack.json for {}", pack_id))?;
     let total = manifest.mod_ids.len();
     let mut mods = Vec::with_capacity(total);
+    let mut fresh = BTreeMap::new();
     for (done, id) in manifest.mod_ids.iter().enumerate() {
         let dir = pack_dir.join(id);
         if !dir.is_dir() {
             return Err(format!("Mod {} is missing from {}", id, manifest.name));
         }
-        let files = hashing::hash_mod_files(&dir, &mut |path| {
+        let files = hashing::hash_mod_files_cached(&dir, id, &manifest.local_hashes, &mut fresh, &mut |path| {
             progress(progress_event(pack_id, "hashing", done, total, Some(path), (0, 0)));
         })?;
         let addons = hashing::addon_states(&dir);
@@ -150,8 +151,22 @@ pub fn hash_local_pack(pack_dir: &Path, pack_id: &str, progress: &mut dyn FnMut(
         let version = crate::vfs::meta_version(meta.as_ref());
         mods.push(LocalMod { id: id.clone(), name, version, dir, files, addons, hash });
     }
+    // Read-modify-write of pack.json, open to the same race as set_dirty
+    if let Err(e) = save_local_hashes(pack_dir, fresh) {
+        eprintln!("[PUBLISH] Could not save the hash cache for {}: {}", pack_id, e);
+    }
     progress(progress_event(pack_id, "hashing", total, total, None, (0, 0)));
     Ok(mods)
+}
+
+// Re-reads pack.json so only local_hashes changes, never a dirty flag set while hashing
+fn save_local_hashes(pack_dir: &Path, fresh: BTreeMap<String, packs::CachedHash>) -> Result<(), String> {
+    let mut manifest = packs::read_manifest(pack_dir).ok_or("Could not read pack.json")?;
+    if manifest.local_hashes == fresh {
+        return Ok(());
+    }
+    manifest.local_hashes = fresh;
+    packs::write_manifest(pack_dir, &manifest)
 }
 
 fn is_mod_folder_name(name: &str) -> bool {
@@ -1486,5 +1501,103 @@ mod tests {
         mk("local", "Local", None);
         let names: Vec<_> = dirty_packs(&mods).into_iter().map(|p| p.name).collect();
         assert_eq!(names, vec!["Alpha", "Zeta"]);
+    }
+
+    fn sha_of(mods: &[LocalMod], id: &str, path: &str) -> String {
+        let m = mods.iter().find(|m| m.id == id).unwrap();
+        m.files.iter().find(|f| f.path == path).unwrap().sha256.clone()
+    }
+
+    fn set_cached_sha(pack_dir: &Path, key: &str, sha256: &str) {
+        let mut man = packs::read_manifest(pack_dir).unwrap();
+        man.local_hashes.get_mut(key).unwrap().sha256 = sha256.to_string();
+        packs::write_manifest(pack_dir, &man).unwrap();
+    }
+
+    fn set_mtime(path: &Path, time: std::time::SystemTime) {
+        fs::File::options().write(true).open(path).unwrap().set_modified(time).unwrap();
+    }
+
+    // Recent files are never cached, so cache tests age every file first
+    fn cache_fixture(name: &str) -> PathBuf {
+        let pack_dir = pack_fixture(name, &base_mods());
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        for entry in walkdir::WalkDir::new(&pack_dir).into_iter().map(Result::unwrap) {
+            if entry.file_type().is_file() && entry.file_name() != "pack.json" {
+                set_mtime(entry.path(), past);
+            }
+        }
+        pack_dir
+    }
+
+    #[test]
+    fn cache_skips_unchanged_files() {
+        let pack_dir = cache_fixture("cache-skip");
+        local(&pack_dir);
+        let blood_key = format!("3311/{}", B_PAK);
+        set_cached_sha(&pack_dir, &blood_key, "bogus");
+
+        let vests = pack_dir.join("3063").join(A_PAK);
+        let old_mtime = fs::metadata(&vests).unwrap().modified().unwrap();
+        fs::write(&vests, "vests-v2").unwrap();
+        set_mtime(&vests, old_mtime + std::time::Duration::from_secs(10));
+
+        let mods = local(&pack_dir);
+        assert_eq!(sha_of(&mods, "3311", B_PAK), "bogus");
+        assert_eq!(sha_of(&mods, "3063", A_PAK), hashing::sha256_bytes(b"vests-v2"));
+        let man = packs::read_manifest(&pack_dir).unwrap();
+        assert_eq!(man.local_hashes[&format!("3063/{}", A_PAK)].sha256, hashing::sha256_bytes(b"vests-v2"));
+        assert_eq!(man.local_hashes[&blood_key].sha256, "bogus");
+    }
+
+    #[test]
+    fn cache_rehashes_resized_file() {
+        let pack_dir = cache_fixture("cache-resize");
+        local(&pack_dir);
+        let key = format!("3063/{}", A_PAK);
+        set_cached_sha(&pack_dir, &key, "bogus");
+
+        let vests = pack_dir.join("3063").join(A_PAK);
+        let old_mtime = fs::metadata(&vests).unwrap().modified().unwrap();
+        fs::write(&vests, "vests-v1-longer").unwrap();
+        set_mtime(&vests, old_mtime);
+
+        let mods = local(&pack_dir);
+        assert_eq!(sha_of(&mods, "3063", A_PAK), hashing::sha256_bytes(b"vests-v1-longer"));
+    }
+
+    #[test]
+    fn cache_drops_deleted_files() {
+        let pack_dir = cache_fixture("cache-drop");
+        local(&pack_dir);
+        let addon_key = format!("3311/addons/{}", W_PAK);
+        let man = packs::read_manifest(&pack_dir).unwrap();
+        assert_eq!(man.local_hashes.len(), 5);
+        assert!(man.local_hashes.contains_key(&addon_key));
+
+        fs::remove_file(pack_dir.join("3311/addons").join(W_PAK)).unwrap();
+        local(&pack_dir);
+        let man = packs::read_manifest(&pack_dir).unwrap();
+        assert_eq!(man.local_hashes.len(), 4);
+        assert!(!man.local_hashes.contains_key(&addon_key));
+
+        set_mod_ids(&pack_dir, &["3063"]);
+        local(&pack_dir);
+        let keys: Vec<_> = packs::read_manifest(&pack_dir).unwrap().local_hashes.into_keys().collect();
+        assert_eq!(keys, vec!["3063/metadata.json".to_string(), format!("3063/{}", A_PAK)]);
+    }
+
+    #[test]
+    fn cache_save_keeps_dirty() {
+        let pack_dir = cache_fixture("cache-dirty");
+        let mut man = packs::read_manifest(&pack_dir).unwrap();
+        man.published = Some(Published { folder_id: "F".into(), dirty: false });
+        packs::write_manifest(&pack_dir, &man).unwrap();
+
+        let mods_dir = pack_dir.parent().unwrap().to_path_buf();
+        hash_local_pack(&pack_dir, PACK, &mut |_| packs::mark_pack_dirty(&mods_dir, PACK)).unwrap();
+        let man = packs::read_manifest(&pack_dir).unwrap();
+        assert_eq!(man.published, Some(Published { folder_id: "F".into(), dirty: true }));
+        assert_eq!(man.local_hashes.len(), 5);
     }
 }

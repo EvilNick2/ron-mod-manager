@@ -31,6 +31,14 @@ pub struct Published {
     pub dirty: bool,
 }
 
+// A file's sha256 as last hashed, reused while its size and mtime are unchanged
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct CachedHash {
+    pub size: u64,
+    pub mtime_ns: u64,
+    pub sha256: String,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct PackManifest {
     pub pack_id: String,
@@ -44,6 +52,9 @@ pub struct PackManifest {
     pub installed_hashes: BTreeMap<String, InstalledMod>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub published: Option<Published>,
+    // Keyed "<mod id>/<relative path>". Only valid for files on this machine, never carried over
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub local_hashes: BTreeMap<String, CachedHash>,
 }
 
 pub fn read_manifest(pack_dir: &Path) -> Option<PackManifest> {

@@ -879,6 +879,11 @@ pub fn load_packs(app_handle: tauri::AppHandle) -> Result<Vec<crate::packs::Pack
     let mut packs: Vec<_> = child_dirs(&mods_dir)?
         .into_iter()
         .filter_map(|name| read_manifest(&mods_dir.join(name)))
+        .map(|mut m| {
+            // The UI never reads the hash cache, so a big pack does not ship it over IPC
+            m.local_hashes.clear();
+            m
+        })
         .collect();
     packs.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(packs)
@@ -2137,6 +2142,19 @@ mod tests {
     }
 
     #[test]
+    fn zip_import_drops_local_hashes() {
+        use crate::packs::{read_manifest, write_manifest, CachedHash, Published};
+        let (m, p, z) = (scratch("mods"), scratch("paks"), scratch("zips"));
+        upgrade_setup(&m, &p, &z);
+        let mut man = read_manifest(&m.join("CS")).unwrap();
+        man.published = Some(Published { folder_id: "F".into(), dirty: false });
+        man.local_hashes.insert("3063/a.pak".into(), CachedHash { size: 1, mtime_ns: 1, sha256: "x".into() });
+        write_manifest(&m.join("CS"), &man).unwrap();
+        import_from_archive(&z.join("v16.zip"), &m, &p).unwrap();
+        assert!(read_manifest(&m.join("CS")).unwrap().local_hashes.is_empty());
+    }
+
+    #[test]
     fn upgrade_replaces_only_this_pack() {
         let (m, p, z) = (scratch("mods"), scratch("paks"), scratch("zips"));
         upgrade_setup(&m, &p, &z);
@@ -2702,6 +2720,7 @@ mod tests {
             pack_id: "CS".into(), name: "Casual".into(), version: Some("1.2".into()),
             mod_ids: vec!["3063".into(), "4296".into()], imported_at: 5,
             source: Some(PackSource { kind: "drive".into(), folder_id: "f".into(), resource_key: None }),
+            local_hashes: [("3063/a.pak".to_string(), crate::packs::CachedHash { size: 3, mtime_ns: 1, sha256: "x".into() })].into(),
             ..Default::default() }).unwrap();
         assert!(crate::packs::ensure_pack_editable(&m, "CS").is_err());
         let before = tree(&m.join("CS"));
@@ -2720,6 +2739,7 @@ mod tests {
         }
         let saved = read_manifest(&m.join("My-Fork")).unwrap();
         assert!(saved.source.is_none() && saved.installed_hashes.is_empty() && saved.published.is_none());
+        assert!(saved.local_hashes.is_empty());
         crate::packs::ensure_pack_editable(&m, "My-Fork").unwrap();
         assert_eq!(tree(&m.join("CS")), before);
         assert_eq!(read_json(&m.join("CS/3063/metadata.json"))["enabled"], Value::Bool(true));
