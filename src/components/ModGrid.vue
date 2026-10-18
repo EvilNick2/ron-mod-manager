@@ -163,6 +163,7 @@ function modsOfSection(section: Section) {
 async function setSectionEnabled(section: Section, enable: boolean) {
   try {
     for (const mod of modsOfSection(section)) {
+      if (mod.nexus_mod_id == null) continue;
       await invoke("toggle_mod", { modId: mod.id, enable });
     }
   } catch (e: any) {
@@ -320,10 +321,6 @@ async function toggleModRightClick(mod: any) {
   if (store.currentMode !== 'Installed') return;
   try {
     await rescanMods();
-    const selectedId = store.selectedMod?.id;
-    if (selectedId !== undefined) {
-      store.selectedMod = store.mods.find((m: any) => m.id === selectedId) ?? null;
-    }
   } catch (e: any) {
     console.error("Refresh after toggle failed:", e);
     alert("Mod toggled, but the list could not be refreshed: " + e);
@@ -346,15 +343,14 @@ async function removeMod(mod: any) {
   
   try {
     await invoke("delete_mod", { modId: mod.id });
-    
-    store.mods = store.mods.filter((m) => m.id !== mod.id);
-    
-    if (store.selectedMod?.id === mod.id) {
-      store.selectedMod = null;
-    }
   } catch (e: any) {
     console.error("Engine failed to purge mod:", e);
     alert("Purge Failure: " + e);
+  }
+  try {
+    await rescanMods();
+  } catch (e) {
+    console.error("Failed to refresh mods:", e);
   }
 }
 
@@ -378,10 +374,10 @@ async function startModUpdateFlow(mod: any) {
 
 async function refreshMods(checkForUpdates = true) {
   try {
-    store.mods = await invoke("scan_local_mods");
+    await rescanMods();
     if (checkForUpdates) {
       await invoke("refresh_installed_mod_updates");
-      store.mods = await invoke("scan_local_mods");
+      await rescanMods();
     }
     if (store.currentMode === 'Online') {
       store.onlineMods = [];
@@ -464,7 +460,7 @@ async function refreshModsFromButton() {
             @contextmenu.prevent="toggleModRightClick(mod)"
           >
             <button
-              v-if="store.currentMode === 'Installed' && mod.update_available"
+              v-if="store.currentMode === 'Installed' && mod.update_available && !mod.pack"
               class="update-available-banner"
               @click.stop="startModUpdateFlow(mod)"
               title="Open Nexus files page and import the updated archive"

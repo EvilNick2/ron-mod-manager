@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { store } from "../store";
+import { refreshMods } from "../packActions";
 import { invoke } from "@tauri-apps/api/core";
 import { ref, watch } from "vue";
 import { Archive, FileArchive, FolderOpen, Puzzle, Trash2, Plus } from 'lucide-vue-next';
@@ -38,6 +39,22 @@ async function startInstall() {
     return;
   }
 
+  const packId = installPackId.value;
+  if (packId) {
+    const archive = store.installingModPath.split(/[\\/]/).pop();
+    const root = store.mods.find((m: any) => m.id === modId);
+    const packCopy = store.mods.find((m: any) => m.id === `${packId}/${modId}`);
+    const packName = store.packs.find((p) => p.pack_id === packId)?.name ?? packId;
+    let question = "";
+    if (packCopy) {
+      question = `Replaces ${packCopy.version} in ${packName} with ${archive}?`;
+      if (root) question += " The hand installed copy will be replaced too.";
+    } else if (root) {
+      question = `Replaces the hand installed copy ${root.version} with ${archive}?`;
+    }
+    if (question && !confirm(question)) return;
+  }
+
   isInstalling.value = true;
   try {
     console.log("[InstallModal] Starting install for modId:", modId, "path:", store.installingModPath);
@@ -48,20 +65,19 @@ async function startInstall() {
     
     let postId = modId;
     let moveWarning = "";
-    if (installPackId.value) {
+    if (packId) {
       try {
-        postId = await invoke("move_to_pack", { key: modId, packId: installPackId.value });
+        postId = await invoke("move_to_pack", { key: modId, packId });
       } catch (e: any) {
         const msg = String(e);
         const match = msg.match(/^Moved to (\S+)/);
-        if (!match) throw new Error("Installed, but could not add to the modpack: " + msg);
-        postId = match[1];
-        moveWarning = msg;
+        postId = match ? match[1] : modId;
+        moveWarning = match ? msg : "Installed, but could not add to the modpack: " + msg;
       }
     }
 
     console.log("[InstallModal] Install succeeded, scanning mods...");
-    store.mods = await invoke("scan_local_mods");
+    await refreshMods();
     
     console.log("[InstallModal] Setting postInstallModId to:", postId);
     store.postInstallModId = postId;
@@ -91,7 +107,7 @@ async function pickPostInstallAddon() {
     if (file) {
       const added: string[] = await invoke("install_addon", { modId: store.postInstallModId, archivePath: file });
       postInstallAddons.value = [...postInstallAddons.value, ...added];
-      store.mods = await invoke("scan_local_mods");
+      await refreshMods();
     }
   } catch (e: any) {
     errorMsg.value = "Failed to add addon: " + e;
@@ -103,7 +119,7 @@ async function removePostInstallAddon(filename: string) {
   try {
     await invoke("remove_addon", { modId: store.postInstallModId, filename });
     postInstallAddons.value = postInstallAddons.value.filter(f => f !== filename);
-    store.mods = await invoke("scan_local_mods");
+    await refreshMods();
   } catch (e: any) {
     errorMsg.value = "Failed to remove addon: " + e;
   }

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { invoke } from "@tauri-apps/api/core";
 import { store } from "../store";
+import { refreshMods } from "../packActions";
 import { onMounted, ref } from "vue";
 import { X, Globe, Crosshair, Info } from 'lucide-vue-next';
 
@@ -62,7 +63,7 @@ async function pickStorageFolder() {
       config.mod_storage_path = folder;
       await invoke("save_config", { config });
       
-      store.mods = await invoke("scan_local_mods");
+      await refreshMods();
     }
   } catch (e) {
     console.error("Storage Folder picker failed", e);

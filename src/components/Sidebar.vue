@@ -2,6 +2,7 @@
 import { onMounted } from 'vue';
 import { invoke } from "@tauri-apps/api/core";
 import { store, type PackManifest } from "../store";
+import { applyPack, loadPacks, refreshMods } from "../packActions";
 import { 
   Package, 
   Globe, 
@@ -27,7 +28,8 @@ async function loginNexus() {
 async function loadPresets() {
   try {
     store.presets = await invoke("load_presets") as Record<string, string[]>;
-    if (store.activePresetName && !store.presets[store.activePresetName]) {
+    const active = store.activePresetName;
+    if (active && !active.startsWith("pack:") && !store.presets[active]) {
       store.activePresetName = "";
     }
   } catch (e) {
@@ -56,9 +58,8 @@ async function applyPreset(name: string) {
   if (!modIds) return;
   try {
     await invoke("apply_preset", { name, modIds });
-    const refreshed: any[] = await invoke("scan_local_mods");
-    store.mods = refreshed;
     store.activePresetName = name;
+    await refreshMods();
   } catch (e) {
     console.error("Failed to apply preset:", e);
     alert("Failed to apply preset: " + e);
@@ -81,38 +82,18 @@ function packLabel(name: string, version: string | null) {
   return version ? `${name} ${version}` : name;
 }
 
+function versionLabel(version: string | null) {
+  return version ? `v${version.replace(/^[vV]/, "")}` : "";
+}
+
 function nameList(names: string[]) {
   const shown = names.slice(0, 10).join(", ");
   return names.length > 10 ? `${shown} and ${names.length - 10} more` : shown;
 }
 
-async function loadPacks() {
+async function onApplyPack(pack: PackManifest) {
   try {
-    store.packs = await invoke("load_packs") as PackManifest[];
-  } catch (e) {
-    console.error("Failed to load packs:", e);
-  }
-}
-
-async function refreshMods() {
-  const refreshed: any[] = await invoke("scan_local_mods");
-  store.mods = refreshed;
-  if (store.selectedMod && !refreshed.some((m: any) => m.id === store.selectedMod.id)) {
-    store.selectedMod = null;
-  }
-}
-
-async function applyPackKeys(pack: PackManifest) {
-  const name = `pack:${pack.pack_id}`;
-  const modIds = pack.mod_ids.map((id) => `${pack.pack_id}/${id}`);
-  await invoke("apply_preset", { name, modIds });
-  store.activePresetName = name;
-}
-
-async function applyPack(pack: PackManifest) {
-  try {
-    await applyPackKeys(pack);
-    await refreshMods();
+    await applyPack(pack);
   } catch (e) {
     console.error("Failed to apply pack:", e);
     alert("Failed to apply pack: " + e);
@@ -141,10 +122,6 @@ async function removePack(pack: PackManifest) {
   if (!confirm(`Delete ${packLabel(pack.name, pack.version)} and its ${pack.mod_ids.length} mods from disk?`)) return;
   try {
     await invoke("delete_pack", { packId: pack.pack_id });
-    if (store.activePresetName === `pack:${pack.pack_id}`) {
-      store.activePresetName = "";
-    }
-    await loadPacks();
     await refreshMods();
   } catch (e) {
     console.error("Failed to delete pack:", e);
@@ -158,7 +135,7 @@ async function importPreset() {
     const archivePath: string | null = await invoke("pick_preset_archive");
     if (!archivePath) return;
 
-    store.packs = await invoke("load_packs") as PackManifest[];
+    await loadPacks();
     const preview: any = await invoke("inspect_preset_archive", { archivePath });
     const installed = store.packs.find((p) => p.pack_id === preview.pack.pack_id);
     const name: string = preview.pack.name;
@@ -187,10 +164,10 @@ async function importPreset() {
     imported = packLabel(summary.pack.name, summary.pack.version);
 
     await loadPresets();
-    store.packs = await invoke("load_packs") as PackManifest[];
+    await loadPacks();
     const pack = store.packs.find((p) => p.pack_id === summary.pack.pack_id);
-    if (pack) await applyPackKeys(pack);
-    await refreshMods();
+    if (pack) await applyPack(pack);
+    else await refreshMods();
 
     let message = `${imported} installed${pack ? " and active" : ""}.`;
     if (summary.failed_deletes.length > 0) {
@@ -227,8 +204,7 @@ async function bulkToggleMods(enable: boolean) {
   store.isFetchingOnline = true;
   try {
     await invoke("toggle_all_mods", { enable });
-    const refreshed: any[] = await invoke("scan_local_mods");
-    store.mods = refreshed;
+    await refreshMods();
   } catch (e: any) {
     console.error("Bulk toggle failed:", e);
     alert("Bulk Action Failed: " + e);
@@ -239,7 +215,7 @@ async function bulkToggleMods(enable: boolean) {
 
 onMounted(() => {
   loadPresets();
-  loadPacks();
+  loadPacks().catch((e) => console.error("Failed to load packs:", e));
 });
 
 async function fetchOnlineMods() {
@@ -359,9 +335,9 @@ async function launchGame() {
             <span class="preset-count">{{ pack.mod_ids.length }}</span>
           </div>
           <div class="pack-card-bottom">
-            <span class="pack-card-version">{{ pack.version ? `v${pack.version}` : "" }}</span>
+            <span class="pack-card-version">{{ versionLabel(pack.version) }}</span>
             <div class="pack-card-actions">
-              <button class="pack-icon-btn" @click.stop="applyPack(pack)" title="Apply Modpack">
+              <button class="pack-icon-btn" @click.stop="onApplyPack(pack)" title="Apply Modpack">
                 <Check :size="13" color="#22c55e" />
               </button>
               <button class="pack-icon-btn" @click.stop="exportPack(pack)" title="Export Modpack to .zip">

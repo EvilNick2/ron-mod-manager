@@ -15,19 +15,12 @@ async function toggleActiveMod() {
   errorMsg.value = "";
   isToggling.value = true;
   
+  const id = store.selectedMod.id;
   const newState = !store.selectedMod.enabled;
   
   try {
-    await invoke("toggle_mod", {
-      modId: store.selectedMod.id,
-      enable: newState
-    });
-    
-    store.selectedMod.enabled = newState;
-    
-    const target = store.mods.find(m => m.id === store.selectedMod.id);
-    if (target) target.enabled = newState;
-    
+    await invoke("toggle_mod", { modId: id, enable: newState });
+    await reselect(id);
   } catch (e: any) {
     errorMsg.value = "Error: " + e;
   } finally {
@@ -54,9 +47,7 @@ async function pickAddonFile() {
     const file: string | null = await invoke("pick_mod_archive");
     if (file) {
       await invoke("install_addon", { modId: store.selectedMod.id, archivePath: file });
-      store.mods = await invoke("scan_local_mods");
-      const updated = store.mods.find((m: any) => m.id === store.selectedMod.id);
-      if (updated) store.selectedMod = updated;
+      await refreshMods();
     }
   } catch (e: any) {
     errorMsg.value = "Failed to add addon: " + e;
@@ -67,9 +58,7 @@ async function toggleAddon(filename: string, enable: boolean) {
   if (!store.selectedMod) return;
   try {
     await invoke("toggle_addon", { modId: store.selectedMod.id, filename, enable });
-    store.mods = await invoke("scan_local_mods");
-    const updated = store.mods.find((m: any) => m.id === store.selectedMod.id);
-    if (updated) store.selectedMod = updated;
+    await refreshMods();
   } catch (e: any) {
     errorMsg.value = "Addon toggle failed: " + e;
   }
@@ -80,9 +69,7 @@ async function deleteAddon(filename: string) {
   if (!confirm(`Remove addon "${filename}"?`)) return;
   try {
     await invoke("remove_addon", { modId: store.selectedMod.id, filename });
-    store.mods = await invoke("scan_local_mods");
-    const updated = store.mods.find((m: any) => m.id === store.selectedMod.id);
-    if (updated) store.selectedMod = updated;
+    await refreshMods();
   } catch (e: any) {
     errorMsg.value = "Failed to remove addon: " + e;
   }
@@ -137,9 +124,10 @@ async function removeFromPack() {
       newKey = await invoke("remove_from_pack", { key: sel.id, replaceRoot: false });
     } catch (e: any) {
       if (String(e) !== "root-exists") throw e;
-      if (confirm("A hand installed copy already exists. Replace it with this one? Cancel deletes this pack copy instead.")) {
+      if (confirm("A hand installed copy already exists. Replace it with this one?")) {
         newKey = await invoke("remove_from_pack", { key: sel.id, replaceRoot: true });
       } else {
+        if (!confirm("Delete this pack copy instead?")) return;
         await invoke("delete_mod", { modId: sel.id });
         await refreshMods();
         return;
