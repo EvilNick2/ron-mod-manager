@@ -918,6 +918,98 @@ pub async fn delete_pack(app_handle: tauri::AppHandle, pack_id: String) -> Resul
     Ok(())
 }
 
+pub fn pack_size(pack_dir: &Path) -> u64 {
+    walkdir::WalkDir::new(pack_dir)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .filter_map(|e| e.metadata().ok())
+        .map(|m| m.len())
+        .sum()
+}
+
+fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
+    for entry in walkdir::WalkDir::new(from).follow_links(false) {
+        let entry = entry.map_err(|e| format!("Failed to read {}: {}", from.display(), e))?;
+        let rel = entry.path().strip_prefix(from).map_err(|e| e.to_string())?;
+        let dest = to.join(rel);
+        if entry.file_type().is_dir() {
+            fs::create_dir_all(&dest).map_err(|e| format!("Failed to create {}: {}", dest.display(), e))?;
+        } else if entry.file_type().is_file() {
+            fs::copy(entry.path(), &dest).map_err(|e| format!("Failed to copy {}: {}", entry.path().display(), e))?;
+        }
+    }
+    Ok(())
+}
+
+// Copies the pack into a staging folder and renames it into place, so a failure leaves nothing behind.
+fn fork_pack_dir(mods_dir: &Path, pack_id: &str, new_name: &str) -> Result<PackManifest, String> {
+    let pack_dir = mods_dir.join(pack_id);
+    let source = match read_manifest(&pack_dir) {
+        Some(m) if parse_key(&format!("{}/1", pack_id)).is_ok() => m,
+        _ => return Err(format!("No modpack folder for {:?}", pack_id)),
+    };
+    let name = new_name.trim();
+    if name.is_empty() {
+        return Err("Enter a name for the fork".to_string());
+    }
+    let new_id = crate::packs::slugify(name);
+    let taken = crate::subscribe::is_reserved_name(&new_id)
+        || fs::read_dir(mods_dir)
+            .map_err(|e| format!("Failed to read {}: {}", mods_dir.display(), e))?
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().eq_ignore_ascii_case(&new_id));
+    if taken {
+        return Err(format!("A modpack called {} already exists", new_id));
+    }
+
+    let staging = mods_dir.join(format!(".fork-{}", uuid::Uuid::new_v4()));
+    let build = || -> Result<PackManifest, String> {
+        let staged = staging.join(&new_id);
+        fs::create_dir_all(&staged).map_err(|e| format!("Failed to create staging folder: {}", e))?;
+        for dir_name in child_dirs(&pack_dir)? {
+            copy_tree(&pack_dir.join(&dir_name), &staged.join(&dir_name))?;
+            clear_enabled_flag(&staged.join(&dir_name))?;
+        }
+        let manifest = PackManifest {
+            pack_id: new_id.clone(),
+            name: name.to_string(),
+            version: source.version.clone(),
+            mod_ids: source.mod_ids.clone(),
+            imported_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            ..Default::default()
+        };
+        write_manifest(&staged, &manifest)?;
+        fs::rename(&staged, mods_dir.join(&new_id)).map_err(|e| format!("Failed to create the fork: {}", e))?;
+        Ok(manifest)
+    };
+    let result = build();
+    let _ = fs::remove_dir_all(&staging);
+    result
+}
+
+#[tauri::command]
+pub async fn fork_pack(app_handle: tauri::AppHandle, pack_id: String, name: String) -> Result<PackManifest, String> {
+    let mods_dir = get_mods_dir(&app_handle)?;
+    tauri::async_runtime::spawn_blocking(move || fork_pack_dir(&mods_dir, &pack_id, &name))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn get_pack_size(app_handle: tauri::AppHandle, pack_id: String) -> Result<u64, String> {
+    let mods_dir = get_mods_dir(&app_handle)?;
+    let pack_dir = mods_dir.join(&pack_id);
+    if parse_key(&format!("{}/1", pack_id)).is_err() || read_manifest(&pack_dir).is_none() {
+        return Err(format!("No modpack folder for {:?}", pack_id));
+    }
+    tauri::async_runtime::spawn_blocking(move || pack_size(&pack_dir)).await.map_err(|e| e.to_string())
+}
+
 fn zip_dir(
     dir: &Path,
     prefix: &str,
@@ -2594,5 +2686,83 @@ mod tests {
         manifest(&m, &["3063"]);
         delete_pack_dir(&m, None, "CS").unwrap();
         assert!(names(&m).is_empty());
+    }
+
+    #[test]
+    fn fork_copies_and_unlocks() {
+        use crate::packs::{write_manifest, PackManifest, PackSource};
+        let m = scratch("fork-ok");
+        put(&m, "CS/3063/a.pak", b"aaa");
+        put(&m, "CS/3063/sub/x.bin", b"xyz");
+        put(&m, "CS/3063/metadata.json", br#"{"enabled": true, "name": "A"}"#);
+        put(&m, "CS/4296/b.pak", b"bb");
+        put(&m, "CS/4296/metadata.json", br#"{"enabled": true}"#);
+        fs::create_dir_all(m.join("CS")).unwrap();
+        write_manifest(&m.join("CS"), &PackManifest {
+            pack_id: "CS".into(), name: "Casual".into(), version: Some("1.2".into()),
+            mod_ids: vec!["3063".into(), "4296".into()], imported_at: 5,
+            source: Some(PackSource { kind: "drive".into(), folder_id: "f".into(), resource_key: None }),
+            ..Default::default() }).unwrap();
+        assert!(crate::packs::ensure_pack_editable(&m, "CS").is_err());
+        let before = tree(&m.join("CS"));
+
+        let fork = fork_pack_dir(&m, "CS", "  My Fork ").unwrap();
+        assert_eq!((fork.pack_id.as_str(), fork.name.as_str()), ("My-Fork", "My Fork"));
+        assert_eq!(fork.version.as_deref(), Some("1.2"));
+        assert_eq!(fork.mod_ids, ["3063", "4296"]);
+        assert!(fork.source.is_none());
+        assert_eq!(names(&m), ["CS", "My-Fork"]);
+        for (rel, bytes) in [("3063/a.pak", &b"aaa"[..]), ("3063/sub/x.bin", b"xyz"), ("4296/b.pak", b"bb")] {
+            assert_eq!(fs::read(m.join("My-Fork").join(rel)).unwrap(), bytes);
+        }
+        for id in ["3063", "4296"] {
+            assert_eq!(read_json(&m.join("My-Fork").join(id).join("metadata.json"))["enabled"], Value::Bool(false));
+        }
+        let saved = read_manifest(&m.join("My-Fork")).unwrap();
+        assert!(saved.source.is_none() && saved.installed_hashes.is_empty() && saved.published.is_none());
+        crate::packs::ensure_pack_editable(&m, "My-Fork").unwrap();
+        assert_eq!(tree(&m.join("CS")), before);
+        assert_eq!(read_json(&m.join("CS/3063/metadata.json"))["enabled"], Value::Bool(true));
+        assert_eq!(pack_size(&m.join("CS/3063")), 3 + 3 + 30);
+    }
+
+    #[test]
+    fn fork_name_taken() {
+        let m = scratch("fork-taken");
+        put(&m, "CS/3063/a.pak", b"a");
+        manifest(&m, &["3063"]);
+        put(&m, "Mine/1/a.pak", b"a");
+        let before = tree(&m);
+        for name in ["mine", "CS", "con"] {
+            let e = fork_pack_dir(&m, "CS", name).unwrap_err();
+            assert_eq!(e, format!("A modpack called {} already exists", name));
+        }
+        assert!(fork_pack_dir(&m, "../CS", "x").is_err());
+        assert!(fork_pack_dir(&m, "Missing", "x").is_err());
+        assert_eq!(tree(&m), before);
+    }
+
+    #[test]
+    fn fork_empty_name() {
+        let m = scratch("fork-empty");
+        put(&m, "CS/3063/a.pak", b"a");
+        manifest(&m, &["3063"]);
+        assert_eq!(fork_pack_dir(&m, "CS", "  ").unwrap_err(), "Enter a name for the fork");
+        assert_eq!(names(&m), ["CS"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fork_and_size_skip_symlinks() {
+        let m = scratch("fork-link");
+        let outside = scratch("fork-link-out");
+        put(&outside, "big.bin", b"0123456789");
+        put(&m, "CS/3063/a.pak", b"a");
+        std::os::unix::fs::symlink(outside.join("big.bin"), m.join("CS/3063/l.bin")).unwrap();
+        std::os::unix::fs::symlink(&outside, m.join("CS/3063/dir")).unwrap();
+        manifest(&m, &["3063"]);
+        assert_eq!(pack_size(&m.join("CS")), fs::metadata(m.join("CS/pack.json")).unwrap().len() + 1);
+        fork_pack_dir(&m, "CS", "F").unwrap();
+        assert_eq!(tree(&m.join("F/3063")), ["a.pak 1"]);
     }
 }

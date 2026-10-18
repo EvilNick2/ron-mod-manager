@@ -65,7 +65,7 @@ pub fn parse_link(input: &str) -> Result<DriveLink, String> {
 }
 
 // Windows device names, refused with or without an extension
-fn is_reserved_name(name: &str) -> bool {
+pub(crate) fn is_reserved_name(name: &str) -> bool {
     let stem = name.split('.').next().unwrap_or("").trim_end().to_ascii_uppercase();
     match stem.as_str() {
         "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" => true,
