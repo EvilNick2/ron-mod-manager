@@ -4,6 +4,7 @@ mod drive;
 mod google;
 mod hashing;
 mod packs;
+mod publish;
 mod sso;
 mod updater;
 mod vfs;
