@@ -2,11 +2,20 @@
 import { invoke } from "@tauri-apps/api/core";
 import { computed, ref } from "vue";
 import { store, type PackRef } from "../store";
-import { loadPacks, publishPack } from "../packActions";
+import { loadPacks, publishPack, progressLine } from "../packActions";
 
 const busy = ref(false);
 
 const uploading = computed(() => store.closeBlocked?.uploading ?? []);
+
+const progress = computed(() => Object.values(store.packProgress).map((p) => ({
+  key: p.pack_id,
+  name: store.packs.find((pack) => pack.pack_id === p.pack_id)?.name ?? p.pack_id,
+  line: progressLine(p),
+  percent: p.bytes_total > 0
+    ? Math.min(100, (p.bytes_done / p.bytes_total) * 100)
+    : p.total > 0 ? Math.min(100, (p.done / p.total) * 100) : 0,
+})));
 
 function joinNames(packs: PackRef[]): string {
   const names = packs.map((p) => p.name);
@@ -67,6 +76,10 @@ function cancel() {
     <div class="guard-modal">
       <h2 class="modal-title">{{ uploading.length > 0 ? "Upload In Progress" : "Changes Not Uploaded" }}</h2>
       <p class="guard-desc">{{ message }}</p>
+      <div v-for="p in progress" :key="p.key" class="guard-progress">
+        <p class="guard-progress-line">{{ p.name }}: {{ p.line }}</p>
+        <div class="guard-progress-track"><div class="guard-progress-fill" :style="{ width: p.percent + '%' }"></div></div>
+      </div>
       <div class="modal-actions">
         <button class="secondary-btn" @click="cancel" :disabled="busy">Cancel</button>
         <button class="secondary-btn" @click="forceClose" :disabled="busy">Close anyway</button>
@@ -116,6 +129,32 @@ function cancel() {
   line-height: 1.5;
   margin: 0 0 1.5rem;
   text-align: center;
+}
+
+.guard-progress {
+  margin: 0 0 1rem;
+}
+
+.guard-progress-line {
+  color: var(--text-muted);
+  font-size: 0.85rem;
+  margin: 0 0 0.4rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.guard-progress-track {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--bg-card);
+  overflow: hidden;
+}
+
+.guard-progress-fill {
+  height: 100%;
+  background: var(--accent-primary);
+  transition: width 0.2s;
 }
 
 .modal-actions {
