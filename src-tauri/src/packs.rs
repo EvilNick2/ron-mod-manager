@@ -21,13 +21,21 @@ pub struct PackManifest {
 }
 
 pub fn read_manifest(pack_dir: &Path) -> Option<PackManifest> {
-    let content = fs::read_to_string(pack_dir.join(MANIFEST_FILE)).ok()?;
-    serde_json::from_str(&content).ok()
+    let path = pack_dir.join(MANIFEST_FILE);
+    let content = fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&content)
+        .map_err(|e| eprintln!("[PACKS] Could not parse {}: {}", path.display(), e))
+        .ok()
 }
 
 pub fn write_manifest(pack_dir: &Path, m: &PackManifest) -> Result<(), String> {
     let json = serde_json::to_string_pretty(m).map_err(|e| e.to_string())?;
-    fs::write(pack_dir.join(MANIFEST_FILE), json).map_err(|e| e.to_string())
+    let tmp = pack_dir.join(format!("{}.tmp", MANIFEST_FILE));
+    fs::write(&tmp, json).map_err(|e| e.to_string())?;
+    fs::rename(&tmp, pack_dir.join(MANIFEST_FILE)).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        e.to_string()
+    })
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -74,7 +82,19 @@ pub fn resolve_for_delete(mods_dir: &Path, key: &str) -> Result<PathBuf, String>
     if !ok || !path.is_dir() {
         return Err(format!("No mod folder for key: {:?}", key));
     }
+    if looks_like_pack(&path) {
+        return Err("This looks like a modpack folder. Delete it from the Modpacks list.".to_string());
+    }
     Ok(path)
+}
+
+fn looks_like_pack(dir: &Path) -> bool {
+    if dir.join(MANIFEST_FILE).is_file() {
+        return true;
+    }
+    fs::read_dir(dir).map_or(false, |entries| {
+        entries.filter_map(Result::ok).any(|e| e.path().is_dir() && all_digits(&e.file_name().to_string_lossy()))
+    })
 }
 
 pub fn link_prefix(key: &str) -> String {
@@ -205,5 +225,31 @@ mod tests {
     fn link_prefix_replaces_slash() {
         assert_eq!(link_prefix("5543"), "5543_");
         assert_eq!(link_prefix("Casual-Shitters/3063"), "Casual-Shitters.3063_");
+    }
+
+    #[test]
+    fn resolve_for_delete_refuses_pack_shaped_folders() {
+        let m = scratch("delpack");
+        fs::create_dir_all(m.join("Broken")).unwrap();
+        fs::write(m.join("Broken/pack.json"), b"{not json").unwrap();
+        fs::create_dir_all(m.join("NoManifest/3063")).unwrap();
+        for key in ["Broken", "NoManifest"] {
+            assert_eq!(resolve_for_delete(&m, key).unwrap_err(),
+                "This looks like a modpack folder. Delete it from the Modpacks list.", "{key}");
+        }
+        fs::create_dir_all(m.join("5543/Content")).unwrap();
+        assert!(resolve_for_delete(&m, "5543").is_ok());
+    }
+
+    #[test]
+    fn write_manifest_replaces_the_file_and_leaves_no_tmp() {
+        let m = scratch("manifest");
+        let mut man = PackManifest { pack_id: "CS".into(), name: "CS".into(), version: None, mod_ids: vec!["1".into()], imported_at: 0 };
+        write_manifest(&m, &man).unwrap();
+        man.mod_ids.push("2".into());
+        write_manifest(&m, &man).unwrap();
+        assert_eq!(read_manifest(&m).unwrap().mod_ids, ["1", "2"]);
+        let names: Vec<_> = fs::read_dir(&m).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        assert_eq!(names, ["pack.json"]);
     }
 }
