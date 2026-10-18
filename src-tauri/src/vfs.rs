@@ -697,72 +697,409 @@ pub async fn export_preset(app_handle: tauri::AppHandle, preset_name: String) ->
 }
 
 #[tauri::command]
-pub async fn import_preset(app_handle: tauri::AppHandle) -> Result<String, String> {
+pub async fn pick_preset_archive() -> Result<Option<String>, String> {
     let result = rfd::AsyncFileDialog::new()
         .set_title("Select Preset Zip Archive")
         .add_filter("zip", &["zip"])
         .pick_file()
         .await;
-        
-    let archive_path = match result {
-        Some(f) => f.path().to_path_buf(),
-        None => return Err("Import cancelled".to_string()),
-    };
-    
+
+    Ok(result.map(|f| f.path().to_string_lossy().to_string()))
+}
+
+#[tauri::command]
+pub async fn inspect_preset_archive(app_handle: tauri::AppHandle, archive_path: String) -> Result<ImportPreview, String> {
     let mods_dir = get_mods_dir(&app_handle)?;
-    
-    let file = std::fs::File::open(&archive_path).map_err(|e| format!("Failed to open zip: {}", e))?;
-    let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("Invalid zip archive: {}", e))?;
-    
-    let mut preset_json_content = String::new();
-    
-    for i in 0..archive.len() {
-        let mut file = archive.by_index(i).map_err(|e| e.to_string())?;
+    inspect_archive(Path::new(&archive_path), &mods_dir)
+}
+
+#[tauri::command]
+pub async fn import_preset(app_handle: tauri::AppHandle, archive_path: String) -> Result<ImportSummary, String> {
+    let mods_dir = get_mods_dir(&app_handle)?;
+    // without a game path nothing can be linked, so a Paks folder that does not exist is enough
+    let paks_dir = get_paks_dir(&app_handle).unwrap_or_else(|_| mods_dir.join(".no-game-path"));
+    let summary = import_from_archive(Path::new(&archive_path), &mods_dir, &paks_dir)?;
+
+    let mut config = crate::config::load_config(app_handle.clone())?;
+    crate::config::tidy_presets_after_import(&mut config, &summary.pack.pack_id, &summary.superseded_ids, &summary.removed_keys);
+    crate::config::save_config(app_handle, config)
+        .map_err(|e| format!("The pack was imported but saved presets could not be updated: {}", e))?;
+
+    Ok(summary)
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct ModRef {
+    pub key: String,
+    pub nexus_mod_id: Option<u32>,
+    pub name: String,
+    pub version: Option<String>,
+}
+
+#[derive(Serialize, Debug)]
+pub struct ImportPreview {
+    pub pack: PackRef,
+    pub installed_version: Option<String>,
+    pub added: Vec<ModRef>,
+    pub removed: Vec<ModRef>,
+    pub changed: Vec<ModRef>,
+    pub superseded: Vec<ModRef>,
+}
+
+#[derive(Serialize, Debug)]
+pub struct ImportSummary {
+    pub pack: PackRef,
+    pub keys: Vec<String>,
+    pub added: usize,
+    pub changed: usize,
+    pub removed_keys: Vec<String>,
+    pub superseded_ids: Vec<String>,
+    pub failed_deletes: Vec<String>,
+}
+
+struct PackArchive {
+    pack: PackRef,
+    // mod folder id and that folder's metadata.json, in numeric order
+    folders: Vec<(String, Option<Value>)>,
+}
+
+struct ImportPlan {
+    installed: Option<PathBuf>,
+    installed_version: Option<String>,
+    added: Vec<ModRef>,
+    removed: Vec<ModRef>,
+    changed: Vec<ModRef>,
+    superseded: Vec<ModRef>,
+}
+
+fn is_numeric(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn numeric_order(a: &String, b: &String) -> std::cmp::Ordering {
+    (a.len(), a).cmp(&(b.len(), b))
+}
+
+fn read_meta(mod_dir: &Path) -> Option<Value> {
+    serde_json::from_str(&fs::read_to_string(mod_dir.join("metadata.json")).ok()?).ok()
+}
+
+fn meta_version(meta: Option<&Value>) -> Option<String> {
+    let meta = meta?;
+    meta.get("installed_version").or_else(|| meta.get("version")).and_then(|v| v.as_str()).map(str::to_string)
+}
+
+fn mod_ref(key: String, id: &str, meta: Option<&Value>) -> ModRef {
+    let name = meta.and_then(|m| m.get("name")).and_then(|n| n.as_str()).unwrap_or(id).to_string();
+    ModRef { key, nexus_mod_id: id.parse().ok(), name, version: meta_version(meta) }
+}
+
+fn open_zip(archive: &Path) -> Result<zip::ZipArchive<fs::File>, String> {
+    let file = fs::File::open(archive).map_err(|e| format!("Failed to open zip: {}", e))?;
+    zip::ZipArchive::new(file).map_err(|e| format!("Invalid zip archive: {}", e))
+}
+
+// The mod folder an archive entry belongs to, or None for entries that are not extracted.
+fn archive_folder(rel: &Path, is_dir: bool) -> Result<Option<String>, String> {
+    if rel.components().any(|c| !matches!(c, std::path::Component::Normal(_))) {
+        return Err(format!("Invalid preset archive: unsafe path {:?}", rel));
+    }
+    let mut parts = rel.components();
+    let first = match parts.next() {
+        Some(std::path::Component::Normal(s)) => s.to_string_lossy().to_string(),
+        _ => return Ok(None),
+    };
+    let nested = parts.next().is_some();
+    if first == "__MACOSX" || (!nested && !is_dir) {
+        return Ok(None);
+    }
+    if !is_numeric(&first) {
+        return Err(format!("Invalid preset archive: folder {:?} is not a Nexus mod id", first));
+    }
+    Ok(Some(first))
+}
+
+fn read_pack_archive(zip: &mut zip::ZipArchive<fs::File>) -> Result<PackArchive, String> {
+    let mut preset_text: Option<String> = None;
+    let mut ids: Vec<String> = Vec::new();
+    for i in 0..zip.len() {
+        let mut file = zip.by_index(i).map_err(|e| format!("Invalid zip archive: {}", e))?;
         if file.name() == "preset.json" {
-            std::io::Read::read_to_string(&mut file, &mut preset_json_content).ok();
-            break;
-        }
-    }
-    
-    if preset_json_content.is_empty() {
-        return Err("Invalid preset archive: missing preset.json".to_string());
-    }
-    
-    let preset: serde_json::Value = serde_json::from_str(&preset_json_content).map_err(|e| format!("Bad preset.json: {}", e))?;
-    let name = preset.get("name").and_then(|n| n.as_str()).unwrap_or("Imported Preset").to_string();
-    let mod_ids: Vec<String> = preset.get("mod_ids")
-        .and_then(|ids| ids.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
-        .unwrap_or_default();
-        
-    for i in 0..archive.len() {
-        let mut file = archive.by_index(i).map_err(|e| e.to_string())?;
-        let name_str = file.name().to_string();
-        if name_str == "preset.json" || name_str.starts_with("__MACOSX") {
+            let mut text = String::new();
+            std::io::Read::read_to_string(&mut file, &mut text).map_err(|e| format!("Bad preset.json: {}", e))?;
+            preset_text = Some(text);
             continue;
         }
-        
-        let outpath = match file.enclosed_name() {
-            Some(path) => mods_dir.join(path),
-            None => continue,
-        };
-        
-        if file.is_dir() {
-            std::fs::create_dir_all(&outpath).map_err(|e| format!("Failed to create directory in preset: {}", e))?;
-        } else {
-            if let Some(p) = outpath.parent() {
-                std::fs::create_dir_all(p).map_err(|e| format!("Failed to create parent directory for {}: {}", outpath.display(), e))?;
+        let rel = file.enclosed_name().ok_or_else(|| format!("Invalid preset archive: unsafe path {:?}", file.name()))?;
+        if let Some(id) = archive_folder(&rel, file.is_dir())? {
+            if !ids.contains(&id) {
+                ids.push(id);
             }
-            let mut outfile = std::fs::File::create(&outpath).map_err(|e| format!("Failed to create file {}: {}", outpath.display(), e))?;
-            std::io::copy(&mut file, &mut outfile).map_err(|e| format!("Failed to extract file {}: {}", outpath.display(), e))?;
         }
     }
-    
-    let mut config = crate::config::load_config(app_handle.clone())?;
-    config.presets.insert(name.clone(), mod_ids);
-    crate::config::save_config(app_handle, config)?;
-    
-    Ok(name)
+    let preset_text = preset_text.ok_or("Invalid preset archive: missing preset.json")?;
+    let preset: Value = serde_json::from_str(&preset_text).map_err(|e| format!("Bad preset.json: {}", e))?;
+    if ids.is_empty() {
+        return Err("Invalid preset archive: it contains no mod folders".to_string());
+    }
+    ids.sort_by(numeric_order);
+
+    let folders = ids.into_iter().map(|id| {
+        let meta = zip.by_name(&format!("{}/metadata.json", id)).ok().and_then(|mut f| {
+            let mut text = String::new();
+            std::io::Read::read_to_string(&mut f, &mut text).ok()?;
+            serde_json::from_str(&text).ok()
+        });
+        (id, meta)
+    }).collect();
+
+    Ok(PackArchive { pack: crate::packs::pack_identity(&preset), folders })
+}
+
+fn child_dirs(dir: &Path) -> Result<Vec<String>, String> {
+    let entries = fs::read_dir(dir).map_err(|e| format!("Failed to read {}: {}", dir.display(), e))?;
+    let mut out = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("Failed to read {}: {}", dir.display(), e))?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if entry.path().is_dir() && !name.starts_with('.') {
+            out.push(name);
+        }
+    }
+    out.sort_by(numeric_order);
+    Ok(out)
+}
+
+// The installed folder of this pack, or an error when a folder that is not a pack is in the way.
+fn installed_pack_dir(mods_dir: &Path, pack_id: &str) -> Result<Option<PathBuf>, String> {
+    let dir = mods_dir.join(pack_id);
+    match fs::symlink_metadata(&dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("Failed to read {}: {}", dir.display(), e)),
+        Ok(md) if md.is_dir() && read_manifest(&dir).is_some() => Ok(Some(dir)),
+        Ok(_) => Err(format!(
+            "{} already exists in mod storage and is not a modpack. Rename or remove it and try again",
+            dir.display()
+        )),
+    }
+}
+
+fn plan_import(archive: &PackArchive, mods_dir: &Path) -> Result<ImportPlan, String> {
+    let pack_id = &archive.pack.pack_id;
+    let installed = installed_pack_dir(mods_dir, pack_id)?;
+    let installed_version = installed.as_deref().and_then(read_manifest).and_then(|m| m.version);
+    let on_disk = match &installed {
+        Some(dir) => child_dirs(dir)?,
+        None => Vec::new(),
+    };
+    let key = |id: &str| format!("{}/{}", pack_id, id);
+
+    let mut plan = ImportPlan { installed, installed_version, added: vec![], removed: vec![], changed: vec![], superseded: vec![] };
+    for (id, meta) in &archive.folders {
+        if on_disk.contains(id) {
+            let disk_meta = plan.installed.as_ref().and_then(|d| read_meta(&d.join(id)));
+            if meta_version(disk_meta.as_ref()) != meta_version(meta.as_ref()) {
+                plan.changed.push(mod_ref(key(id), id, meta.as_ref()));
+            }
+        } else {
+            plan.added.push(mod_ref(key(id), id, meta.as_ref()));
+        }
+        let loose = mods_dir.join(id);
+        if loose.is_dir() && read_manifest(&loose).is_none() {
+            plan.superseded.push(mod_ref(id.clone(), id, read_meta(&loose).as_ref()));
+        }
+    }
+    for id in &on_disk {
+        if !archive.folders.iter().any(|(f, _)| f == id) {
+            let disk_meta = plan.installed.as_ref().and_then(|d| read_meta(&d.join(id)));
+            plan.removed.push(mod_ref(key(id), id, disk_meta.as_ref()));
+        }
+    }
+    Ok(plan)
+}
+
+fn inspect_archive(archive: &Path, mods_dir: &Path) -> Result<ImportPreview, String> {
+    let mut zip = open_zip(archive)?;
+    let archive = read_pack_archive(&mut zip)?;
+    let plan = plan_import(&archive, mods_dir)?;
+    Ok(ImportPreview {
+        pack: archive.pack,
+        installed_version: plan.installed_version,
+        added: plan.added,
+        removed: plan.removed,
+        changed: plan.changed,
+        superseded: plan.superseded,
+    })
+}
+
+fn clear_enabled_flag(mod_dir: &Path) -> Result<(), String> {
+    let path = mod_dir.join("metadata.json");
+    let Some(mut meta) = read_meta(mod_dir) else {
+        return Ok(());
+    };
+    let Some(obj) = meta.as_object_mut() else {
+        return Ok(());
+    };
+    obj.insert("enabled".to_string(), Value::Bool(false));
+    let json = serde_json::to_string_pretty(&meta).map_err(|e| e.to_string())?;
+    fs::write(&path, json).map_err(|e| format!("Failed to write {}: {}", path.display(), e))
+}
+
+fn stage_pack(zip: &mut zip::ZipArchive<fs::File>, archive: &PackArchive, staged: &Path) -> Result<(), String> {
+    fs::create_dir_all(staged).map_err(|e| format!("Failed to create staging folder: {}", e))?;
+    for i in 0..zip.len() {
+        let mut file = zip.by_index(i).map_err(|e| format!("Invalid zip archive: {}", e))?;
+        if file.name() == "preset.json" {
+            continue;
+        }
+        let rel = file.enclosed_name().ok_or_else(|| format!("Invalid preset archive: unsafe path {:?}", file.name()))?;
+        if archive_folder(&rel, file.is_dir())?.is_none() {
+            continue;
+        }
+        let out = staged.join(&rel);
+        if file.is_dir() {
+            fs::create_dir_all(&out).map_err(|e| format!("Failed to create {}: {}", out.display(), e))?;
+        } else {
+            if let Some(parent) = out.parent() {
+                fs::create_dir_all(parent).map_err(|e| format!("Failed to create {}: {}", parent.display(), e))?;
+            }
+            let mut outfile = fs::File::create(&out).map_err(|e| format!("Failed to create {}: {}", out.display(), e))?;
+            std::io::copy(&mut file, &mut outfile).map_err(|e| format!("Failed to extract {}: {}", out.display(), e))?;
+        }
+    }
+
+    let mut mod_ids = Vec::new();
+    for (id, _) in &archive.folders {
+        let dir = staged.join(id);
+        fs::create_dir_all(&dir).map_err(|e| format!("Failed to create {}: {}", dir.display(), e))?;
+        clear_enabled_flag(&dir)?;
+        mod_ids.push(id.clone());
+    }
+    let imported_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    crate::packs::write_manifest(staged, &crate::packs::PackManifest {
+        pack_id: archive.pack.pack_id.clone(),
+        name: archive.pack.name.clone(),
+        version: archive.pack.version.clone(),
+        mod_ids,
+        imported_at,
+    })
+}
+
+// Removes the staging folder on a failed import and returns the error to report.
+fn abandon_staging(staging: &Path, err: String) -> String {
+    match fs::remove_dir_all(staging) {
+        Ok(()) => err,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => err,
+        Err(e) => format!("{} (could not remove {}: {})", err, staging.display(), e),
+    }
+}
+
+// Restores the links of keys unlinked by a failed swap. Unlike enable_key it leaves other copies and metadata alone.
+fn relink(mods_dir: &Path, paks_dir: &Path, keys: &[String], err: String) -> String {
+    let restore = |key: &str| -> Result<(), String> {
+        unlink_mod(paks_dir, key)?;
+        link_mod_files(&resolve_key(mods_dir, key)?, paks_dir, key)
+    };
+    let failed: Vec<&str> = keys.iter()
+        .filter(|k| restore(k).is_err())
+        .map(String::as_str)
+        .collect();
+    if failed.is_empty() {
+        err
+    } else {
+        format!("{} (could not re-enable {})", err, failed.join(", "))
+    }
+}
+
+enum SwapError {
+    // the library is as it was, staging can be deleted
+    RolledBack(String),
+    // the old pack is only inside staging, which must be kept
+    Stranded(String),
+}
+
+// Unlinks the old pack, sets it aside inside staging and moves the staged pack in.
+fn swap_pack(mods_dir: &Path, paks_dir: &Path, staging: &Path, staged: &Path, target: &Path, pack_id: &str) -> Result<(), SwapError> {
+    let old_keys: Vec<String> = child_dirs(target).map_err(SwapError::RolledBack)?.iter().map(|c| format!("{}/{}", pack_id, c)).collect();
+    let mut linked: Vec<String> = Vec::new();
+    for key in &old_keys {
+        match unlink_mod(paks_dir, key) {
+            Ok(0) => {}
+            Ok(_) => linked.push(key.clone()),
+            Err(e) => {
+                linked.push(key.clone());
+                return Err(SwapError::RolledBack(relink(mods_dir, paks_dir, &linked, e)));
+            }
+        }
+    }
+
+    let aside = staging.join(format!("old-{}", pack_id));
+    if fs::rename(target, &aside).is_err() {
+        return Err(SwapError::RolledBack(relink(mods_dir, paks_dir, &linked, "Close Ready or Not and try again".to_string())));
+    }
+    if let Err(e) = fs::rename(staged, target) {
+        let err = format!("Failed to move the new pack into place: {}", e);
+        if let Err(back) = fs::rename(&aside, target) {
+            return Err(SwapError::Stranded(format!("{}. The previous pack could not be restored ({}) and is kept at {}", err, back, aside.display())));
+        }
+        return Err(SwapError::RolledBack(relink(mods_dir, paks_dir, &linked, err)));
+    }
+    Ok(())
+}
+
+fn import_from_archive(archive: &Path, mods_dir: &Path, paks_dir: &Path) -> Result<ImportSummary, String> {
+    let mut zip = open_zip(archive)?;
+    let archive = read_pack_archive(&mut zip)?;
+    let plan = plan_import(&archive, mods_dir)?;
+    let pack_id = archive.pack.pack_id.clone();
+
+    let staging = mods_dir.join(format!(".import-{}", uuid::Uuid::new_v4()));
+    let staged = staging.join(&pack_id);
+    if let Err(e) = stage_pack(&mut zip, &archive, &staged) {
+        return Err(abandon_staging(&staging, e));
+    }
+
+    let target = mods_dir.join(&pack_id);
+    if plan.installed.is_some() {
+        match swap_pack(mods_dir, paks_dir, &staging, &staged, &target, &pack_id) {
+            Ok(()) => {}
+            Err(SwapError::RolledBack(e)) => return Err(abandon_staging(&staging, e)),
+            Err(SwapError::Stranded(e)) => return Err(e),
+        }
+    } else if let Err(e) = fs::rename(&staged, &target) {
+        return Err(abandon_staging(&staging, format!("Failed to move the new pack into place: {}", e)));
+    }
+
+    let mut failed_deletes: Vec<String> = Vec::new();
+    let mut superseded_ids: Vec<String> = Vec::new();
+    for m in &plan.superseded {
+        let dir = mods_dir.join(&m.key);
+        superseded_ids.push(m.key.clone());
+        if unlink_mod(paks_dir, &m.key).is_err() || fs::remove_dir_all(&dir).is_err() {
+            failed_deletes.push(dir.display().to_string());
+        }
+    }
+
+    sweep_orphans(paks_dir, mods_dir);
+
+    if let Err(e) = fs::remove_dir_all(&staging) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            failed_deletes.push(staging.display().to_string());
+        }
+    }
+
+    Ok(ImportSummary {
+        keys: archive.folders.iter().map(|(id, _)| format!("{}/{}", pack_id, id)).collect(),
+        added: plan.added.len(),
+        changed: plan.changed.len(),
+        removed_keys: plan.removed.into_iter().map(|m| m.key).collect(),
+        superseded_ids,
+        failed_deletes,
+        pack: archive.pack,
+    })
 }
 
 #[tauri::command]
@@ -1161,5 +1498,278 @@ mod tests {
         let mut got: Vec<_> = fs::read_dir(&p).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
         got.sort();
         assert_eq!(got, ["P.3063_a.pak", "P.3063_addon_x.pak", "P.3063_addon_x.ucas"]);
+    }
+
+    fn make_pack_zip(path: &Path, preset: serde_json::Value, files: &[(&str, &[u8])]) {
+        use std::io::Write;
+        let mut zip = zip::ZipWriter::new(fs::File::create(path).unwrap());
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("preset.json", options).unwrap();
+        zip.write_all(preset.to_string().as_bytes()).unwrap();
+        for (name, bytes) in files {
+            zip.start_file(*name, options).unwrap();
+            zip.write_all(bytes).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    fn put(dir: &Path, rel: &str, bytes: &[u8]) {
+        let p = dir.join(rel);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, bytes).unwrap();
+    }
+
+    fn read_json(path: &Path) -> Value {
+        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut out: Vec<_> = fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        out.sort();
+        out
+    }
+
+    fn tree(dir: &Path) -> Vec<String> {
+        fn walk(base: &Path, dir: &Path, out: &mut Vec<String>) {
+            for e in fs::read_dir(dir).unwrap().map(|e| e.unwrap()) {
+                let p = e.path();
+                let md = p.symlink_metadata().unwrap();
+                let rel = p.strip_prefix(base).unwrap().to_string_lossy().to_string();
+                if md.is_dir() {
+                    out.push(format!("{}/", rel));
+                    walk(base, &p, out);
+                } else {
+                    out.push(format!("{} {}", rel, md.len()));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(dir, dir, &mut out);
+        out.sort();
+        out
+    }
+
+    fn no_staging_left(m: &Path) -> bool {
+        names(m).iter().all(|n| !n.starts_with(".import-"))
+    }
+
+    fn keys(refs: &[ModRef]) -> Vec<String> {
+        refs.iter().map(|r| r.key.clone()).collect()
+    }
+
+    fn cs_v15_zip(path: &Path) {
+        make_pack_zip(path, serde_json::json!({"name": "CS v1.5", "mod_ids": ["3063", "4296"]}), &[
+            ("3063/metadata.json", br#"{"version": "1.0"}"#),
+            ("3063/old.pak", b"old"),
+            ("4296/metadata.json", br#"{"version": "1.0"}"#),
+            ("4296/b.pak", b"b"),
+        ]);
+    }
+
+    fn cs_v16_zip(path: &Path) {
+        make_pack_zip(path, serde_json::json!({"name": "CS v1.6", "mod_ids": ["3063", "7000"]}), &[
+            ("3063/metadata.json", br#"{"version": "2.0"}"#),
+            ("3063/new.pak", b"new"),
+            ("7000/metadata.json", br#"{"version": "1.0"}"#),
+            ("7000/c.pak", b"c"),
+        ]);
+    }
+
+    // CS v1.5 installed with both mods enabled, a second pack Other/3063 and loose 5543
+    fn upgrade_setup(m: &Path, p: &Path, z: &Path) {
+        use crate::packs::{write_manifest, PackManifest};
+        cs_v15_zip(&z.join("v15.zip"));
+        import_from_archive(&z.join("v15.zip"), m, p).unwrap();
+        enable_key(m, p, "CS/3063").unwrap();
+        enable_key(m, p, "CS/4296").unwrap();
+        put(m, "Other/3063/other.pak", b"o");
+        write_manifest(&m.join("Other"), &PackManifest {
+            pack_id: "Other".into(), name: "Other".into(), version: None,
+            mod_ids: vec!["3063".into()], imported_at: 0 }).unwrap();
+        put(m, "5543/a.pak", b"a");
+        enable_key(m, p, "5543").unwrap();
+        cs_v16_zip(&z.join("v16.zip"));
+    }
+
+    #[test]
+    fn import_over_flat_library() {
+        let (m, p, z) = (scratch("mods"), scratch("paks"), scratch("zips"));
+        for id in ["3063", "3151", "5543"] {
+            put(&m, &format!("{}/a.pak", id), id.as_bytes());
+            put(&m, &format!("{}/metadata.json", id), br#"{"version": "1"}"#);
+            enable_key(&m, &p, id).unwrap();
+        }
+        let zip = z.join("cs.zip");
+        make_pack_zip(&zip, serde_json::json!({"name": "CS v1.5", "mod_ids": ["3063", "3151"]}), &[
+            ("3063/metadata.json", br#"{"version": "1", "enabled": true, "addons": {"x.pak": {"enabled": true}}}"#),
+            ("3063/a.pak", b"packed"),
+            ("3063/addons/x.pak", b"x"),
+            ("3151/metadata.json", br#"{"version": "1", "enabled": true}"#),
+            ("3151/a.pak", b"packed"),
+        ]);
+        let s = import_from_archive(&zip, &m, &p).unwrap();
+        assert!(m.join("CS/3063").is_dir());
+        assert!(m.join("CS/3151").is_dir());
+        assert!(!m.join("3063").exists());
+        assert!(!m.join("3151").exists());
+        assert_eq!(fs::read(m.join("5543/a.pak")).unwrap(), b"5543");
+        assert!(names(&p).iter().all(|n| !n.starts_with("3063_") && !n.starts_with("3151_")));
+        assert!(entry_present(&p.join("5543_a.pak")));
+        assert_eq!(s.superseded_ids, ["3063", "3151"]);
+        for id in ["3063", "3151"] {
+            assert_eq!(read_json(&m.join("CS").join(id).join("metadata.json"))["enabled"], false);
+        }
+        assert_eq!(read_json(&m.join("CS/3063/metadata.json"))["addons"], serde_json::json!({"x.pak": {"enabled": true}}));
+        assert!(no_staging_left(&m));
+    }
+
+    #[test]
+    fn upgrade_replaces_only_this_pack() {
+        let (m, p, z) = (scratch("mods"), scratch("paks"), scratch("zips"));
+        upgrade_setup(&m, &p, &z);
+        let s = import_from_archive(&z.join("v16.zip"), &m, &p).unwrap();
+        assert!(!m.join("CS/4296").exists());
+        let paks: Vec<_> = names(&m.join("CS/3063")).into_iter().filter(|n| n.ends_with(".pak")).collect();
+        assert_eq!(paks, ["new.pak"]);
+        assert!(m.join("CS/7000").is_dir());
+        assert_eq!(fs::read(m.join("Other/3063/other.pak")).unwrap(), b"o");
+        assert_eq!(fs::read(m.join("5543/a.pak")).unwrap(), b"a");
+        assert!(entry_present(&p.join("5543_a.pak")));
+        assert!(names(&p).iter().all(|n| !n.starts_with("CS.")));
+        assert_eq!(s.removed_keys, ["CS/4296"]);
+        assert_eq!(s.added, 1);
+        assert_eq!(s.changed, 1);
+        assert_eq!(s.keys, ["CS/3063", "CS/7000"]);
+        assert_eq!(read_json(&m.join("CS/pack.json"))["version"], "1.6");
+        assert!(no_staging_left(&m));
+    }
+
+    #[test]
+    fn truncated_zip_changes_nothing() {
+        let (m, p, z) = (scratch("mods"), scratch("paks"), scratch("zips"));
+        upgrade_setup(&m, &p, &z);
+        let bytes = fs::read(z.join("v16.zip")).unwrap();
+        let cut = z.join("cut.zip");
+        fs::write(&cut, &bytes[..bytes.len() / 2]).unwrap();
+        let before = (tree(&m), tree(&p));
+        assert!(import_from_archive(&cut, &m, &p).is_err());
+        assert_eq!((tree(&m), tree(&p)), before);
+        assert!(no_staging_left(&m));
+    }
+
+    #[test]
+    fn reimport_same_zip_is_stable() {
+        let (m, p, z) = (scratch("mods"), scratch("paks"), scratch("zips"));
+        upgrade_setup(&m, &p, &z);
+        put(&m, "7000/c.pak", b"loose");
+        let zip = z.join("v16.zip");
+        import_from_archive(&zip, &m, &p).unwrap();
+        let count = names(&m).len();
+        let again = import_from_archive(&zip, &m, &p).unwrap();
+        assert!(again.removed_keys.is_empty() && again.superseded_ids.is_empty());
+        assert_eq!((again.added, again.changed), (0, 0));
+        let v = inspect_archive(&zip, &m).unwrap();
+        assert!(v.added.is_empty() && v.removed.is_empty() && v.changed.is_empty() && v.superseded.is_empty(), "{v:?}");
+        assert_eq!(v.installed_version.as_deref(), Some("1.6"));
+        assert_eq!(names(&m).len(), count);
+        assert!(no_staging_left(&m));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_delete_of_old_pack_is_reported() {
+        use std::os::unix::fs::PermissionsExt;
+        let (m, p, z) = (scratch("mods"), scratch("paks"), scratch("zips"));
+        upgrade_setup(&m, &p, &z);
+        put(&m, "CS/4296/sub/locked.pak", b"x");
+        fs::set_permissions(m.join("CS/4296/sub"), fs::Permissions::from_mode(0o500)).unwrap();
+        let s = import_from_archive(&z.join("v16.zip"), &m, &p);
+        let staging: Vec<_> = names(&m).into_iter().filter(|n| n.starts_with(".import-")).collect();
+        for n in &staging {
+            let sub = m.join(n).join("old-CS/4296/sub");
+            if sub.exists() {
+                fs::set_permissions(&sub, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+        if m.join("CS/4296/sub").exists() {
+            fs::set_permissions(m.join("CS/4296/sub"), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let s = s.unwrap();
+        assert!(!s.failed_deletes.is_empty());
+        assert_eq!(staging.len(), 1);
+        assert_eq!(read_json(&m.join("CS/pack.json"))["version"], "1.6");
+        assert!(m.join("CS/7000").is_dir());
+        assert!(!m.join("CS/4296").exists());
+    }
+
+    #[test]
+    fn pack_holds_folders_present() {
+        let (m, p, z) = (scratch("mods"), scratch("paks"), scratch("zips"));
+        let zip = z.join("n.zip");
+        make_pack_zip(&zip, serde_json::json!({"name": "N", "mod_ids": ["1", "2", "3"]}), &[
+            ("2/a.pak", b"a"), ("3/a.pak", b"a"), ("4/a.pak", b"a"),
+        ]);
+        import_from_archive(&zip, &m, &p).unwrap();
+        assert_eq!(read_json(&m.join("N/pack.json"))["mod_ids"], serde_json::json!(["2", "3", "4"]));
+    }
+
+    #[test]
+    fn non_numeric_loose_folder_is_left_alone() {
+        let (m, p, z) = (scratch("mods"), scratch("paks"), scratch("zips"));
+        put(&m, "notes/readme.txt", b"keep");
+        cs_v15_zip(&z.join("v15.zip"));
+        import_from_archive(&z.join("v15.zip"), &m, &p).unwrap();
+        assert_eq!(fs::read(m.join("notes/readme.txt")).unwrap(), b"keep");
+        assert_eq!(names(&m), ["CS", "notes"]);
+    }
+
+    #[test]
+    fn inspect_lists_removed_and_superseded() {
+        let (m, p, z) = (scratch("mods"), scratch("paks"), scratch("zips"));
+        upgrade_setup(&m, &p, &z);
+        put(&m, "7000/c.pak", b"loose");
+        let before = tree(&m);
+        let v = inspect_archive(&z.join("v16.zip"), &m).unwrap();
+        assert_eq!(v.pack.pack_id, "CS");
+        assert_eq!(v.pack.version.as_deref(), Some("1.6"));
+        assert_eq!(v.installed_version.as_deref(), Some("1.5"));
+        assert_eq!(keys(&v.removed), ["CS/4296"]);
+        assert_eq!(keys(&v.added), ["CS/7000"]);
+        assert_eq!(keys(&v.changed), ["CS/3063"]);
+        assert_eq!(keys(&v.superseded), ["7000"]);
+        assert_eq!(tree(&m), before);
+    }
+
+    #[test]
+    fn import_rejects_non_numeric_top_folder_and_a_non_pack_folder_in_the_way() {
+        let (m, p, z) = (scratch("mods"), scratch("paks"), scratch("zips"));
+        let bad = z.join("bad.zip");
+        make_pack_zip(&bad, serde_json::json!({"name": "CS"}), &[("3063/a.pak", b"a"), ("Stuff/a.pak", b"a")]);
+        let err = import_from_archive(&bad, &m, &p).unwrap_err();
+        assert!(err.contains("Stuff"), "{err}");
+        make_pack_zip(&bad, serde_json::json!({"name": "CS"}), &[("3063/a.pak", b"a"), ("3063/../Stuff/a.pak", b"a")]);
+        assert!(import_from_archive(&bad, &m, &p).is_err());
+        assert!(inspect_archive(&bad, &m).is_err());
+        put(&m, "CS/readme.txt", b"mine");
+        cs_v15_zip(&z.join("v15.zip"));
+        assert!(import_from_archive(&z.join("v15.zip"), &m, &p).is_err());
+        assert_eq!(fs::read(m.join("CS/readme.txt")).unwrap(), b"mine");
+        assert_eq!(names(&m), ["CS"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_rename_aside_restores_links() {
+        use std::os::unix::fs::PermissionsExt;
+        let (m, p, z) = (scratch("mods"), scratch("paks"), scratch("zips"));
+        upgrade_setup(&m, &p, &z);
+        let before = (tree(&m), tree(&p));
+        // moving a folder to a new parent needs write access to it, to update its ".." entry
+        fs::set_permissions(m.join("CS"), fs::Permissions::from_mode(0o500)).unwrap();
+        let r = import_from_archive(&z.join("v16.zip"), &m, &p);
+        fs::set_permissions(m.join("CS"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(r.unwrap_err(), "Close Ready or Not and try again");
+        assert_eq!((tree(&m), tree(&p)), before);
+        assert!(no_staging_left(&m));
     }
 }

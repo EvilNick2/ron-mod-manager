@@ -38,6 +38,8 @@ pub fn run() {
             vfs::delete_mod,
             vfs::apply_preset,
             vfs::export_preset,
+            vfs::pick_preset_archive,
+            vfs::inspect_preset_archive,
             vfs::import_preset,
             vfs::toggle_all_mods,
             vfs::install_addon,
