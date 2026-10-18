@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use serde::{Serialize, Deserialize};
 use tauri::{AppHandle, Manager};
 use serde_json::Value;
-use crate::packs::{link_prefix, read_manifest, resolve_for_delete, resolve_key, parse_key, KeyKind, PackRef};
+use crate::packs::{link_prefix, read_manifest, write_manifest, PackManifest, resolve_for_delete, resolve_key, parse_key, KeyKind, PackRef};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AddonInfo {
@@ -610,8 +610,173 @@ pub async fn delete_mod(app_handle: tauri::AppHandle, mod_id: String) -> Result<
     if target_dir.exists() {
         std::fs::remove_dir_all(&target_dir).map_err(|e| format!("Failed to obliterate mod directory: {}", e))?;
     }
-    
+    drop_from_manifest(&mods_dir, &mod_id)?;
+
     Ok(())
+}
+
+fn flag_enabled(mod_dir: &Path) -> bool {
+    read_meta(mod_dir).and_then(|m| m.get("enabled").and_then(Value::as_bool)).unwrap_or(false)
+}
+
+// Moves a mod folder to a new key, parking any folder already there aside until the manifest edit lands.
+// On failure everything is put back and relinked as it was.
+fn relocate(
+    mods_dir: &Path,
+    paks_dir: &Path,
+    old_key: &str,
+    new_key: &str,
+    pack_dir: &Path,
+    edit: impl FnOnce(&mut PackManifest),
+) -> Result<(), String> {
+    let from = resolve_key(mods_dir, old_key)?;
+    let to = resolve_key(mods_dir, new_key)?;
+    if !from.is_dir() {
+        return Err(format!("No mod folder for key: {:?}", old_key));
+    }
+    let was_enabled = flag_enabled(&from);
+    let replaced = to.exists();
+    let replaced_enabled = replaced && flag_enabled(&to);
+    let aside = to.with_file_name(format!(".replaced-{}", uuid::Uuid::new_v4()));
+
+    let restore = |moved: bool, parked: bool| {
+        if moved {
+            let _ = fs::rename(&to, &from);
+        }
+        if parked {
+            let _ = fs::rename(&aside, &to);
+        }
+        if replaced_enabled {
+            let _ = enable_key(mods_dir, paks_dir, new_key);
+        }
+        if was_enabled {
+            let _ = enable_key(mods_dir, paks_dir, old_key);
+        }
+    };
+
+    if let Err(e) = unlink_mod(paks_dir, old_key) {
+        restore(false, false);
+        return Err(e);
+    }
+    let mut parked = false;
+    if replaced {
+        if let Err(e) = unlink_mod(paks_dir, new_key) {
+            restore(false, false);
+            return Err(e);
+        }
+        if let Err(e) = fs::rename(&to, &aside) {
+            restore(false, false);
+            return Err(format!("Failed to set the old copy aside: {}", e));
+        }
+        parked = true;
+    }
+    if let Err(e) = fs::rename(&from, &to) {
+        restore(false, parked);
+        return Err(format!("Failed to move mod folder: {}", e));
+    }
+    if let Some(mut m) = read_manifest(pack_dir) {
+        edit(&mut m);
+        if let Err(e) = write_manifest(pack_dir, &m) {
+            restore(true, parked);
+            return Err(e);
+        }
+    }
+    if parked {
+        let _ = fs::remove_dir_all(&aside);
+    }
+    Ok(())
+}
+
+fn enable_moved(mods_dir: &Path, paks_dir: &Path, new_key: &str) -> Result<(), String> {
+    enable_key(mods_dir, paks_dir, new_key).map_err(|e| {
+        if let Ok(dir) = resolve_key(mods_dir, new_key) {
+            set_enabled_flag(&dir, false);
+        }
+        format!("Moved to {} but could not enable it: {}", new_key, e)
+    })
+}
+
+// Returns the new key and, when the move worked but relinking did not, the message to report.
+fn move_into_pack(mods_dir: &Path, paks_dir: &Path, key: &str, pack_id: &str) -> Result<(String, Option<String>), String> {
+    let nexus_id = match parse_key(key)? {
+        KeyKind::Loose(id) => id.to_string(),
+        KeyKind::Pack { .. } => return Err(format!("{:?} is already in a modpack", key)),
+    };
+    let new_key = format!("{}/{}", pack_id, nexus_id);
+    parse_key(&new_key)?;
+    let pack_dir = mods_dir.join(pack_id);
+    if read_manifest(&pack_dir).is_none() {
+        return Err(format!("No modpack folder for {:?}", pack_id));
+    }
+
+    let was_enabled = flag_enabled(&resolve_key(mods_dir, key)?);
+    relocate(mods_dir, paks_dir, key, &new_key, &pack_dir, |m| {
+        if !m.mod_ids.contains(&nexus_id) {
+            m.mod_ids.push(nexus_id.clone());
+        }
+    })?;
+    let warning = if was_enabled { enable_moved(mods_dir, paks_dir, &new_key).err() } else { None };
+    Ok((new_key, warning))
+}
+
+fn move_out_of_pack(mods_dir: &Path, paks_dir: &Path, key: &str, replace_root: bool) -> Result<(String, Option<String>), String> {
+    let (pack_id, nexus_id) = match parse_key(key)? {
+        KeyKind::Pack { pack_id, nexus_id } => (pack_id, nexus_id.to_string()),
+        KeyKind::Loose(_) => return Err(format!("{:?} is not in a modpack", key)),
+    };
+    if mods_dir.join(&nexus_id).exists() && !replace_root {
+        return Err("root-exists".to_string());
+    }
+    let pack_dir = mods_dir.join(&pack_id);
+
+    let was_enabled = flag_enabled(&resolve_key(mods_dir, key)?);
+    relocate(mods_dir, paks_dir, key, &nexus_id, &pack_dir, |m| m.mod_ids.retain(|id| *id != nexus_id))?;
+    let warning = if was_enabled { enable_moved(mods_dir, paks_dir, &nexus_id).err() } else { None };
+    Ok((nexus_id, warning))
+}
+
+fn drop_from_manifest(mods_dir: &Path, key: &str) -> Result<(), String> {
+    if let Ok(KeyKind::Pack { pack_id, nexus_id }) = parse_key(key) {
+        let pack_dir = mods_dir.join(&pack_id);
+        if let Some(mut m) = read_manifest(&pack_dir) {
+            let id = nexus_id.to_string();
+            m.mod_ids.retain(|x| *x != id);
+            write_manifest(&pack_dir, &m)?;
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn move_to_pack(app_handle: tauri::AppHandle, key: String, pack_id: String) -> Result<String, String> {
+    let mods_dir = get_mods_dir(&app_handle)?;
+    let paks_dir = get_paks_dir(&app_handle).unwrap_or_else(|_| mods_dir.join(".no-game-path"));
+    let (new_key, warning) = move_into_pack(&mods_dir, &paks_dir, &key, &pack_id)?;
+    finish_move(app_handle, &key, new_key, warning)
+}
+
+#[tauri::command]
+pub async fn remove_from_pack(app_handle: tauri::AppHandle, key: String, replace_root: bool) -> Result<String, String> {
+    let mods_dir = get_mods_dir(&app_handle)?;
+    let paks_dir = get_paks_dir(&app_handle).unwrap_or_else(|_| mods_dir.join(".no-game-path"));
+    let (new_key, warning) = move_out_of_pack(&mods_dir, &paks_dir, &key, replace_root)?;
+    finish_move(app_handle, &key, new_key, warning)
+}
+
+fn finish_move(app_handle: tauri::AppHandle, old: &str, new_key: String, warning: Option<String>) -> Result<String, String> {
+    let saved = save_renamed_key(app_handle, old, &new_key);
+    match (warning, saved) {
+        (Some(w), Err(e)) => Err(format!("{}. Saved presets were not updated either: {}", w, e)),
+        (Some(w), Ok(())) => Err(w),
+        (None, Err(e)) => Err(format!("Moved to {} but saved presets were not updated: {}", new_key, e)),
+        (None, Ok(())) => Ok(new_key),
+    }
+}
+
+fn save_renamed_key(app_handle: tauri::AppHandle, old: &str, new: &str) -> Result<(), String> {
+    let mut config = crate::config::load_config(app_handle.clone())?;
+    crate::config::rename_key_in_presets(&mut config, old, new);
+    crate::config::save_config(app_handle, config)
 }
 
 #[derive(Serialize, Debug, Default)]
@@ -1971,5 +2136,161 @@ mod tests {
         presets.insert("mine".to_string(), vec!["3063".to_string(), "CS/3063".to_string()]);
         let e = export_plan(&m, &presets, "mine", None).unwrap_err();
         assert_eq!(e, "Two mods in this preset share Nexus id 3063");
+    }
+
+    fn manifest(m: &Path, ids: &[&str]) {
+        use crate::packs::{write_manifest, PackManifest};
+        write_manifest(&m.join("CS"), &PackManifest {
+            pack_id: "CS".into(), name: "CS".into(), version: None,
+            mod_ids: ids.iter().map(|s| s.to_string()).collect(), imported_at: 0 }).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn move_into_pack_moves_and_relinks() {
+        let m = scratch("mv-in-mods");
+        let p = scratch("mv-in-paks");
+        put(&m, "7000/a.pak", b"a");
+        put(&m, "CS/3063/b.pak", b"b");
+        manifest(&m, &["3063"]);
+        enable_key(&m, &p, "7000").unwrap();
+        assert!(names(&p).iter().any(|n| n.starts_with("7000_")));
+
+        let (key, warning) = move_into_pack(&m, &p, "7000", "CS").unwrap();
+        assert_eq!(warning, None);
+        assert_eq!(key, "CS/7000");
+        assert!(!m.join("7000").exists());
+        assert!(m.join("CS/7000/a.pak").exists());
+        assert_eq!(read_manifest(&m.join("CS")).unwrap().mod_ids, ["3063", "7000"]);
+        assert!(names(&p).iter().all(|n| !n.starts_with("7000_")));
+        assert!(names(&p).iter().any(|n| n.starts_with("CS.7000_")));
+    }
+
+    #[test]
+    fn move_into_pack_replaces_existing_copy() {
+        let m = scratch("mv-rep-mods");
+        let p = scratch("mv-rep-paks");
+        put(&m, "CS/3063/old.pak", b"old");
+        put(&m, "3063/new.pak", b"new");
+        manifest(&m, &["3063"]);
+        move_into_pack(&m, &p, "3063", "CS").unwrap();
+        assert_eq!(names(&m.join("CS/3063")), ["new.pak"]);
+        assert_eq!(read_manifest(&m.join("CS")).unwrap().mod_ids, ["3063"]);
+    }
+
+    #[test]
+    fn move_out_round_trips() {
+        let m = scratch("mv-out-mods");
+        let p = scratch("mv-out-paks");
+        put(&m, "CS/7000/a.pak", b"a");
+        manifest(&m, &["7000", "3063"]);
+        let (key, _) = move_out_of_pack(&m, &p, "CS/7000", false).unwrap();
+        assert_eq!(key, "7000");
+        assert!(m.join("7000/a.pak").exists());
+        assert!(!m.join("CS/7000").exists());
+        assert_eq!(read_manifest(&m.join("CS")).unwrap().mod_ids, ["3063"]);
+    }
+
+    #[test]
+    fn move_out_refuses_over_root_copy() {
+        let m = scratch("mv-refuse-mods");
+        let p = scratch("mv-refuse-paks");
+        put(&m, "7000/root.pak", b"r");
+        put(&m, "CS/7000/a.pak", b"a");
+        manifest(&m, &["7000"]);
+        assert_eq!(move_out_of_pack(&m, &p, "CS/7000", false), Err("root-exists".to_string()));
+        assert!(m.join("7000/root.pak").exists());
+        assert!(m.join("CS/7000/a.pak").exists());
+        assert_eq!(read_manifest(&m.join("CS")).unwrap().mod_ids, ["7000"]);
+
+        move_out_of_pack(&m, &p, "CS/7000", true).unwrap();
+        assert!(m.join("7000/a.pak").exists());
+        assert!(!m.join("7000/root.pak").exists());
+    }
+
+    #[test]
+    fn delete_pack_mod_drops_it_from_manifest() {
+        let m = scratch("del-pack-mod");
+        put(&m, "CS/7000/a.pak", b"a");
+        manifest(&m, &["7000", "3063"]);
+        drop_from_manifest(&m, "CS/7000").unwrap();
+        assert_eq!(read_manifest(&m.join("CS")).unwrap().mod_ids, ["3063"]);
+        drop_from_manifest(&m, "7000").unwrap();
+        assert_eq!(read_manifest(&m.join("CS")).unwrap().mod_ids, ["3063"]);
+    }
+
+    #[test]
+    fn move_into_pack_with_missing_source_deletes_nothing() {
+        let m = scratch("mv-missing-mods");
+        let p = scratch("mv-missing-paks");
+        put(&m, "CS/3063/old.pak", b"old");
+        manifest(&m, &["3063"]);
+        assert!(move_into_pack(&m, &p, "3063", "CS").is_err());
+        assert!(m.join("CS/3063/old.pak").exists());
+        assert_eq!(read_manifest(&m.join("CS")).unwrap().mod_ids, ["3063"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_replace_keeps_the_old_copy() {
+        use std::os::unix::fs::PermissionsExt;
+        let m = scratch("mv-fail-mods");
+        let p = scratch("mv-fail-paks");
+        put(&m, "CS/3063/old.pak", b"old");
+        put(&m, "3063/new.pak", b"new");
+        manifest(&m, &["3063"]);
+        fs::set_permissions(m.join("CS"), fs::Permissions::from_mode(0o555)).unwrap();
+        let r = move_into_pack(&m, &p, "3063", "CS");
+        fs::set_permissions(m.join("CS"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(r.is_err());
+        assert!(m.join("CS/3063/old.pak").exists());
+        assert!(m.join("3063/new.pak").exists());
+        assert_eq!(read_manifest(&m.join("CS")).unwrap().mod_ids, ["3063"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn drop_from_manifest_reports_write_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let m = scratch("drop-fail");
+        put(&m, "CS/7000/a.pak", b"a");
+        manifest(&m, &["7000"]);
+        let file = m.join("CS/pack.json");
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o444)).unwrap();
+        let r = drop_from_manifest(&m, "CS/7000");
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        if r.is_ok() {
+            return; // running as root, permissions are not enforced
+        }
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn scan_dir_skips_dot_folders_inside_packs() {
+        let m = scratch("scan-dot");
+        put(&m, "CS/7000/a.pak", b"a");
+        put(&m, "CS/.replaced-x/a.pak", b"a");
+        manifest(&m, &["7000"]);
+        let ids: Vec<_> = scan_dir(&m).into_iter().map(|x| x.id).collect();
+        assert_eq!(ids, ["CS/7000"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_replace_relinks_the_enabled_old_copy() {
+        use std::os::unix::fs::PermissionsExt;
+        let m = scratch("mv-relink-mods");
+        let p = scratch("mv-relink-paks");
+        put(&m, "CS/3063/old.pak", b"old");
+        put(&m, "3063/new.pak", b"new");
+        manifest(&m, &["3063"]);
+        enable_key(&m, &p, "CS/3063").unwrap();
+        fs::set_permissions(m.join("CS"), fs::Permissions::from_mode(0o555)).unwrap();
+        let r = move_into_pack(&m, &p, "3063", "CS");
+        fs::set_permissions(m.join("CS"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(r.is_err());
+        assert!(names(&p).iter().any(|n| n.starts_with("CS.3063_")));
+        assert!(m.join("CS/3063/old.pak").exists());
+        assert!(flag_enabled(&m.join("CS/3063")));
     }
 }

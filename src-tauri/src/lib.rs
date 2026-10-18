@@ -36,6 +36,8 @@ pub fn run() {
             vfs::toggle_mod,
             vfs::pick_mod_archive,
             vfs::delete_mod,
+            vfs::move_to_pack,
+            vfs::remove_from_pack,
             vfs::apply_preset,
             vfs::load_packs,
             vfs::delete_pack,

@@ -207,6 +207,19 @@ pub fn tidy_presets_after_import(config: &mut AppConfig, pack_id: &str, supersed
     }
 }
 
+pub fn rename_key_in_presets(config: &mut AppConfig, old: &str, new: &str) {
+    for keys in config.presets.values_mut() {
+        let mut out: Vec<String> = Vec::with_capacity(keys.len());
+        for key in keys.drain(..) {
+            let key = if key == old { new.to_string() } else { key };
+            if !out.contains(&key) {
+                out.push(key);
+            }
+        }
+        *keys = out;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,5 +236,19 @@ mod tests {
         assert_eq!(c.presets["Mine"], ["Casual-Shitters/3063", "5543"]);
         assert!(!c.presets.contains_key("Only Removed"));
         assert_eq!(c.active_preset, None);
+    }
+
+    #[test]
+    fn rename_key_in_presets_rewrites_every_preset() {
+        let mut c = AppConfig::default();
+        c.presets.insert("A".into(), vec!["1".into(), "7000".into(), "2".into()]);
+        c.presets.insert("B".into(), vec!["7000".into(), "CS/7000".into()]);
+        c.presets.insert("C".into(), vec!["5".into()]);
+        c.active_preset = Some("A".into());
+        rename_key_in_presets(&mut c, "7000", "CS/7000");
+        assert_eq!(c.presets["A"], ["1", "CS/7000", "2"]);
+        assert_eq!(c.presets["B"], ["CS/7000"]);
+        assert_eq!(c.presets["C"], ["5"]);
+        assert_eq!(c.active_preset.as_deref(), Some("A"));
     }
 }
