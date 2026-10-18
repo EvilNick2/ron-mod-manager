@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 use crate::hashing;
 
 pub const FOLDER_MIME: &str = "application/vnd.google-apps.folder";
+pub const SIZE_MISMATCH: &str = "The download did not match its expected size";
 
 const FILES_URL: &str = "https://www.googleapis.com/drive/v3/files";
 const UPLOAD_URL: &str = "https://www.googleapis.com/upload/drive/v3/files";
@@ -73,7 +74,8 @@ pub struct Progress {
 pub trait DriveApi {
     fn list(&self, folder_id: &str) -> Result<Vec<RemoteFile>, String>;
     fn read(&self, file_id: &str) -> Result<Vec<u8>, String>;
-    fn download(&self, file_id: &str, dest: &Path, on_bytes: &mut dyn FnMut(u64)) -> Result<String, String>;
+    /// Fails with SIZE_MISMATCH, leaving no file, when the content is not exactly expected_size bytes
+    fn download(&self, file_id: &str, dest: &Path, expected_size: u64, on_bytes: &mut dyn FnMut(u64)) -> Result<String, String>;
     fn find_folder(&self, parent: Option<&str>, name: &str) -> Result<Option<String>, String>;
     fn create_folder(&self, parent: Option<&str>, name: &str) -> Result<String, String>;
     fn share_anyone(&self, file_id: &str) -> Result<(), String>;
@@ -357,7 +359,7 @@ impl DriveApi for HttpDrive {
         resp.bytes().map(|b| b.to_vec()).map_err(|e| format!("Could not read from Google Drive: {}", e))
     }
 
-    fn download(&self, file_id: &str, dest: &Path, on_bytes: &mut dyn FnMut(u64)) -> Result<String, String> {
+    fn download(&self, file_id: &str, dest: &Path, expected_size: u64, on_bytes: &mut dyn FnMut(u64)) -> Result<String, String> {
         let url = format!("{}/{}", FILES_URL, file_id);
         let mut resp = self.send(&[], || self.client.get(&url).query(&[("alt", "media")]))?;
         if let Some(parent) = dest.parent() {
@@ -371,7 +373,9 @@ impl DriveApi for HttpDrive {
             let mut buf = vec![0u8; 256 * 1024];
             loop {
                 match resp.read(&mut buf) {
+                    Ok(0) if written != expected_size => return Err(SIZE_MISMATCH.to_string()),
                     Ok(0) => return Ok(hashing::hex(&hasher.finalize())),
+                    Ok(n) if written + n as u64 > expected_size => return Err(SIZE_MISMATCH.to_string()),
                     Ok(n) => {
                         hasher.update(&buf[..n]);
                         file.write_all(&buf[..n]).map_err(|e| format!("Could not write {}: {}", dest.display(), e))?;
@@ -645,9 +649,12 @@ pub mod fake {
             self.stored(file_id)
         }
 
-        fn download(&self, file_id: &str, dest: &Path, on_bytes: &mut dyn FnMut(u64)) -> Result<String, String> {
+        fn download(&self, file_id: &str, dest: &Path, expected_size: u64, on_bytes: &mut dyn FnMut(u64)) -> Result<String, String> {
             let bytes = self.stored(file_id)?;
             self.downloads.set(self.downloads.get() + 1);
+            if bytes.len() as u64 != expected_size {
+                return Err(SIZE_MISMATCH.to_string());
+            }
             if let Some(parent) = dest.parent() {
                 fs::create_dir_all(parent).map_err(|e| e.to_string())?;
             }
@@ -798,7 +805,7 @@ mod tests {
         assert_eq!(drive.file_bytes(&folder, "Mod/a.bin"), Some(b"hello".to_vec()));
 
         let dest = dir.join("out.bin");
-        let sha = drive.download(&id, &dest, &mut |_| {}).unwrap();
+        let sha = drive.download(&id, &dest, 5, &mut |_| {}).unwrap();
         assert_eq!(sha, listed[0].sha256.clone().unwrap());
         assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
         assert_eq!(drive.downloads(), 1);
@@ -823,7 +830,10 @@ mod tests {
         let id = drive.create_bytes(&folder, "a", b"data").unwrap();
         drive.corrupt(&id);
         let reported = drive.list(&folder).unwrap()[0].sha256.clone().unwrap();
-        let got = drive.download(&id, &dir.join("a"), &mut |_| {}).unwrap();
+        let got = drive.download(&id, &dir.join("a"), 4, &mut |_| {}).unwrap();
+        assert_eq!(drive.download(&id, &dir.join("b"), 3, &mut |_| {}).unwrap_err(), SIZE_MISMATCH);
+        assert_eq!(drive.download(&id, &dir.join("b"), 5, &mut |_| {}).unwrap_err(), SIZE_MISMATCH);
+        assert!(!dir.join("b").exists());
         assert_ne!(got, reported);
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -1581,7 +1581,7 @@ pub async fn install_addon(app_handle: tauri::AppHandle, mod_id: String, archive
     Ok(added_files)
 }
 
-fn get_paks_dir(app_handle: &tauri::AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn get_paks_dir(app_handle: &tauri::AppHandle) -> Result<PathBuf, String> {
     let config = crate::config::load_config(app_handle.clone()).map_err(|e| e.to_string())?;
     let game_path_str = config.game_path.ok_or("Game installation path is not set!")?;
     let mut paks_dir = PathBuf::from(game_path_str);

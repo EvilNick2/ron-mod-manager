@@ -6,6 +6,7 @@ mod hashing;
 mod packs;
 mod publish;
 mod sso;
+mod subscribe;
 mod updater;
 mod vfs;
 
@@ -42,6 +43,9 @@ pub fn run() {
             publish::publish_pack_cmd,
             publish::list_dirty_packs,
             publish::force_close,
+            subscribe::inspect_pack_link,
+            subscribe::add_pack_from_link,
+            subscribe::check_pack_updates,
             config::save_preset,
             config::delete_preset,
             config::load_presets,

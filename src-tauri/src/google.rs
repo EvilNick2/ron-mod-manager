@@ -26,7 +26,6 @@ pub fn client_secret() -> Option<&'static str> {
     non_empty(option_env!("GOOGLE_CLIENT_SECRET"))
 }
 
-#[allow(dead_code)]
 pub fn api_key() -> Option<&'static str> {
     non_empty(option_env!("GOOGLE_API_KEY"))
 }

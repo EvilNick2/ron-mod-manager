@@ -99,16 +99,16 @@ pub enum PublishOutcome {
 
 const PROGRESS_EVERY: Duration = Duration::from_millis(250);
 
-struct Throttle {
+pub(crate) struct Throttle {
     last: Option<Instant>,
 }
 
 impl Throttle {
-    fn new() -> Throttle {
+    pub(crate) fn new() -> Throttle {
         Throttle { last: None }
     }
 
-    fn ready(&mut self) -> bool {
+    pub(crate) fn ready(&mut self) -> bool {
         let now = Instant::now();
         if self.last.is_some_and(|t| now.duration_since(t) < PROGRESS_EVERY) {
             return false;
@@ -118,7 +118,7 @@ impl Throttle {
     }
 }
 
-fn progress_event(pack_id: &str, stage: &str, done: usize, total: usize, file: Option<&str>, bytes: (u64, u64)) -> Progress {
+pub(crate) fn progress_event(pack_id: &str, stage: &str, done: usize, total: usize, file: Option<&str>, bytes: (u64, u64)) -> Progress {
     Progress {
         pack_id: pack_id.to_string(),
         stage: stage.to_string(),
@@ -1214,8 +1214,8 @@ mod tests {
         fn read(&self, file_id: &str) -> Result<Vec<u8>, String> {
             self.inner.read(file_id)
         }
-        fn download(&self, file_id: &str, dest: &Path, on_bytes: &mut dyn FnMut(u64)) -> Result<String, String> {
-            self.inner.download(file_id, dest, on_bytes)
+        fn download(&self, file_id: &str, dest: &Path, expected_size: u64, on_bytes: &mut dyn FnMut(u64)) -> Result<String, String> {
+            self.inner.download(file_id, dest, expected_size, on_bytes)
         }
         fn find_folder(&self, parent: Option<&str>, name: &str) -> Result<Option<String>, String> {
             if self.find_fails {
