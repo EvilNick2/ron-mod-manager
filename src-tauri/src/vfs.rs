@@ -805,16 +805,21 @@ pub async fn toggle_addon(app_handle: tauri::AppHandle, mod_id: String, filename
     Ok(())
 }
 
+fn delete_addon_files(addons_dir: &Path, pak_filename: &str) -> Result<(), String> {
+    for file in addon_files(addons_dir, pak_filename) {
+        if file.exists() {
+            std::fs::remove_file(&file).map_err(|e| format!("Failed to delete addon: {}", e))?;
+        }
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn remove_addon(app_handle: tauri::AppHandle, mod_id: String, filename: String) -> Result<(), String> {
     let _ = toggle_addon(app_handle.clone(), mod_id.clone(), filename.clone(), false).await;
     
     let mods_dir = get_mods_dir(&app_handle)?;
-    let addon_path = mods_dir.join(&mod_id).join("addons").join(&filename);
-    
-    if addon_path.exists() {
-        std::fs::remove_file(&addon_path).map_err(|e| format!("Failed to delete addon: {}", e))?;
-    }
+    delete_addon_files(&mods_dir.join(&mod_id).join("addons"), &filename)?;
     
     let metadata_path = mods_dir.join(&mod_id).join("metadata.json");
     if let Ok(content) = std::fs::read_to_string(&metadata_path) {
@@ -882,5 +887,16 @@ mod tests {
         let got: Vec<_> = addon_files(&a, "x.pak").iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
         assert_eq!(got, ["x.pak", "x.ucas", "x.utoc"]);
+    }
+
+    #[test]
+    fn delete_addon_files_removes_companions_only() {
+        let a = scratch("addon-del");
+        for f in ["x.pak", "x.ucas", "x.utoc", "y.ucas"] { fs::write(a.join(f), b"x").unwrap(); }
+        delete_addon_files(&a, "x.pak").unwrap();
+        assert!(!a.join("x.pak").exists());
+        assert!(!a.join("x.ucas").exists());
+        assert!(!a.join("x.utoc").exists());
+        assert!(a.join("y.ucas").exists());
     }
 }
