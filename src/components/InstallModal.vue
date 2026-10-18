@@ -7,6 +7,7 @@ import { Archive, FileArchive, FolderOpen, Puzzle, Trash2, Plus } from 'lucide-v
 const nexusInput = ref("");
 const isInstalling = ref(false);
 const errorMsg = ref("");
+const installPackId = ref("");
 const postInstallAddons = ref<string[]>([]);
 
 watch(() => store.awaitingDropForId, (newId) => {
@@ -45,11 +46,27 @@ async function startInstall() {
       modId: modId
     });
     
+    let postId = modId;
+    let moveWarning = "";
+    if (installPackId.value) {
+      try {
+        postId = await invoke("move_to_pack", { key: modId, packId: installPackId.value });
+      } catch (e: any) {
+        const msg = String(e);
+        const match = msg.match(/^Moved to (\S+)/);
+        if (!match) throw new Error("Installed, but could not add to the modpack: " + msg);
+        postId = match[1];
+        moveWarning = msg;
+      }
+    }
+
     console.log("[InstallModal] Install succeeded, scanning mods...");
     store.mods = await invoke("scan_local_mods");
     
-    console.log("[InstallModal] Setting postInstallModId to:", modId);
-    store.postInstallModId = modId;
+    console.log("[InstallModal] Setting postInstallModId to:", postId);
+    store.postInstallModId = postId;
+    installPackId.value = "";
+    if (moveWarning) alert(moveWarning);
     store.installingModPath = null;
     store.awaitingDropForId = null;
     nexusInput.value = "";
@@ -98,6 +115,7 @@ function cancelInstall() {
   store.postInstallModId = null;
   postInstallAddons.value = [];
   nexusInput.value = "";
+  installPackId.value = "";
   errorMsg.value = "";
 }
 
@@ -173,6 +191,14 @@ async function browseForArchive() {
           class="dark-input" 
           :disabled="isInstalling"
         />
+      </div>
+      
+      <div class="input-group" v-if="store.packs.length">
+        <label>Install into</label>
+        <select v-model="installPackId" class="dark-input" :disabled="isInstalling">
+          <option value="">None</option>
+          <option v-for="p in store.packs" :key="p.pack_id" :value="p.pack_id">{{ p.name }}</option>
+        </select>
       </div>
       
       <div v-if="errorMsg" class="error-msg">{{ errorMsg }}</div>
