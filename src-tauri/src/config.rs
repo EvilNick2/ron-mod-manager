@@ -209,6 +209,13 @@ pub fn tidy_presets_after_import(config: &mut AppConfig, pack_id: &str, supersed
     }
 }
 
+// After a pack update, drops the keys of removed mods and leaves every preset and the active one in place
+pub fn strip_keys_from_presets(config: &mut AppConfig, removed_keys: &[String]) {
+    for keys in config.presets.values_mut() {
+        keys.retain(|k| !removed_keys.contains(k));
+    }
+}
+
 pub fn rename_key_in_presets(config: &mut AppConfig, old: &str, new: &str) {
     for keys in config.presets.values_mut() {
         let mut out: Vec<String> = Vec::with_capacity(keys.len());
@@ -238,6 +245,18 @@ mod tests {
         assert_eq!(c.presets["Mine"], ["Casual-Shitters/3063", "5543"]);
         assert!(!c.presets.contains_key("Only Removed"));
         assert_eq!(c.active_preset, None);
+    }
+
+    #[test]
+    fn strip_keys_keeps_an_active_own_named_preset() {
+        let mut c = AppConfig::default();
+        c.presets.insert("Casual Shitters".into(), vec!["Casual-Shitters/3063".into(), "Casual-Shitters/3311".into()]);
+        c.presets.insert("Mine".into(), vec!["5543".into(), "Casual-Shitters/3063".into()]);
+        c.active_preset = Some("Casual Shitters".into());
+        strip_keys_from_presets(&mut c, &["Casual-Shitters/3063".into()]);
+        assert_eq!(c.presets["Casual Shitters"], ["Casual-Shitters/3311"]);
+        assert_eq!(c.presets["Mine"], ["5543"]);
+        assert_eq!(c.active_preset.as_deref(), Some("Casual Shitters"));
     }
 
     #[test]

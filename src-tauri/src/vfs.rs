@@ -585,7 +585,7 @@ fn link_mod_files(mod_dir: &Path, paks_dir: &Path, key: &str) -> Result<(), Stri
 }
 
 // Rollback relinking: creates only the links that are gone, so a partly unlinked key is made whole.
-fn link_missing(mods_dir: &Path, paks_dir: &Path, key: &str) -> Result<(), String> {
+pub(crate) fn link_missing(mods_dir: &Path, paks_dir: &Path, key: &str) -> Result<(), String> {
     for (src, link, addon) in planned_links(&resolve_key(mods_dir, key)?, paks_dir, key) {
         if !entry_present(&link) {
             create_planned(&src, &link, addon)?;
@@ -1339,6 +1339,9 @@ pub(crate) fn abandon_staging(staging: &Path, err: String) -> String {
     }
 }
 
+// Starts the note relink adds to an error
+pub(crate) const RELINK_NOTE: &str = " (could not re-enable ";
+
 // Restores the links of keys unlinked by a failed swap. Unlike enable_key it leaves other copies and metadata alone.
 fn relink(mods_dir: &Path, paks_dir: &Path, keys: &[String], err: String) -> String {
     let failed: Vec<&str> = keys.iter()
@@ -1348,7 +1351,7 @@ fn relink(mods_dir: &Path, paks_dir: &Path, keys: &[String], err: String) -> Str
     if failed.is_empty() {
         err
     } else {
-        format!("{} (could not re-enable {})", err, failed.join(", "))
+        format!("{}{}{})", err, RELINK_NOTE, failed.join(", "))
     }
 }
 

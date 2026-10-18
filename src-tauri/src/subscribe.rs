@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -10,7 +10,7 @@ use crate::drive::{DriveApi, HttpDrive, Progress, SIZE_MISMATCH};
 use crate::hashing;
 use crate::packs::{self, InstalledMod, PackManifest, PackRef, PackSource};
 use crate::publish::{progress_event, RemoteFileEntry, RemoteManifest, RemoteMod, Throttle, FORMAT, MANIFEST_NAME};
-use crate::vfs::{self, ImportPreview, ImportSummary, ModRef, PackArchive};
+use crate::vfs::{self, ImportPreview, ImportSummary, ModRef, PackArchive, SwapError};
 
 const NOT_A_LINK: &str = "That is not a Google Drive folder link";
 const NO_PACK: &str = "No modpack found at that link";
@@ -224,46 +224,73 @@ fn stage_remote(
     progress: &mut dyn FnMut(Progress),
 ) -> Result<(), String> {
     let manifest = &remote.manifest;
-    let pack_id = manifest.pack_id.as_str();
     fs::create_dir_all(staged).map_err(|e| format!("Failed to create staging folder: {}", e))?;
     let total = manifest.mods.iter().map(|m| m.files.len()).sum();
-    let mut done = 0;
-    let mut throttle = Throttle::new();
+    let mut fetch = Fetch { drive, manifest, done: 0, total, throttle: Throttle::new(), progress };
     for m in &manifest.mods {
         let mod_dir = staged.join(&m.id);
         fs::create_dir_all(&mod_dir).map_err(|e| format!("Failed to create {}: {}", mod_dir.display(), e))?;
         for f in &m.files {
-            let dest = mod_dir.join(safe_rel_path(&f.path)?);
-            if !dest.starts_with(staged) {
-                return Err(format!("Invalid file path in pack: {}", f.path));
-            }
-            let mut got = 0u64;
-            let corrupted = || format!("A download from {} was corrupted ({}). Nothing was changed.", manifest.name, f.path);
-            let downloaded = drive.download(&f.file_id, &dest, f.size, &mut |n| {
-                got += n;
-                if throttle.ready() {
-                    progress(progress_event(pack_id, "downloading", done, total, Some(&f.path), (got, f.size)));
-                }
-            });
-            let sha = match downloaded {
-                Err(e) if e == SIZE_MISMATCH => return Err(corrupted()),
-                other => other?,
-            };
-            if !sha.eq_ignore_ascii_case(&f.sha256) {
-                return Err(corrupted());
-            }
-            done += 1;
-            progress(progress_event(pack_id, "downloading", done, total, Some(&f.path), (f.size, f.size)));
+            fetch.file(f, &mod_dir, staged)?;
         }
     }
 
     for m in &manifest.mods {
-        let dir = staged.join(&m.id);
-        vfs::clear_enabled_flag(&dir)?;
-        if !m.addons.is_empty() {
-            hashing::set_addon_states(&dir, &m.addons)?;
-        }
+        reset_downloaded_mod(&staged.join(&m.id), m)?;
     }
+    write_staged_manifest(remote, mod_ids, staged)
+}
+
+// Downloads files into staging with their hashes checked, and reports progress for the pack
+struct Fetch<'a> {
+    drive: &'a dyn DriveApi,
+    manifest: &'a RemoteManifest,
+    done: usize,
+    total: usize,
+    throttle: Throttle,
+    progress: &'a mut dyn FnMut(Progress),
+}
+
+impl Fetch<'_> {
+    fn file(&mut self, f: &RemoteFileEntry, mod_dir: &Path, staged: &Path) -> Result<(), String> {
+        let dest = mod_dir.join(safe_rel_path(&f.path)?);
+        if !dest.starts_with(staged) {
+            return Err(format!("Invalid file path in pack: {}", f.path));
+        }
+        let (pack_id, done, total) = (self.manifest.pack_id.as_str(), self.done, self.total);
+        let corrupted = || format!("A download from {} was corrupted ({}). Nothing was changed.", self.manifest.name, f.path);
+        let mut got = 0u64;
+        let (throttle, progress) = (&mut self.throttle, &mut *self.progress);
+        let downloaded = self.drive.download(&f.file_id, &dest, f.size, &mut |n| {
+            got += n;
+            if throttle.ready() {
+                progress(progress_event(pack_id, "downloading", done, total, Some(&f.path), (got, f.size)));
+            }
+        });
+        let sha = match downloaded {
+            Err(e) if e == SIZE_MISMATCH => return Err(corrupted()),
+            other => other?,
+        };
+        if !sha.eq_ignore_ascii_case(&f.sha256) {
+            return Err(corrupted());
+        }
+        self.done += 1;
+        (self.progress)(progress_event(pack_id, "downloading", self.done, total, Some(&f.path), (f.size, f.size)));
+        Ok(())
+    }
+}
+
+// A freshly downloaded metadata.json starts off and takes its addon states from the manifest
+fn reset_downloaded_mod(dir: &Path, m: &RemoteMod) -> Result<(), String> {
+    vfs::clear_enabled_flag(dir)?;
+    if !m.addons.is_empty() {
+        hashing::set_addon_states(dir, &m.addons)?;
+    }
+    Ok(())
+}
+
+fn write_staged_manifest(remote: &RemotePack, mod_ids: Vec<String>, staged: &Path) -> Result<(), String> {
+    let manifest = &remote.manifest;
     let installed_hashes = manifest
         .mods
         .iter()
@@ -326,7 +353,7 @@ pub struct UpdateCheck {
 
 pub fn check_pack(drive: &dyn DriveApi, pack_dir: &Path) -> Result<UpdateCheck, String> {
     let local = packs::read_manifest(pack_dir).ok_or_else(|| format!("Could not read {}", pack_dir.join("pack.json").display()))?;
-    let source = local.source.as_ref().ok_or_else(|| format!("{} is not linked to a Google Drive folder", local.name))?;
+    let source = local.source.as_ref().ok_or_else(|| format!("{} is not linked to a Drive folder", local.name))?;
     let link = DriveLink { folder_id: source.folder_id.clone(), resource_key: source.resource_key.clone() };
     let (_, remote) = load_manifest(drive, &link)?;
     if remote.pack_id != local.pack_id {
@@ -443,6 +470,324 @@ pub async fn check_pack_updates(app_handle: tauri::AppHandle) -> Result<Vec<Upda
         .map_err(|e| e.to_string())
 }
 
+#[derive(Serialize, Debug)]
+pub struct UpdateSummary {
+    pub pack: PackRef,
+    pub downloaded: usize,
+    pub added: usize,
+    pub changed: usize,
+    pub removed_keys: Vec<String>,
+    pub failed_deletes: Vec<String>,
+    // "<key>: <error>" for each mod that was updated but could not be turned on
+    pub not_enabled: Vec<String>,
+}
+
+// The installed pack for an id from the frontend, which must be linked to Drive
+fn linked_pack(mods_dir: &Path, pack_id: &str) -> Result<(PathBuf, PackManifest, DriveLink), String> {
+    let pack_dir = mods_dir.join(pack_id);
+    let local = packs::parse_key(&format!("{}/1", pack_id))
+        .ok()
+        .and_then(|_| packs::read_manifest(&pack_dir))
+        .ok_or_else(|| format!("No modpack folder for {:?}", pack_id))?;
+    let source = local.source.as_ref().ok_or_else(|| format!("{} is not linked to a Drive folder", local.name))?;
+    let link = DriveLink { folder_id: source.folder_id.clone(), resource_key: source.resource_key.clone() };
+    Ok((pack_dir, local, link))
+}
+
+enum Stage<'a> {
+    // the installed folder moves across whole
+    Keep,
+    // these files are downloaded and the rest move across from the installed folder
+    Fetch { download: Vec<&'a RemoteFileEntry>, carry: Vec<&'a RemoteFileEntry> },
+}
+
+fn is_plain(path: &Path, dir: bool) -> bool {
+    path.symlink_metadata().is_ok_and(|m| if dir { m.is_dir() } else { m.is_file() })
+}
+
+fn plan_mod<'a>(m: &'a RemoteMod, local: &PackManifest, installed: &Path, forced: bool) -> Stage<'a> {
+    let old = local.mod_ids.contains(&m.id);
+    let record = local.installed_hashes.get(&m.id);
+    if old && !forced && is_plain(installed, true) && record.is_some_and(|r| r.hash == m.hash) {
+        return Stage::Keep;
+    }
+    let reusable = |f: &&RemoteFileEntry| {
+        old && !forced
+            && !hashing::is_meta_file(&f.path)
+            && record.and_then(|r| r.files.get(&f.path)).is_some_and(|sha| sha.eq_ignore_ascii_case(&f.sha256))
+            && safe_rel_path(&f.path).is_ok_and(|rel| is_plain(&installed.join(rel), false))
+    };
+    let (carry, download) = m.files.iter().partition(reusable);
+    Stage::Fetch { download, carry }
+}
+
+// Renames from the installed pack into staging, kept so they can be undone
+#[derive(Default)]
+struct Moves(Vec<(PathBuf, PathBuf)>);
+
+impl Moves {
+    fn make(&mut self, from: &Path, to: &Path) -> Result<(), String> {
+        if let Some(parent) = to.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("Failed to create {}: {}", parent.display(), e))?;
+        }
+        fs::rename(from, to).map_err(|e| format!("Failed to move {}: {}", from.display(), e))?;
+        self.0.push((from.to_path_buf(), to.to_path_buf()));
+        Ok(())
+    }
+
+    // Moves everything back in reverse order and removes staging. When a file cannot go back
+    // it stops there and keeps staging, since it still holds the rest of the pack.
+    fn undo(&self, staging: &Path, err: String) -> Result<String, String> {
+        for (from, to) in self.0.iter().rev() {
+            if let Err(e) = fs::rename(to, from) {
+                return Err(format!(
+                    "{}. The previous pack could not be restored ({}) and part of it is kept at {}",
+                    err,
+                    e,
+                    staging.display()
+                ));
+            }
+        }
+        Ok(vfs::abandon_staging(staging, err))
+    }
+}
+
+fn download_changes(
+    drive: &dyn DriveApi,
+    manifest: &RemoteManifest,
+    plans: &[(&RemoteMod, Stage)],
+    staged: &Path,
+    progress: &mut dyn FnMut(Progress),
+) -> Result<usize, String> {
+    fs::create_dir_all(staged).map_err(|e| format!("Failed to create staging folder: {}", e))?;
+    let downloads = || plans.iter().filter_map(|(m, s)| match s {
+        Stage::Fetch { download, .. } => Some((*m, download)),
+        Stage::Keep => None,
+    });
+    let total = downloads().map(|(_, d)| d.len()).sum();
+    let mut fetch = Fetch { drive, manifest, done: 0, total, throttle: Throttle::new(), progress };
+    for (m, download) in downloads() {
+        let mod_dir = staged.join(&m.id);
+        fs::create_dir_all(&mod_dir).map_err(|e| format!("Failed to create {}: {}", mod_dir.display(), e))?;
+        for f in download {
+            fetch.file(f, &mod_dir, staged)?;
+        }
+    }
+    Ok(fetch.done)
+}
+
+// Moves the kept files into staging and writes the staged pack.json, addon states and flags
+fn assemble(
+    moves: &mut Moves,
+    remote: &RemotePack,
+    plans: &[(&RemoteMod, Stage)],
+    pack_dir: &Path,
+    staged: &Path,
+    flags: &BTreeMap<String, bool>,
+    active: bool,
+) -> Result<(), String> {
+    for (m, stage) in plans {
+        let (from, to) = (pack_dir.join(&m.id), staged.join(&m.id));
+        match stage {
+            Stage::Keep => moves.make(&from, &to)?,
+            Stage::Fetch { carry, .. } => {
+                for f in carry {
+                    let rel = safe_rel_path(&f.path)?;
+                    moves.make(&from.join(&rel), &to.join(&rel))?;
+                }
+            }
+        }
+    }
+    write_staged_manifest(remote, plans.iter().map(|(m, _)| m.id.clone()).collect(), staged)?;
+    for (m, stage) in plans {
+        let dir = staged.join(&m.id);
+        if matches!(stage, Stage::Fetch { .. }) {
+            reset_downloaded_mod(&dir, m)?;
+        }
+        let on = flags.get(&m.id).copied().unwrap_or(active);
+        if vfs::flag_enabled(&dir) != on {
+            vfs::set_enabled_flag(&dir, on);
+        }
+    }
+    Ok(())
+}
+
+// Restores links of the pack after its files went back into place
+fn relink_flagged(mods_dir: &Path, paks_dir: &Path, pack_id: &str, flags: &BTreeMap<String, bool>, err: String) -> String {
+    if !paks_dir.is_dir() {
+        return err;
+    }
+    let failed: Vec<String> = flags
+        .iter()
+        .filter(|(_, on)| **on)
+        .map(|(id, _)| format!("{}/{}", pack_id, id))
+        .filter(|key| vfs::link_missing(mods_dir, paks_dir, key).is_err())
+        .collect();
+    if failed.is_empty() {
+        err
+    } else {
+        format!("{}{}{})", err, vfs::RELINK_NOTE, failed.join(", "))
+    }
+}
+
+pub fn update_pack(
+    drive: &dyn DriveApi,
+    mods_dir: &Path,
+    paks_dir: &Path,
+    pack_id: &str,
+    active: bool,
+    force: &[String],
+    progress: &mut dyn FnMut(Progress),
+) -> Result<UpdateSummary, String> {
+    let (pack_dir, local, link) = linked_pack(mods_dir, pack_id)?;
+    let remote = fetch_remote(drive, &link)?;
+    let manifest = &remote.manifest;
+    if manifest.pack_id != pack_id {
+        return Err(format!("The link for {} now holds a different pack ({})", local.name, manifest.pack_id));
+    }
+    let flags: BTreeMap<String, bool> =
+        local.mod_ids.iter().map(|id| (id.clone(), vfs::flag_enabled(&pack_dir.join(id)))).collect();
+    let plans: Vec<(&RemoteMod, Stage)> = sorted_mods(manifest)
+        .into_iter()
+        .map(|m| (m, plan_mod(m, &local, &pack_dir.join(&m.id), force.contains(&m.id))))
+        .collect();
+    let is_old = |id: &String| local.mod_ids.contains(id);
+    let added = plans.iter().filter(|(m, _)| !is_old(&m.id)).count();
+    let changed = plans.iter().filter(|(m, s)| is_old(&m.id) && matches!(s, Stage::Fetch { .. })).count();
+    let removed_keys = local
+        .mod_ids
+        .iter()
+        .filter(|id| !manifest.mods.iter().any(|m| &m.id == *id))
+        .map(|id| format!("{}/{}", pack_id, id))
+        .collect();
+
+    // Everything is downloaded before any installed file moves, so a failed download leaves the pack untouched
+    let staging = mods_dir.join(format!(".import-{}", uuid::Uuid::new_v4()));
+    let staged = staging.join(pack_id);
+    let downloaded = match download_changes(drive, manifest, &plans, &staged, progress) {
+        Ok(n) => n,
+        Err(e) => return Err(vfs::abandon_staging(&staging, e)),
+    };
+    let mut moves = Moves::default();
+    if let Err(e) = assemble(&mut moves, &remote, &plans, &pack_dir, &staged, &flags, active) {
+        return Err(moves.undo(&staging, e).unwrap_or_else(|stranded| stranded));
+    }
+
+    let target = mods_dir.join(pack_id);
+    match vfs::swap_pack(mods_dir, paks_dir, &staging, &staged, &target, pack_id) {
+        Ok(()) => {}
+        Err(SwapError::RolledBack(e)) => {
+            // relink_flagged below reports what is still unlinked once the files are back
+            let base = e.find(vfs::RELINK_NOTE).map_or(e.as_str(), |i| &e[..i]).to_string();
+            return Err(match moves.undo(&staging, base) {
+                Ok(e) => relink_flagged(mods_dir, paks_dir, pack_id, &flags, e),
+                Err(stranded) => stranded,
+            });
+        }
+        Err(SwapError::Stranded(e)) => {
+            let aside = staging.join(format!("old-{}", pack_id));
+            return Err(format!(
+                "{}. The previous pack is split between {} and {}. Its unchanged files were moved to the second folder, and the two folders together form the previous pack.",
+                e,
+                aside.display(),
+                staged.display()
+            ));
+        }
+    }
+
+    let mut not_enabled: Vec<String> = Vec::new();
+    if paks_dir.is_dir() {
+        for (m, _) in &plans {
+            let dir = target.join(&m.id);
+            if !vfs::flag_enabled(&dir) {
+                continue;
+            }
+            let key = format!("{}/{}", pack_id, m.id);
+            if let Err(e) = vfs::enable_key(mods_dir, paks_dir, &key) {
+                vfs::set_enabled_flag(&dir, false);
+                not_enabled.push(format!("{}: {}", key, e));
+            }
+        }
+        vfs::sweep_orphans(paks_dir, mods_dir);
+    }
+    let mut failed_deletes = Vec::new();
+    if let Err(e) = fs::remove_dir_all(&staging) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            failed_deletes.push(staging.display().to_string());
+        }
+    }
+
+    Ok(UpdateSummary {
+        pack: PackRef { pack_id: pack_id.to_string(), name: manifest.name.clone(), version: Some(manifest.version.clone()) },
+        downloaded,
+        added,
+        changed,
+        removed_keys,
+        failed_deletes,
+        not_enabled,
+    })
+}
+
+// Non-meta files match the record exactly, none missing and none extra
+fn mod_intact(dir: &Path, record: Option<&InstalledMod>) -> bool {
+    let Some(record) = record else { return false };
+    let Ok(files) = hashing::list_mod_files(dir) else { return false };
+    let local: Vec<_> = files.into_iter().filter(|(rel, _, _)| !hashing::is_meta_file(rel)).collect();
+    let expected = record.files.keys().filter(|p| !hashing::is_meta_file(p)).count();
+    local.len() == expected
+        && local.iter().all(|(rel, full, _)| {
+            record.files.get(rel).is_some_and(|sha| hashing::sha256_file(full).is_ok_and(|s| s.eq_ignore_ascii_case(sha)))
+        })
+}
+
+pub fn verify_pack(pack_dir: &Path) -> Result<Vec<String>, String> {
+    let local = packs::read_manifest(pack_dir).ok_or_else(|| format!("Could not read {}", pack_dir.join("pack.json").display()))?;
+    Ok(local.mod_ids.iter().filter(|id| !mod_intact(&pack_dir.join(id), local.installed_hashes.get(*id))).cloned().collect())
+}
+
+async fn run_update(app_handle: tauri::AppHandle, pack_id: String, force: Vec<String>) -> Result<UpdateSummary, String> {
+    crate::google::api_key().ok_or(NO_API_KEY)?;
+    let mods_dir = vfs::get_mods_dir(&app_handle)?;
+    let (_, _, link) = linked_pack(&mods_dir, &pack_id)?;
+    // without a game path nothing can be linked, so a Paks folder that does not exist is enough
+    let paks_dir = vfs::get_paks_dir(&app_handle).unwrap_or_else(|_| mods_dir.join(".no-game-path"));
+    let config = crate::config::load_config(app_handle.clone())?;
+    let active = config.active_preset.as_deref() == Some(format!("pack:{}", pack_id).as_str());
+    let handle = app_handle.clone();
+    let summary = tauri::async_runtime::spawn_blocking(move || {
+        let drive = public_drive(&link)?;
+        let mut emit = |p: Progress| {
+            let _ = handle.emit("pack-progress", p);
+        };
+        update_pack(&drive, &mods_dir, &paks_dir, &pack_id, active, &force, &mut emit)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    let mut config = crate::config::load_config(app_handle.clone())?;
+    crate::config::strip_keys_from_presets(&mut config, &summary.removed_keys);
+    crate::config::save_config(app_handle, config)
+        .map_err(|e| format!("The pack was updated but saved presets could not be updated: {}", e))?;
+    Ok(summary)
+}
+
+#[tauri::command]
+pub async fn update_linked_pack(app_handle: tauri::AppHandle, pack_id: String) -> Result<UpdateSummary, String> {
+    run_update(app_handle, pack_id, Vec::new()).await
+}
+
+#[tauri::command]
+pub async fn redownload_mods(app_handle: tauri::AppHandle, pack_id: String, mod_ids: Vec<String>) -> Result<UpdateSummary, String> {
+    run_update(app_handle, pack_id, mod_ids).await
+}
+
+#[tauri::command]
+pub async fn verify_linked_pack(app_handle: tauri::AppHandle, pack_id: String) -> Result<Vec<String>, String> {
+    let mods_dir = vfs::get_mods_dir(&app_handle)?;
+    let (pack_dir, _, _) = linked_pack(&mods_dir, &pack_id)?;
+    tauri::async_runtime::spawn_blocking(move || verify_pack(&pack_dir)).await.map_err(|e| e.to_string())?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -504,44 +849,7 @@ mod tests {
     // Publishes the pack layout and a ready manifest straight into the fake
     fn remote_fixture(fake: &FakeDrive, mods: &[FixtureMod]) -> Remote {
         let folder = fake.create_folder(None, PACK).unwrap();
-        let mut out = Vec::new();
-        for m in mods {
-            let mod_folder = fake.create_folder(Some(&folder), m.id).unwrap();
-            let mut dirs: BTreeMap<String, String> = BTreeMap::new();
-            let mut files = Vec::new();
-            for (path, body) in &m.files {
-                let parent = match path.rsplit_once('/') {
-                    Some((dir, _)) => dirs
-                        .entry(dir.to_string())
-                        .or_insert_with(|| fake.create_folder(Some(&mod_folder), dir).unwrap())
-                        .clone(),
-                    None => mod_folder.clone(),
-                };
-                let name = path.rsplit('/').next().unwrap();
-                let file_id = fake.create_bytes(&parent, name, body.as_bytes()).unwrap();
-                files.push(RemoteFileEntry {
-                    path: path.to_string(),
-                    size: body.len() as u64,
-                    sha256: hashing::sha256_bytes(body.as_bytes()),
-                    file_id,
-                });
-            }
-            let mut rm = RemoteMod {
-                id: m.id.to_string(),
-                name: format!("Mod {}", m.id),
-                version: m
-                    .files
-                    .iter()
-                    .find(|(p, _)| *p == "metadata.json")
-                    .and_then(|(_, body)| crate::vfs::meta_version(serde_json::from_str(body).ok().as_ref())),
-                folder_id: mod_folder,
-                hash: String::new(),
-                addons: m.addons.iter().map(|(n, on)| (n.to_string(), *on)).collect(),
-                files,
-            };
-            rm.hash = remote_hash(&rm);
-            out.push(rm);
-        }
+        let out = mods.iter().map(|m| fixture_mod(fake, &folder, m)).collect();
         let manifest = RemoteManifest {
             format: FORMAT,
             pack_id: PACK.into(),
@@ -553,6 +861,45 @@ mod tests {
         };
         let manifest_id = fake.create_bytes(&folder, MANIFEST_NAME, &serde_json::to_vec(&manifest).unwrap()).unwrap();
         Remote { folder, manifest_id, manifest }
+    }
+
+    // Uploads one mod's files into the fake pack folder and returns its manifest entry
+    fn fixture_mod(fake: &FakeDrive, folder: &str, m: &FixtureMod) -> RemoteMod {
+        let mod_folder = fake.create_folder(Some(folder), m.id).unwrap();
+        let mut dirs: BTreeMap<String, String> = BTreeMap::new();
+        let mut files = Vec::new();
+        for (path, body) in &m.files {
+            let parent = match path.rsplit_once('/') {
+                Some((dir, _)) => dirs
+                    .entry(dir.to_string())
+                    .or_insert_with(|| fake.create_folder(Some(&mod_folder), dir).unwrap())
+                    .clone(),
+                None => mod_folder.clone(),
+            };
+            let name = path.rsplit('/').next().unwrap();
+            let file_id = fake.create_bytes(&parent, name, body.as_bytes()).unwrap();
+            files.push(RemoteFileEntry {
+                path: path.to_string(),
+                size: body.len() as u64,
+                sha256: hashing::sha256_bytes(body.as_bytes()),
+                file_id,
+            });
+        }
+        let mut rm = RemoteMod {
+            id: m.id.to_string(),
+            name: format!("Mod {}", m.id),
+            version: m
+                .files
+                .iter()
+                .find(|(p, _)| *p == "metadata.json")
+                .and_then(|(_, body)| crate::vfs::meta_version(serde_json::from_str(body).ok().as_ref())),
+            folder_id: mod_folder,
+            hash: String::new(),
+            addons: m.addons.iter().map(|(n, on)| (n.to_string(), *on)).collect(),
+            files,
+        };
+        rm.hash = remote_hash(&rm);
+        rm
     }
 
     fn set_remote(fake: &FakeDrive, remote: &Remote, manifest: &RemoteManifest) {
@@ -933,5 +1280,360 @@ mod tests {
         assert_eq!(listing(&mods), before);
         assert_eq!(fs::read(mods.join(PACK).join("pack.json")).unwrap(), pack_json);
         assert_eq!(fs::read(mods.join(PACK).join("3311").join(B_PAK)).unwrap(), b"blood-v1");
+    }
+
+    const N_PAK: &str = "pakchunk999-Mods_NewMod_P.pak";
+
+    fn new_mod() -> FixtureMod {
+        FixtureMod { id: "3500", files: vec![(N_PAK, "new-v1"), ("metadata.json", r#"{"name":"New Mod","version":"0.1"}"#)], addons: vec![] }
+    }
+
+    fn update(fake: &FakeDrive, mods: &Path, paks: &Path, active: bool, force: &[&str]) -> Result<UpdateSummary, String> {
+        let force: Vec<String> = force.iter().map(|s| s.to_string()).collect();
+        update_pack(fake, mods, paks, PACK, active, &force, &mut |_| {})
+    }
+
+    // Every file under the pack folder with its sha256
+    fn snapshot(pack_dir: &Path) -> BTreeMap<String, String> {
+        hashing::list_mod_files(pack_dir)
+            .unwrap()
+            .into_iter()
+            .map(|(rel, full, _)| (rel, hashing::sha256_file(&full).unwrap()))
+            .collect()
+    }
+
+    // Paks entries starting with a prefix, with the content each one reads as
+    fn links(paks: &Path, prefix: &str) -> BTreeMap<String, Vec<u8>> {
+        fs::read_dir(paks)
+            .unwrap()
+            .map(|e| e.unwrap())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(prefix))
+            .map(|e| (e.file_name().to_string_lossy().into_owned(), fs::read(e.path()).unwrap()))
+            .collect()
+    }
+
+    fn no_staging(mods: &Path) -> bool {
+        !fs::read_dir(mods).unwrap().any(|e| e.unwrap().file_name().to_string_lossy().starts_with(".import-"))
+    }
+
+    #[cfg(unix)]
+    fn inode(path: &Path) -> u64 {
+        std::os::unix::fs::MetadataExt::ino(&fs::metadata(path).unwrap())
+    }
+
+    #[test]
+    fn update_downloads_only_changes() {
+        let fake = FakeDrive::new();
+        let mut mods_spec = base_mods();
+        mods_spec[1].files.push(("thumbnail.jpg", "thumb"));
+        let remote = remote_fixture(&fake, &mods_spec);
+        let (mods, paks) = (scratch("sub-update"), scratch("sub-update-paks"));
+        add(&fake, &remote, &mods, &paks).unwrap();
+        let pack_dir = mods.join(PACK);
+        let kept = [pack_dir.join("3063").join(A_PAK), pack_dir.join("3311/addons").join(W_PAK)];
+        #[cfg(unix)]
+        let inodes: Vec<u64> = kept.iter().map(|p| inode(p)).collect();
+        let meta_3063 = fs::read(pack_dir.join("3063/metadata.json")).unwrap();
+
+        let (mut next, _) = bump(&fake, &remote);
+        next.mods.push(fixture_mod(&fake, &remote.folder, &new_mod()));
+        set_remote(&fake, &remote, &next);
+        let before = fake.downloads();
+        let summary = update(&fake, &mods, &paks, false, &[]).unwrap();
+
+        // the blood pak, both meta files of 3311 and the two files of the new mod
+        assert_eq!(fake.downloads() - before, 5);
+        assert_eq!(summary.downloaded, 5);
+        assert_eq!((summary.added, summary.changed), (1, 1));
+        assert!(summary.removed_keys.is_empty() && summary.failed_deletes.is_empty());
+        assert_eq!((summary.pack.pack_id.as_str(), summary.pack.version.as_deref()), (PACK, Some("1.1")));
+        #[cfg(unix)]
+        assert_eq!(kept.iter().map(|p| inode(p)).collect::<Vec<_>>(), inodes);
+        assert_eq!(fs::read(pack_dir.join("3063/metadata.json")).unwrap(), meta_3063);
+        assert_eq!(fs::read(pack_dir.join("3311").join(B_PAK)).unwrap(), b"blood-v2");
+        assert_eq!(fs::read(pack_dir.join("3500").join(N_PAK)).unwrap(), b"new-v1");
+
+        let man = packs::read_manifest(&pack_dir).unwrap();
+        assert_eq!(man.version.as_deref(), Some("1.1"));
+        assert_eq!(man.mod_ids, ["3063", "3311", "3500"]);
+        assert_eq!(man.source.unwrap().folder_id, remote.folder);
+        assert!(man.published.is_none());
+        for m in &next.mods {
+            assert_eq!(man.installed_hashes[&m.id].hash, m.hash);
+        }
+        assert_eq!(hashing::addon_states(&pack_dir.join("3311")), BTreeMap::from([(W_PAK.to_string(), true)]));
+        assert!(verify_pack(&pack_dir).unwrap().is_empty());
+        assert!(no_staging(&mods));
+    }
+
+    // Pack-A is a local pack, active and linked. The linked pack has 3063 on and 3311 off.
+    fn two_packs(name: &str) -> (FakeDrive, Remote, PathBuf, PathBuf) {
+        let fake = FakeDrive::new();
+        let remote = remote_fixture(&fake, &base_mods());
+        let (mods, paks) = (scratch(name), scratch(&format!("{}-paks", name)));
+        let a = mods.join("Pack-A");
+        fs::create_dir_all(a.join("1001")).unwrap();
+        fs::write(a.join("1001/a.pak"), b"a").unwrap();
+        packs::write_manifest(&a, &packs::PackManifest { pack_id: "Pack-A".into(), name: "A".into(), mod_ids: vec!["1001".into()], ..Default::default() }).unwrap();
+        crate::vfs::enable_key(&mods, &paks, "Pack-A/1001").unwrap();
+        add(&fake, &remote, &mods, &paks).unwrap();
+        crate::vfs::enable_key(&mods, &paks, &format!("{}/3063", PACK)).unwrap();
+        let mut next = remote.manifest.clone();
+        next.version = "1.1".into();
+        next.mods.push(fixture_mod(&fake, &remote.folder, &new_mod()));
+        set_remote(&fake, &remote, &next);
+        (fake, remote, mods, paks)
+    }
+
+    fn check_setup(mods: &Path, paks: &Path, a_links: &BTreeMap<String, Vec<u8>>, new_on: bool) {
+        let pack_dir = mods.join(PACK);
+        assert_eq!(&links(paks, "Pack-A.1001_"), a_links);
+        assert!(crate::vfs::flag_enabled(&mods.join("Pack-A/1001")));
+        assert_eq!(links(paks, &format!("{}.3063_", PACK)), BTreeMap::from([(format!("{}.3063_{}", PACK, A_PAK), b"vests-v1".to_vec())]));
+        assert!(crate::vfs::flag_enabled(&pack_dir.join("3063")));
+        assert!(links(paks, &format!("{}.3311_", PACK)).is_empty());
+        assert!(!crate::vfs::flag_enabled(&pack_dir.join("3311")));
+        let added = links(paks, &format!("{}.3500_", PACK));
+        if new_on {
+            assert_eq!(added, BTreeMap::from([(format!("{}.3500_{}", PACK, N_PAK), b"new-v1".to_vec())]));
+        } else {
+            assert!(added.is_empty());
+        }
+        assert_eq!(crate::vfs::flag_enabled(&pack_dir.join("3500")), new_on);
+        assert!(no_staging(mods));
+    }
+
+    #[test]
+    fn update_inactive_pack_keeps_setup() {
+        let (fake, _remote, mods, paks) = two_packs("sub-inactive");
+        let a_links = links(&paks, "Pack-A.1001_");
+        assert_eq!(a_links.len(), 1);
+        let summary = update(&fake, &mods, &paks, false, &[]).unwrap();
+        assert_eq!((summary.added, summary.changed, summary.downloaded), (1, 0, 2));
+        check_setup(&mods, &paks, &a_links, false);
+    }
+
+    #[test]
+    fn update_active_pack_enables_added() {
+        let (fake, _remote, mods, paks) = two_packs("sub-active");
+        let a_links = links(&paks, "Pack-A.1001_");
+        update(&fake, &mods, &paks, true, &[]).unwrap();
+        check_setup(&mods, &paks, &a_links, true);
+    }
+
+    #[test]
+    fn update_relinks_changed_pak_in_enabled_mod() {
+        let fake = FakeDrive::new();
+        let remote = remote_fixture(&fake, &base_mods());
+        let (mods, paks) = (scratch("sub-relink"), scratch("sub-relink-paks"));
+        add(&fake, &remote, &mods, &paks).unwrap();
+        crate::vfs::enable_key(&mods, &paks, &format!("{}/3311", PACK)).unwrap();
+        let prefix = format!("{}.3311_", PACK);
+        let before = links(&paks, &prefix);
+        assert_eq!(before.len(), 2);
+        bump(&fake, &remote);
+        update(&fake, &mods, &paks, true, &[]).unwrap();
+
+        let after = links(&paks, &prefix);
+        assert_eq!(after.keys().collect::<Vec<_>>(), before.keys().collect::<Vec<_>>());
+        assert_eq!(after[&format!("{}{}", prefix, B_PAK)], b"blood-v2");
+        assert_eq!(after[&format!("{}addon_{}", prefix, W_PAK)], b"wound");
+        // no entry in Paks is left pointing at a file that is gone
+        for e in fs::read_dir(&paks).unwrap() {
+            assert!(fs::metadata(e.unwrap().path()).is_ok());
+        }
+        #[cfg(unix)]
+        assert_eq!(fs::read_link(paks.join(format!("{}{}", prefix, B_PAK))).unwrap(), mods.join(PACK).join("3311").join(B_PAK));
+        assert!(crate::vfs::flag_enabled(&mods.join(PACK).join("3311")));
+    }
+
+    #[test]
+    fn failed_download_restores_pack() {
+        let fake = FakeDrive::new();
+        let remote = remote_fixture(&fake, &base_mods());
+        let (mods, paks) = (scratch("sub-update-corrupt"), scratch("sub-update-corrupt-paks"));
+        add(&fake, &remote, &mods, &paks).unwrap();
+        let pack_dir = mods.join(PACK);
+        let before = snapshot(&pack_dir);
+        let (mut next, changed) = bump(&fake, &remote);
+        next.mods.push(fixture_mod(&fake, &remote.folder, &new_mod()));
+        set_remote(&fake, &remote, &next);
+        fake.corrupt(&changed);
+        let err = update(&fake, &mods, &paks, false, &[]).unwrap_err();
+        assert_eq!(err, format!("A download from {} was corrupted ({}). Nothing was changed.", NAME, B_PAK));
+        assert_eq!(snapshot(&pack_dir), before);
+        assert!(no_staging(&mods));
+    }
+
+    // Makes a folder read only. False when that does not stop writes, as when running as root.
+    #[cfg(unix)]
+    fn lock_dir(dir: &Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let probe = dir.join(".probe");
+        if fs::write(&probe, b"").is_ok() {
+            let _ = fs::remove_file(&probe);
+            unlock_dir(dir);
+            return false;
+        }
+        true
+    }
+
+    #[cfg(unix)]
+    fn unlock_dir(dir: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_assemble_moves_everything_back() {
+        let fake = FakeDrive::new();
+        let remote = remote_fixture(&fake, &base_mods());
+        let (mods, paks) = (scratch("sub-update-assemble"), scratch("sub-update-assemble-paks"));
+        add(&fake, &remote, &mods, &paks).unwrap();
+        crate::vfs::enable_key(&mods, &paks, &format!("{}/3063", PACK)).unwrap();
+        crate::vfs::enable_key(&mods, &paks, &format!("{}/3311", PACK)).unwrap();
+        let pack_dir = mods.join(PACK);
+        let before = snapshot(&pack_dir);
+        let linked = links(&paks, &format!("{}.", PACK));
+        bump(&fake, &remote);
+        // 3063 moves across whole first, then the carried addon of 3311 cannot leave its folder
+        let addons = pack_dir.join("3311/addons");
+        if !lock_dir(&addons) {
+            return;
+        }
+        let result = update(&fake, &mods, &paks, true, &[]);
+        unlock_dir(&addons);
+        let err = result.unwrap_err();
+        assert!(err.starts_with(&format!("Failed to move {}", addons.join(W_PAK).display())), "{err}");
+        assert_eq!(snapshot(&pack_dir), before);
+        assert_eq!(links(&paks, &format!("{}.", PACK)), linked);
+        assert!(no_staging(&mods));
+    }
+
+    #[test]
+    fn link_failure_after_swap_still_returns_the_summary() {
+        let (fake, _remote, mods, paks) = two_packs("sub-not-enabled");
+        // a folder where the new mod's links go cannot be cleared by enable_key
+        let blocker = paks.join(format!("{}.3500_blocker", PACK));
+        fs::create_dir_all(&blocker).unwrap();
+        let summary = update(&fake, &mods, &paks, true, &[]).unwrap();
+        assert_eq!(summary.added, 1);
+        assert_eq!(summary.not_enabled.len(), 1);
+        assert!(summary.not_enabled[0].starts_with(&format!("{}/3500: ", PACK)), "{:?}", summary.not_enabled);
+        assert!(!crate::vfs::flag_enabled(&mods.join(PACK).join("3500")));
+        assert!(mods.join(PACK).join("3500").join(N_PAK).is_file());
+        assert!(crate::vfs::flag_enabled(&mods.join(PACK).join("3063")));
+        assert!(no_staging(&mods));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_swap_moves_everything_back() {
+        let fake = FakeDrive::new();
+        let remote = remote_fixture(&fake, &base_mods());
+        let (mods, paks) = (scratch("sub-update-swap"), scratch("sub-update-swap-paks"));
+        add(&fake, &remote, &mods, &paks).unwrap();
+        crate::vfs::enable_key(&mods, &paks, &format!("{}/3311", PACK)).unwrap();
+        let pack_dir = mods.join(PACK);
+        let before = snapshot(&pack_dir);
+        let linked = links(&paks, &format!("{}.", PACK));
+        bump(&fake, &remote);
+        // the old links cannot be removed, so the swap rolls back
+        if !lock_dir(&paks) {
+            return;
+        }
+        let result = update(&fake, &mods, &paks, false, &[]);
+        unlock_dir(&paks);
+        assert_eq!(result.unwrap_err(), "Close Ready or Not and try again");
+        assert_eq!(snapshot(&pack_dir), before);
+        assert_eq!(links(&paks, &format!("{}.", PACK)), linked);
+        assert!(no_staging(&mods));
+    }
+
+    #[test]
+    fn verify_finds_tampered_mod_and_redownload_restores_it() {
+        let fake = FakeDrive::new();
+        let remote = remote_fixture(&fake, &base_mods());
+        let (mods, paks) = (scratch("sub-verify"), scratch("sub-verify-paks"));
+        add(&fake, &remote, &mods, &paks).unwrap();
+        let pack_dir = mods.join(PACK);
+        assert!(verify_pack(&pack_dir).unwrap().is_empty());
+        fs::write(pack_dir.join("3311").join(B_PAK), b"tampered").unwrap();
+        assert_eq!(verify_pack(&pack_dir).unwrap(), ["3311"]);
+
+        let before = fake.downloads();
+        let summary = update(&fake, &mods, &paks, false, &["3311"]).unwrap();
+        assert_eq!(fake.downloads() - before, remote.manifest.mods[1].files.len());
+        assert_eq!((summary.changed, summary.added), (1, 0));
+        assert!(verify_pack(&pack_dir).unwrap().is_empty());
+        assert_eq!(fs::read(pack_dir.join("3311").join(B_PAK)).unwrap(), b"blood-v1");
+    }
+
+    #[test]
+    fn verify_reports_extra_missing_and_unrecorded() {
+        let fake = FakeDrive::new();
+        let remote = remote_fixture(&fake, &base_mods());
+        let mods = scratch("sub-verify-cases");
+        add(&fake, &remote, &mods, &mods.join("paks")).unwrap();
+        let pack_dir = mods.join(PACK);
+        // a meta file edit is not tampering
+        crate::vfs::set_enabled_flag(&pack_dir.join("3063"), true);
+        assert!(verify_pack(&pack_dir).unwrap().is_empty());
+        fs::write(pack_dir.join("3063/extra.pak"), b"x").unwrap();
+        fs::remove_file(pack_dir.join("3311/addons").join(W_PAK)).unwrap();
+        assert_eq!(verify_pack(&pack_dir).unwrap(), ["3063", "3311"]);
+
+        let fake2 = FakeDrive::new();
+        let remote2 = remote_fixture(&fake2, &base_mods());
+        let mods2 = scratch("sub-verify-norecord");
+        add(&fake2, &remote2, &mods2, &mods2.join("paks")).unwrap();
+        let mut man = packs::read_manifest(&mods2.join(PACK)).unwrap();
+        man.installed_hashes.remove("3063");
+        packs::write_manifest(&mods2.join(PACK), &man).unwrap();
+        assert_eq!(verify_pack(&mods2.join(PACK)).unwrap(), ["3063"]);
+    }
+
+    #[test]
+    fn update_drops_removed_mods_and_unlisted_files() {
+        let fake = FakeDrive::new();
+        let remote = remote_fixture(&fake, &base_mods());
+        let (mods, paks) = (scratch("sub-update-drop"), scratch("sub-update-drop-paks"));
+        add(&fake, &remote, &mods, &paks).unwrap();
+        let pack_dir = mods.join(PACK);
+        fs::write(pack_dir.join("3063/extra.pak"), b"x").unwrap();
+        fs::write(pack_dir.join("3311/stray.pak"), b"y").unwrap();
+        crate::vfs::enable_key(&mods, &paks, &format!("{}/3063", PACK)).unwrap();
+        let gone = format!("{}.3063_", PACK);
+        assert_eq!(links(&paks, &gone).len(), 2);
+        let (mut next, _) = bump(&fake, &remote);
+        next.mods.remove(0);
+        set_remote(&fake, &remote, &next);
+        let summary = update(&fake, &mods, &paks, true, &[]).unwrap();
+        assert_eq!(summary.removed_keys, [format!("{}/3063", PACK)]);
+        assert!(fs::read_dir(&paks).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().starts_with(&gone)));
+        assert!(!pack_dir.join("3063").exists());
+        assert!(!pack_dir.join("3311/stray.pak").exists());
+        assert_eq!(packs::read_manifest(&pack_dir).unwrap().mod_ids, ["3311"]);
+        assert!(no_staging(&mods));
+    }
+
+    #[test]
+    fn update_refuses_unknown_and_unlinked_packs() {
+        let fake = FakeDrive::new();
+        let remote = remote_fixture(&fake, &base_mods());
+        let mods = scratch("sub-update-refuse");
+        let paks = mods.join("paks");
+        let noop = |id: &str| update_pack(&fake, &mods, &paks, id, false, &[], &mut |_| {}).unwrap_err();
+        assert_eq!(noop("../x"), "No modpack folder for \"../x\"");
+        assert_eq!(noop(PACK), format!("No modpack folder for {:?}", PACK));
+        add(&fake, &remote, &mods, &paks).unwrap();
+        let mut man = packs::read_manifest(&mods.join(PACK)).unwrap();
+        man.source = None;
+        packs::write_manifest(&mods.join(PACK), &man).unwrap();
+        let downloads = fake.downloads();
+        assert_eq!(noop(PACK), "Casual Shitters is not linked to a Drive folder");
+        assert_eq!(fake.downloads(), downloads);
     }
 }
