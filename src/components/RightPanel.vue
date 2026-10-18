@@ -35,9 +35,9 @@ async function toggleActiveMod() {
 }
 
 async function downloadOnlineMod() {
-  if (!store.selectedMod) return;
+  if (!store.selectedMod || store.selectedMod.nexus_mod_id == null) return;
   
-  const url = `https://www.nexusmods.com/readyornot/mods/${store.selectedMod.id}?tab=files`;
+  const url = `https://www.nexusmods.com/readyornot/mods/${store.selectedMod.nexus_mod_id}?tab=files`;
   
   try {
     await invoke("open_browser_url", { url });
@@ -107,7 +107,7 @@ const cleanDescription = computed(() => {
   <aside class="right-panel" v-if="store.selectedMod">
     <div class="panel-header">
       <h2>{{ store.selectedMod.name }}</h2>
-      <a href="#" class="external-link" title="View on Nexus Mods" @click.prevent="invoke('open_browser_url', { url: `https://www.nexusmods.com/readyornot/mods/${store.selectedMod.id}` })">
+      <a v-if="store.selectedMod.nexus_mod_id != null" href="#" class="external-link" title="View on Nexus Mods" @click.prevent="invoke('open_browser_url', { url: `https://www.nexusmods.com/readyornot/mods/${store.selectedMod.nexus_mod_id}` })">
         <ExternalLink :size="18" color="#3b82f6" />
       </a>
     </div>

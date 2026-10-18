@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use serde::{Serialize, Deserialize};
 use tauri::{AppHandle, Manager};
 use serde_json::Value;
+use crate::packs::{read_manifest, resolve_for_delete, resolve_key, parse_key, KeyKind, PackRef};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AddonInfo {
@@ -23,6 +24,7 @@ pub struct ModInfo {
     pub thumbnail_url: Option<String>,
     pub enabled: bool,
     pub addons: Vec<AddonInfo>,
+    pub pack: Option<PackRef>,
 }
 
 pub fn get_mods_dir(app_handle: &AppHandle) -> Result<PathBuf, String> {
@@ -46,102 +48,128 @@ pub fn get_mods_dir(app_handle: &AppHandle) -> Result<PathBuf, String> {
     Ok(base_dir)
 }
 
-#[tauri::command]
-pub async fn scan_local_mods(app_handle: tauri::AppHandle) -> Result<Vec<ModInfo>, String> {
-    let mods_dir = get_mods_dir(&app_handle)?;
-    let mut mods = Vec::new();
+fn read_mod(dir: &Path, key: String, pack: Option<PackRef>) -> ModInfo {
+    let metadata_path = dir.join("metadata.json");
+    
+    let folder = dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let mut info = ModInfo {
+        id: key.clone(),
+        name: folder.clone(),
+        description: "No metadata found.".to_string(),
+        version: "1.0.0".to_string(),
+        latest_version: None,
+        update_available: false,
+        nexus_mod_id: folder.parse::<u32>().ok(),
+        author: "Unknown".to_string(),
+        thumbnail_url: None,
+        enabled: false,
+        addons: Vec::new(),
+        pack,
+    };
 
-    if let Ok(entries) = fs::read_dir(mods_dir) {
-        for entry in entries.filter_map(Result::ok) {
-            let path = entry.path();
+    if let Ok(content) = fs::read_to_string(&metadata_path) {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(name) = parsed.get("name").and_then(|n| n.as_str()) {
+                info.name = name.to_string();
+            }
+            if let Some(desc) = parsed.get("summary").or_else(|| parsed.get("description")).and_then(|d| d.as_str()) {
+                info.description = desc.to_string();
+            }
+            if let Some(author) = parsed.get("author").and_then(|a| a.as_str()) {
+                info.author = author.to_string();
+            }
+            if let Some(version) = parsed.get("version")
+                .or_else(|| parsed.get("version"))
+                .and_then(|v| v.as_str()) {
+                info.version = version.to_string();
+            }
+            if let Some(update_available) = parsed.get("update_available").and_then(|v| v.as_bool()) {
+                info.update_available = update_available;
+            }
+            if let Some(mod_id) = parsed.get("mod_id").and_then(|v| v.as_u64()) {
+                info.nexus_mod_id = Some(mod_id as u32);
+            }
             
-            if path.is_dir() {
-                let id = entry.file_name().to_string_lossy().to_string();
-                let metadata_path = path.join("metadata.json");
-                
-                let mut info = ModInfo {
-                    id: id.clone(),
-                    name: id.clone(),
-                    description: "No metadata found.".to_string(),
-                    version: "1.0.0".to_string(),
-                    latest_version: None,
-                    update_available: false,
-                    nexus_mod_id: id.parse::<u32>().ok(),
-                    author: "Unknown".to_string(),
-                    thumbnail_url: None,
-                    enabled: false,
-                    addons: Vec::new(),
-                };
+            let thumb_path = dir.join("thumbnail.jpg");
+            if let Ok(bytes) = std::fs::read(&thumb_path) {
+                use base64::prelude::*;
+                let b64 = BASE64_STANDARD.encode(&bytes);
+                info.thumbnail_url = Some(format!("data:image/jpeg;base64,{}", b64));
+            } else if let Some(pic) = parsed.get("picture_url").and_then(|p| p.as_str()) {
+                info.thumbnail_url = Some(pic.to_string());
+            }
 
-                if let Ok(content) = fs::read_to_string(&metadata_path) {
-                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content) {
-                        if let Some(name) = parsed.get("name").and_then(|n| n.as_str()) {
-                            info.name = name.to_string();
-                        }
-                        if let Some(desc) = parsed.get("summary").or_else(|| parsed.get("description")).and_then(|d| d.as_str()) {
-                            info.description = desc.to_string();
-                        }
-                        if let Some(author) = parsed.get("author").and_then(|a| a.as_str()) {
-                            info.author = author.to_string();
-                        }
-                        if let Some(version) = parsed.get("version")
-                            .or_else(|| parsed.get("version"))
-                            .and_then(|v| v.as_str()) {
-                            info.version = version.to_string();
-                        }
-                        if let Some(update_available) = parsed.get("update_available").and_then(|v| v.as_bool()) {
-                            info.update_available = update_available;
-                        }
-                        if let Some(mod_id) = parsed.get("mod_id").and_then(|v| v.as_u64()) {
-                            info.nexus_mod_id = Some(mod_id as u32);
-                        }
-                        
-                        let thumb_path = path.join("thumbnail.jpg");
-                        if let Ok(bytes) = std::fs::read(&thumb_path) {
-                            use base64::prelude::*;
-                            let b64 = BASE64_STANDARD.encode(&bytes);
-                            info.thumbnail_url = Some(format!("data:image/jpeg;base64,{}", b64));
-                        } else if let Some(pic) = parsed.get("picture_url").and_then(|p| p.as_str()) {
-                            info.thumbnail_url = Some(pic.to_string());
-                        }
-
-                        if let Some(enabled) = parsed.get("enabled").and_then(|e| e.as_bool()) {
-                            info.enabled = enabled;
-                        }
-                    }
-                }
-                
-                let addons_dir = path.join("addons");
-                if addons_dir.exists() && addons_dir.is_dir() {
-                    if let Ok(addon_entries) = fs::read_dir(&addons_dir) {
-                        for addon_entry in addon_entries.filter_map(Result::ok) {
-                            let ap = addon_entry.path();
-                            if ap.is_file() {
-                                let ext = ap.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-                                if ext == "pak" {
-                                    let filename = ap.file_name().unwrap().to_string_lossy().to_string();
-                                    let addon_enabled = if let Ok(content) = fs::read_to_string(&metadata_path) {
-                                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content) {
-                                            parsed.get("addons")
-                                                .and_then(|a| a.get(&filename))
-                                                .and_then(|a| a.get("enabled"))
-                                                .and_then(|e| e.as_bool())
-                                                .unwrap_or(false)
-                                        } else { false }
-                                    } else { false };
-                                    info.addons.push(AddonInfo { filename, enabled: addon_enabled });
-                                }
-                            }
-                        }
-                    }
-                }
-                
-                mods.push(info);
+            if let Some(enabled) = parsed.get("enabled").and_then(|e| e.as_bool()) {
+                info.enabled = enabled;
             }
         }
     }
     
-    Ok(mods)
+    let addons_dir = dir.join("addons");
+    if addons_dir.exists() && addons_dir.is_dir() {
+        if let Ok(addon_entries) = fs::read_dir(&addons_dir) {
+            for addon_entry in addon_entries.filter_map(Result::ok) {
+                let ap = addon_entry.path();
+                if ap.is_file() {
+                    let ext = ap.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+                    if ext == "pak" {
+                        let filename = ap.file_name().unwrap().to_string_lossy().to_string();
+                        let addon_enabled = if let Ok(content) = fs::read_to_string(&metadata_path) {
+                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content) {
+                                parsed.get("addons")
+                                    .and_then(|a| a.get(&filename))
+                                    .and_then(|a| a.get("enabled"))
+                                    .and_then(|e| e.as_bool())
+                                    .unwrap_or(false)
+                            } else { false }
+                        } else { false };
+                        info.addons.push(AddonInfo { filename, enabled: addon_enabled });
+                    }
+                }
+            }
+        }
+    }
+
+    info
+}
+
+fn scan_dir(mods_dir: &Path) -> Vec<ModInfo> {
+    let mut mods = Vec::new();
+    let Ok(entries) = fs::read_dir(mods_dir) else {
+        return mods;
+    };
+
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !path.is_dir() || name.starts_with('.') {
+            continue;
+        }
+
+        if let Some(manifest) = read_manifest(&path) {
+            let pack = PackRef { pack_id: name.clone(), name: manifest.name, version: manifest.version };
+            let Ok(children) = fs::read_dir(&path) else {
+                continue;
+            };
+            for child in children.filter_map(Result::ok) {
+                let child_path = child.path();
+                let child_name = child.file_name().to_string_lossy().to_string();
+                if child_path.is_dir() && !child_name.starts_with('.') {
+                    mods.push(read_mod(&child_path, format!("{}/{}", name, child_name), Some(pack.clone())));
+                }
+            }
+        } else {
+            mods.push(read_mod(&path, name, None));
+        }
+    }
+
+    mods
+}
+
+#[tauri::command]
+pub async fn scan_local_mods(app_handle: tauri::AppHandle) -> Result<Vec<ModInfo>, String> {
+    let mods_dir = get_mods_dir(&app_handle)?;
+    Ok(scan_dir(&mods_dir))
 }
 
 #[tauri::command]
@@ -257,7 +285,10 @@ fn extract_rar(archive: &Path, dest: &Path) -> Result<(), String> {
 #[tauri::command]
 pub async fn install_mod_archive(app_handle: tauri::AppHandle, archive_path: String, mod_id: String) -> Result<(), String> {
     let mods_dir = get_mods_dir(&app_handle)?;
-    let target_dir = mods_dir.join(&mod_id);
+    if !matches!(parse_key(&mod_id)?, KeyKind::Loose(_)) {
+        return Err(format!("Archives can only be installed to a loose mod, not {}", mod_id));
+    }
+    let target_dir = resolve_key(&mods_dir, &mod_id)?;
     
     if target_dir.exists() {
         std::fs::remove_dir_all(&target_dir).ok();
@@ -375,7 +406,7 @@ fn addon_files(addons_dir: &Path, pak_filename: &str) -> Vec<PathBuf> {
 #[tauri::command]
 pub async fn toggle_mod(app_handle: tauri::AppHandle, mod_id: String, enable: bool) -> Result<(), String> {
     let mods_dir = get_mods_dir(&app_handle)?;
-    let target_dir = mods_dir.join(&mod_id);
+    let target_dir = resolve_key(&mods_dir, &mod_id)?;
     
     let config = crate::config::load_config(app_handle.clone()).map_err(|e| e.to_string())?;
     let game_path_str = config.game_path.ok_or("Game installation path is not set! Please configure it in the Settings tab.")?;
@@ -479,7 +510,7 @@ pub async fn delete_mod(app_handle: tauri::AppHandle, mod_id: String) -> Result<
     let _ = toggle_mod(app_handle.clone(), mod_id.clone(), false).await;
     
     let mods_dir = get_mods_dir(&app_handle)?;
-    let target_dir = mods_dir.join(&mod_id);
+    let target_dir = resolve_for_delete(&mods_dir, &mod_id)?;
     
     if target_dir.exists() {
         std::fs::remove_dir_all(&target_dir).map_err(|e| format!("Failed to obliterate mod directory: {}", e))?;
@@ -670,7 +701,7 @@ pub async fn toggle_all_mods(app_handle: tauri::AppHandle, enable: bool) -> Resu
 #[tauri::command]
 pub async fn install_addon(app_handle: tauri::AppHandle, mod_id: String, archive_path: String) -> Result<Vec<String>, String> {
     let mods_dir = get_mods_dir(&app_handle)?;
-    let mod_dir = mods_dir.join(&mod_id);
+    let mod_dir = resolve_key(&mods_dir, &mod_id)?;
     let addons_dir = mod_dir.join("addons");
     std::fs::create_dir_all(&addons_dir).map_err(|e| format!("Failed to create addons directory: {}", e))?;
     
@@ -765,7 +796,7 @@ fn get_paks_dir(app_handle: &tauri::AppHandle) -> Result<PathBuf, String> {
 #[tauri::command]
 pub async fn toggle_addon(app_handle: tauri::AppHandle, mod_id: String, filename: String, enable: bool) -> Result<(), String> {
     let mods_dir = get_mods_dir(&app_handle)?;
-    let mod_dir = mods_dir.join(&mod_id);
+    let mod_dir = resolve_key(&mods_dir, &mod_id)?;
     let addon_path = mod_dir.join("addons").join(&filename);
     
     if !addon_path.exists() {
@@ -819,9 +850,10 @@ pub async fn remove_addon(app_handle: tauri::AppHandle, mod_id: String, filename
     let _ = toggle_addon(app_handle.clone(), mod_id.clone(), filename.clone(), false).await;
     
     let mods_dir = get_mods_dir(&app_handle)?;
-    delete_addon_files(&mods_dir.join(&mod_id).join("addons"), &filename)?;
+    let mod_dir = resolve_key(&mods_dir, &mod_id)?;
+    delete_addon_files(&mod_dir.join("addons"), &filename)?;
     
-    let metadata_path = mods_dir.join(&mod_id).join("metadata.json");
+    let metadata_path = mod_dir.join("metadata.json");
     if let Ok(content) = std::fs::read_to_string(&metadata_path) {
         if let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(&content) {
             if let Some(addons_obj) = parsed.get_mut("addons").and_then(|a| a.as_object_mut()) {
@@ -898,5 +930,25 @@ mod tests {
         assert!(!a.join("x.ucas").exists());
         assert!(!a.join("x.utoc").exists());
         assert!(a.join("y.ucas").exists());
+    }
+
+    #[test]
+    fn scan_dir_reads_loose_mods_and_packs_and_skips_staging() {
+        use crate::packs::{write_manifest, PackManifest};
+        let m = scratch("scan");
+        fs::create_dir_all(m.join("5543")).unwrap();
+        fs::create_dir_all(m.join("notes")).unwrap();
+        fs::create_dir_all(m.join(".import-x/Casual-Shitters/1")).unwrap();
+        fs::create_dir_all(m.join("Casual-Shitters/3063")).unwrap();
+        write_manifest(&m.join("Casual-Shitters"), &PackManifest {
+            pack_id: "Casual-Shitters".into(), name: "Casual Shitters".into(),
+            version: Some("1.5".into()), mod_ids: vec!["3063".into()], imported_at: 0 }).unwrap();
+        let mut keys: Vec<_> = scan_dir(&m).into_iter().map(|i| (i.id, i.pack.map(|p| p.pack_id))).collect();
+        keys.sort();
+        assert_eq!(keys, [
+            ("5543".to_string(), None),
+            ("Casual-Shitters/3063".to_string(), Some("Casual-Shitters".to_string())),
+            ("notes".to_string(), None),
+        ]);
     }
 }

@@ -1,5 +1,6 @@
 mod api;
 mod config;
+mod packs;
 mod sso;
 mod updater;
 mod vfs;
