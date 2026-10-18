@@ -331,6 +331,47 @@ fn create_link(src: &Path, dst: &Path) -> std::io::Result<()> {
     std::fs::hard_link(src, dst).or_else(|_| std::fs::copy(src, dst).map(|_| ()))
 }
 
+fn is_deployable(path: &Path) -> bool {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    matches!(ext.as_str(), "pak" | "ucas" | "utoc")
+}
+
+fn collect_deployables(mod_dir: &Path) -> Vec<PathBuf> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.filter_map(Result::ok) {
+                let path = entry.path();
+                if path.is_dir() {
+                    if path.file_name().and_then(|n| n.to_str()) != Some("addons") {
+                        walk(&path, out);
+                    }
+                } else if path.is_file() && is_deployable(&path) {
+                    out.push(path);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(mod_dir, &mut out);
+    out.sort();
+    out
+}
+
+fn addon_files(addons_dir: &Path, pak_filename: &str) -> Vec<PathBuf> {
+    let pak = addons_dir.join(pak_filename);
+    let mut out = vec![pak.clone()];
+    if let Ok(entries) = std::fs::read_dir(addons_dir) {
+        for p in entries.filter_map(Result::ok).map(|e| e.path()) {
+            let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+            if p.is_file() && p != pak && (ext == "ucas" || ext == "utoc") && p.file_stem() == pak.file_stem() {
+                out.push(p);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
 #[tauri::command]
 pub async fn toggle_mod(app_handle: tauri::AppHandle, mod_id: String, enable: bool) -> Result<(), String> {
     let mods_dir = get_mods_dir(&app_handle)?;
@@ -351,27 +392,7 @@ pub async fn toggle_mod(app_handle: tauri::AppHandle, mod_id: String, enable: bo
         std::fs::create_dir_all(&paks_mod_dir).map_err(|e| format!("Failed to create Paks directory: {}", e))?;
     }
     
-    fn find_paks(dir: &Path, paks: &mut Vec<PathBuf>) {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.filter_map(Result::ok) {
-                let path = entry.path();
-                if path.is_dir() {
-                    if path.file_name().and_then(|n| n.to_str()) == Some("addons") {
-                        continue;
-                    }
-                    find_paks(&path, paks);
-                } else if path.is_file() {
-                    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-                    if ext == "pak" {
-                        paks.push(path);
-                    }
-                }
-            }
-        }
-    }
-
-    let mut paks = Vec::new();
-    find_paks(&target_dir, &mut paks);
+    let paks = collect_deployables(&target_dir);
 
     for path in paks {
         let file_name = path.file_name().unwrap();
@@ -410,15 +431,8 @@ pub async fn toggle_mod(app_handle: tauri::AppHandle, mod_id: String, enable: bo
                     let ext = ap.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
                     if ext == "pak" {
                         let fname = ap.file_name().unwrap().to_string_lossy().to_string();
-                        let link_name = format!("{}_addon_{}", mod_id, fname);
-                        let link_path = paks_mod_dir.join(&link_name);
-                        
-                        if !enable {
-                            if link_path.exists() {
-                                std::fs::remove_file(&link_path).ok();
-                            }
-                        } else {
-                            let addon_enabled = if let Ok(content) = std::fs::read_to_string(&metadata_path) {
+                        let addon_enabled = enable && {
+                            if let Ok(content) = std::fs::read_to_string(&metadata_path) {
                                 if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content) {
                                     parsed.get("addons")
                                         .and_then(|a| a.get(&fname))
@@ -426,10 +440,18 @@ pub async fn toggle_mod(app_handle: tauri::AppHandle, mod_id: String, enable: bo
                                         .and_then(|e| e.as_bool())
                                         .unwrap_or(false)
                                 } else { false }
-                            } else { false };
-                            
-                            if addon_enabled && !link_path.exists() {
-                                create_link(&ap, &link_path).ok();
+                            } else { false }
+                        };
+
+                        for file in addon_files(&addons_dir, &fname) {
+                            let link_name = format!("{}_addon_{}", mod_id, file.file_name().unwrap().to_string_lossy());
+                            let link_path = paks_mod_dir.join(&link_name);
+                            if !enable {
+                                if link_path.exists() {
+                                    std::fs::remove_file(&link_path).ok();
+                                }
+                            } else if addon_enabled && !link_path.exists() {
+                                create_link(&file, &link_path).ok();
                             }
                         }
                     }
@@ -675,11 +697,13 @@ pub async fn install_addon(app_handle: tauri::AppHandle, mod_id: String, archive
             };
             
             let ext = std::path::Path::new(&fname).extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-            if ext == "pak" {
+            if is_deployable(Path::new(&fname)) {
                 let outpath = addons_dir.join(&fname);
                 let mut outfile = std::fs::File::create(&outpath).map_err(|e| format!("Failed to create addon file: {}", e))?;
                 std::io::copy(&mut file, &mut outfile).map_err(|e| format!("Failed to extract addon: {}", e))?;
-                added_files.push(fname);
+                if ext == "pak" {
+                    added_files.push(fname);
+                }
             }
         }
     } else if extension == "rar" {
@@ -753,15 +777,15 @@ pub async fn toggle_addon(app_handle: tauri::AppHandle, mod_id: String, filename
         std::fs::create_dir_all(&paks_dir).map_err(|e| format!("Failed to create Paks dir: {}", e))?;
     }
     
-    let link_name = format!("{}_addon_{}", mod_id, filename);
-    let link_path = paks_dir.join(&link_name);
-    
-    if enable {
-        if !link_path.exists() {
-            create_link(&addon_path, &link_path).map_err(|e| format!("Failed to inject addon: {}", e))?;
-        }
-    } else {
-        if link_path.exists() {
+    for file in addon_files(&mod_dir.join("addons"), &filename) {
+        let link_name = format!("{}_addon_{}", mod_id, file.file_name().unwrap().to_string_lossy());
+        let link_path = paks_dir.join(&link_name);
+
+        if enable {
+            if !link_path.exists() {
+                create_link(&file, &link_path).map_err(|e| format!("Failed to inject addon: {}", e))?;
+            }
+        } else if link_path.exists() {
             std::fs::remove_file(&link_path).map_err(|e| format!("Failed to remove addon link: {}", e))?;
         }
     }
@@ -836,5 +860,27 @@ mod tests {
         fs::write(&junk, b"not a rar").unwrap();
         let err = extract_rar(&junk, &dir.join("out")).unwrap_err();
         assert!(err.starts_with("Failed to open RAR"), "{err}");
+    }
+
+    #[test]
+    fn collect_deployables_takes_pak_ucas_utoc_and_skips_addons() {
+        let m = scratch("deploy");
+        for f in ["a.pak", "a.ucas", "a.UTOC", "readme.txt", "sub/b.pak", "addons/x.pak"] {
+            let p = m.join(f);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, b"x").unwrap();
+        }
+        let got: Vec<_> = collect_deployables(&m).iter()
+            .map(|p| p.strip_prefix(&m).unwrap().to_string_lossy().replace('\\', "/")).collect();
+        assert_eq!(got, ["a.UTOC", "a.pak", "a.ucas", "sub/b.pak"]);
+    }
+
+    #[test]
+    fn addon_files_pairs_companions_by_stem() {
+        let a = scratch("addon");
+        for f in ["x.pak", "x.ucas", "x.utoc", "y.ucas"] { fs::write(a.join(f), b"x").unwrap(); }
+        let got: Vec<_> = addon_files(&a, "x.pak").iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        assert_eq!(got, ["x.pak", "x.ucas", "x.utoc"]);
     }
 }
