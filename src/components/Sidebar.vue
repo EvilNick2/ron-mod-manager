@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { onMounted } from 'vue';
 import { invoke } from "@tauri-apps/api/core";
-import { store } from "../store";
+import { store, type PackManifest } from "../store";
 import { 
   Package, 
   Globe, 
@@ -10,7 +10,7 @@ import {
   Upload, 
   Save, 
   X,
-  CheckCircle,
+  Check,
   CircleOff,
   Play
 } from 'lucide-vue-next';
@@ -77,18 +77,131 @@ async function exportPreset(name: string) {
   }
 }
 
-async function importPreset() {
+function packLabel(name: string, version: string | null) {
+  return version ? `${name} ${version}` : name;
+}
+
+function nameList(names: string[]) {
+  const shown = names.slice(0, 10).join(", ");
+  return names.length > 10 ? `${shown} and ${names.length - 10} more` : shown;
+}
+
+async function loadPacks() {
   try {
-    const importedName: string = await invoke("import_preset");
-    alert(`Successfully imported preset: ${importedName}`);
-    await loadPresets();
-    
-    await applyPreset(importedName);
-    
-    const refreshed: any[] = await invoke("scan_local_mods");
-    store.mods = refreshed;
+    store.packs = await invoke("load_packs") as PackManifest[];
+  } catch (e) {
+    console.error("Failed to load packs:", e);
+  }
+}
+
+async function refreshMods() {
+  const refreshed: any[] = await invoke("scan_local_mods");
+  store.mods = refreshed;
+  if (store.selectedMod && !refreshed.some((m: any) => m.id === store.selectedMod.id)) {
+    store.selectedMod = null;
+  }
+}
+
+async function applyPackKeys(pack: PackManifest) {
+  const name = `pack:${pack.pack_id}`;
+  const modIds = pack.mod_ids.map((id) => `${pack.pack_id}/${id}`);
+  await invoke("apply_preset", { name, modIds });
+  store.activePresetName = name;
+}
+
+async function applyPack(pack: PackManifest) {
+  try {
+    await applyPackKeys(pack);
+    await refreshMods();
+  } catch (e) {
+    console.error("Failed to apply pack:", e);
+    alert("Failed to apply pack: " + e);
+  }
+}
+
+function showPack(pack: PackManifest) {
+  document.getElementById(`section-${pack.pack_id}`)?.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+async function exportPack(pack: PackManifest) {
+  const version = prompt("Version for this export:", pack.version ?? "");
+  if (version === null) return;
+  try {
+    await invoke("export_preset", { presetName: `pack:${pack.pack_id}`, version: version.trim() || undefined });
+    alert(`Successfully exported modpack: ${pack.name}`);
   } catch (e: any) {
-    if (e !== "Import cancelled") {
+    if (e !== "Export cancelled") {
+      console.error("Failed to export pack:", e);
+      alert("Failed to export pack: " + e);
+    }
+  }
+}
+
+async function removePack(pack: PackManifest) {
+  if (!confirm(`Delete ${packLabel(pack.name, pack.version)} and its ${pack.mod_ids.length} mods from disk?`)) return;
+  try {
+    await invoke("delete_pack", { packId: pack.pack_id });
+    if (store.activePresetName === `pack:${pack.pack_id}`) {
+      store.activePresetName = "";
+    }
+    await loadPacks();
+    await refreshMods();
+  } catch (e) {
+    console.error("Failed to delete pack:", e);
+    alert("Failed to delete pack: " + e);
+  }
+}
+
+async function importPreset() {
+  let imported = "";
+  try {
+    const archivePath: string | null = await invoke("pick_preset_archive");
+    if (!archivePath) return;
+
+    store.packs = await invoke("load_packs") as PackManifest[];
+    const preview: any = await invoke("inspect_preset_archive", { archivePath });
+    const installed = store.packs.find((p) => p.pack_id === preview.pack.pack_id);
+    const name: string = preview.pack.name;
+    const version: string | null = preview.pack.version;
+    const removed: any[] = preview.removed;
+    const superseded: any[] = preview.superseded;
+    const supersededText = `${superseded.length} installed mods are also in this pack and their old copies will be deleted from disk.`;
+
+    let question = "";
+    if (removed.length + superseded.length > 0) {
+      if (installed) {
+        const from = installed.version ? ` from ${installed.version}` : "";
+        const to = version ? ` to ${version}` : "";
+        question = `Update ${name}${from}${to}? ${preview.added.length} mods added, ${preview.changed.length} updated`;
+        question += removed.length > 0
+          ? `, ${removed.length} removed and deleted from disk: ${nameList(removed.map((m: any) => m.name))}.`
+          : ".";
+        if (superseded.length > 0) question += ` ${supersededText}`;
+      } else {
+        question = `Import ${packLabel(name, version)}? ${supersededText}`;
+      }
+    }
+    if (question && !confirm(question)) return;
+
+    const summary: any = await invoke("import_preset", { archivePath });
+    imported = packLabel(summary.pack.name, summary.pack.version);
+
+    await loadPresets();
+    store.packs = await invoke("load_packs") as PackManifest[];
+    const pack = store.packs.find((p) => p.pack_id === summary.pack.pack_id);
+    if (pack) await applyPackKeys(pack);
+    await refreshMods();
+
+    let message = `${imported} installed${pack ? " and active" : ""}.`;
+    if (summary.failed_deletes.length > 0) {
+      message += `\nThese folders could not be deleted: ${summary.failed_deletes.join(", ")}`;
+    }
+    alert(message);
+  } catch (e: any) {
+    if (imported) {
+      console.error("Import follow-up failed:", e);
+      alert(`${imported} was imported, but the next step failed: ${e}`);
+    } else if (e !== "Import cancelled") {
       console.error("Failed to import preset:", e);
       alert("Failed to import preset: " + e);
     }
@@ -126,6 +239,7 @@ async function bulkToggleMods(enable: boolean) {
 
 onMounted(() => {
   loadPresets();
+  loadPacks();
 });
 
 async function fetchOnlineMods() {
@@ -223,9 +337,6 @@ async function launchGame() {
       </div>
       
       <div class="bulk-actions" v-if="store.currentMode === 'Installed'">
-        <button class="bulk-btn" @click="bulkToggleMods(true)">
-          <CheckCircle :size="14" color="#22c55e" /> Enable All
-        </button>
         <button class="bulk-btn" @click="bulkToggleMods(false)">
           <CircleOff :size="14" color="#ef4444" /> Disable All
         </button>
@@ -233,6 +344,33 @@ async function launchGame() {
     </div>
 
     <div class="sidebar-section" v-if="store.currentMode === 'Installed'">
+      <h3 class="section-label">Modpacks</h3>
+      <div class="preset-list" v-if="store.packs.length > 0">
+        <div class="preset-item" v-for="pack in store.packs" :key="pack.pack_id">
+          <button
+            class="preset-apply-btn"
+            :class="{ active: store.activePresetName === `pack:${pack.pack_id}` }"
+            @click="showPack(pack)"
+            :title="`${packLabel(pack.name, pack.version)} (${pack.mod_ids.length} mods)`"
+          >
+            {{ packLabel(pack.name, pack.version) }}
+            <span class="preset-count">{{ pack.mod_ids.length }}</span>
+          </button>
+          <button class="preset-action-btn" @click="applyPack(pack)"
+            title="Apply Modpack"
+          >
+            <Check :size="14" color="#22c55e" />
+          </button>
+          <button class="preset-action-btn" @click="exportPack(pack)" title="Export Modpack to .zip">
+            <Upload :size="14" color="#f59e0b" />
+          </button>
+          <button class="preset-delete-btn preset-action-btn" @click="removePack(pack)" title="Delete Modpack">
+            <X :size="14" color="#ef4444" />
+          </button>
+        </div>
+      </div>
+      <p v-else class="preset-empty">No modpacks imported yet.</p>
+
       <h3 class="section-label">Presets</h3>
       <div class="preset-list" v-if="Object.keys(store.presets).length > 0">
         <div class="preset-item" v-for="(ids, name) in store.presets" :key="name">

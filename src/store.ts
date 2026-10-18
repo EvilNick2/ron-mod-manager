@@ -1,5 +1,13 @@
 import { reactive } from 'vue';
 
+export interface PackManifest {
+  pack_id: string;
+  name: string;
+  version: string | null;
+  mod_ids: string[];
+  imported_at: number;
+}
+
 export const store = reactive({
   apiKeyStore: "",
   currentMode: "Installed",
@@ -31,6 +39,7 @@ export const store = reactive({
   updateError: "" as string,
 
   presets: {} as Record<string, string[]>,
+  packs: [] as PackManifest[],
   installingModPath: null as string | null,
   awaitingDropForId: null as string | null,
   postInstallModId: null as string | null
