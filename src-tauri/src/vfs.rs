@@ -1,5 +1,4 @@
 use std::fs;
-use std::sync::Arc;
 use std::path::{Path, PathBuf};
 use serde::{Serialize, Deserialize};
 use tauri::{AppHandle, Manager};
@@ -239,6 +238,22 @@ pub async fn refresh_installed_mod_updates(app_handle: tauri::AppHandle) -> Resu
     Ok(updated_count)
 }
 
+fn extract_rar(archive: &Path, dest: &Path) -> Result<(), String> {
+    fs::create_dir_all(dest).map_err(|e| format!("Failed to create directory: {}", e))?;
+    let mut open = unrar::Archive::new(archive)
+        .open_for_processing()
+        .map_err(|e| format!("Failed to open RAR: {}", e))?;
+    while let Some(header) = open.read_header().map_err(|e| format!("Failed to read RAR: {}", e))? {
+        open = if header.entry().is_file() {
+            header.extract_with_base(dest)
+        } else {
+            header.skip()
+        }
+        .map_err(|e| format!("Failed to extract RAR: {}", e))?;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn install_mod_archive(app_handle: tauri::AppHandle, archive_path: String, mod_id: String) -> Result<(), String> {
     let mods_dir = get_mods_dir(&app_handle)?;
@@ -258,27 +273,10 @@ pub async fn install_mod_archive(app_handle: tauri::AppHandle, archive_path: Str
         let outpath = target_dir.join(file_name);
         std::fs::copy(&archive_path, &outpath).map_err(|e| format!("Failed to copy .pak file: {}", e))?;
     } else if extension == "rar" {
-        let media = Arc::new(rar_stream::LocalFileMedia::new(&archive_path).map_err(|e| format!("Failed to open RAR: {}", e))?);
-        let pkg = rar_stream::RarFilesPackage::new(vec![media]);
-        let files = pkg.parse(rar_stream::ParseOptions::default()).await
-            .map_err(|e| format!("Failed to parse RAR: {}", e))?;
-
-        for file in files {
-            let outpath = target_dir.join(&file.name);
-            if let Some(parent) = outpath.parent() {
-                std::fs::create_dir_all(parent).map_err(|_| "Failed to create directory in RAR")?;
-            }
-            
-            if file.name.ends_with('/') || file.name.ends_with('\\') {
-                continue;
-            }
-
-            let content = file.read_to_end().await
-                .map_err(|e| format!("Failed to read file {}: {}", file.name, e))?;
-            
-            std::fs::write(&outpath, content)
-                .map_err(|e| format!("Failed to write extracted file {}: {}", file.name, e))?;
-        }
+        let (a, d) = (path.to_path_buf(), target_dir.clone());
+        tauri::async_runtime::spawn_blocking(move || extract_rar(&a, &d))
+            .await
+            .map_err(|e| e.to_string())??;
     } else {
         // Assume it's a zip and extract
         let file = std::fs::File::open(&archive_path).map_err(|e| format!("Failed to open archive: {}", e))?;
@@ -685,29 +683,11 @@ pub async fn install_addon(app_handle: tauri::AppHandle, mod_id: String, archive
             }
         }
     } else if extension == "rar" {
-        let media = Arc::new(rar_stream::LocalFileMedia::new(&archive_path)
-            .map_err(|e| format!("Failed to open RAR: {}", e))?);
-        let pkg = rar_stream::RarFilesPackage::new(vec![media]);
-        let files = pkg.parse(rar_stream::ParseOptions::default()).await
-            .map_err(|e| format!("Failed to parse RAR: {}", e))?;
+        let (a, d) = (std::path::PathBuf::from(&archive_path), addons_dir.clone());
+        tauri::async_runtime::spawn_blocking(move || extract_rar(&a, &d))
+            .await
+            .map_err(|e| e.to_string())??;
 
-        for file in files {
-            let outpath = addons_dir.join(&file.name);
-            if let Some(parent) = outpath.parent() {
-                std::fs::create_dir_all(parent).map_err(|_| "Failed to create directory in RAR")?;
-            }
-            
-            if file.name.ends_with('/') || file.name.ends_with('\\') {
-                continue;
-            }
-
-            let content = file.read_to_end().await
-                .map_err(|e| format!("Failed to read file {}: {}", file.name, e))?;
-            
-            std::fs::write(&outpath, content)
-                .map_err(|e| format!("Failed to write extracted file {}: {}", file.name, e))?;
-        }
-        
         if let Ok(entries) = std::fs::read_dir(&addons_dir) {
             for entry in entries.filter_map(Result::ok) {
                 let p = entry.path();
@@ -825,4 +805,36 @@ pub async fn remove_addon(app_handle: tauri::AppHandle, mod_id: String, filename
     }
     
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ron-test-{}-{}", name, uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn extract_rar_handles_rar5_and_rar4() {
+        for name in ["rar5_small.rar", "rar4_small.rar"] {
+            let dest = scratch("rar");
+            let archive = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata").join(name);
+            extract_rar(&archive, &dest).unwrap();
+            assert_eq!(fs::read(dest.join("Mod/a.pak")).unwrap(), b"pak-a ".repeat(200));
+            assert_eq!(fs::read(dest.join("Mod/a.ucas")).unwrap(), b"ucas-a ".repeat(200));
+            assert_eq!(fs::read(dest.join("Mod/sub/b.utoc")).unwrap(), b"utoc-b ".repeat(50));
+        }
+    }
+
+    #[test]
+    fn extract_rar_rejects_a_non_rar_file() {
+        let dir = scratch("rar-junk");
+        let junk = dir.join("junk.rar");
+        fs::write(&junk, b"not a rar").unwrap();
+        let err = extract_rar(&junk, &dir.join("out")).unwrap_err();
+        assert!(err.starts_with("Failed to open RAR"), "{err}");
+    }
 }
