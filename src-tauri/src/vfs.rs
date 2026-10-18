@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use serde::{Serialize, Deserialize};
 use tauri::{AppHandle, Manager};
 use serde_json::Value;
-use crate::packs::{link_prefix, read_manifest, write_manifest, PackManifest, resolve_for_delete, resolve_key, parse_key, KeyKind, PackRef};
+use crate::packs::{ensure_editable, ensure_pack_editable, mark_dirty, mark_pack_dirty, link_prefix, read_manifest, write_manifest, PackManifest, resolve_for_delete, resolve_key, parse_key, KeyKind, PackRef};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AddonInfo {
@@ -629,6 +629,7 @@ pub async fn pick_mod_archive() -> Result<Option<String>, String> {
 #[tauri::command]
 pub async fn delete_mod(app_handle: tauri::AppHandle, mod_id: String) -> Result<(), String> {
     let mods_dir = get_mods_dir(&app_handle)?;
+    ensure_editable(&mods_dir, &mod_id)?;
     let target_dir = resolve_for_delete(&mods_dir, &mod_id)?;
     if parse_key(&mod_id).is_ok() {
         if let Ok(paks_dir) = get_paks_dir(&app_handle) {
@@ -640,6 +641,7 @@ pub async fn delete_mod(app_handle: tauri::AppHandle, mod_id: String) -> Result<
         std::fs::remove_dir_all(&target_dir).map_err(|e| format!("Failed to obliterate mod directory: {}", e))?;
     }
     drop_from_manifest(&mods_dir, &mod_id)?;
+    mark_dirty(&mods_dir, &mod_id);
 
     Ok(())
 }
@@ -741,6 +743,8 @@ fn move_into_pack(mods_dir: &Path, paks_dir: Option<&Path>, key: &str, pack_id: 
     };
     let new_key = format!("{}/{}", pack_id, nexus_id);
     parse_key(&new_key)?;
+    ensure_editable(mods_dir, key)?;
+    ensure_pack_editable(mods_dir, pack_id)?;
     let pack_dir = mods_dir.join(pack_id);
     if read_manifest(&pack_dir).is_none() {
         return Err(format!("No modpack folder for {:?}", pack_id));
@@ -751,6 +755,8 @@ fn move_into_pack(mods_dir: &Path, paks_dir: Option<&Path>, key: &str, pack_id: 
             m.mod_ids.push(nexus_id.clone());
         }
     })?;
+    mark_dirty(mods_dir, key);
+    mark_pack_dirty(mods_dir, pack_id);
     let warning = if enable { enable_moved(mods_dir, paks_dir, &new_key).err() } else { None };
     Ok((new_key, warning))
 }
@@ -760,12 +766,14 @@ fn move_out_of_pack(mods_dir: &Path, paks_dir: Option<&Path>, key: &str, replace
         KeyKind::Pack { pack_id, nexus_id } => (pack_id, nexus_id.to_string()),
         KeyKind::Loose(_) => return Err(format!("{:?} is not in a modpack", key)),
     };
+    ensure_editable(mods_dir, key)?;
     if mods_dir.join(&nexus_id).exists() && !replace_root {
         return Err("root-exists".to_string());
     }
     let pack_dir = mods_dir.join(&pack_id);
 
     let enable = relocate(mods_dir, paks_dir, key, &nexus_id, &pack_dir, |m| m.mod_ids.retain(|id| *id != nexus_id))?;
+    mark_dirty(mods_dir, key);
     let warning = if enable { enable_moved(mods_dir, paks_dir, &nexus_id).err() } else { None };
     Ok((nexus_id, warning))
 }
@@ -1318,6 +1326,7 @@ fn stage_pack(zip: &mut zip::ZipArchive<fs::File>, archive: &PackArchive, staged
         version: archive.pack.version.clone(),
         mod_ids,
         imported_at,
+        ..Default::default()
     })
 }
 
@@ -1471,6 +1480,7 @@ pub async fn toggle_all_mods(app_handle: tauri::AppHandle, enable: bool) -> Resu
 #[tauri::command]
 pub async fn install_addon(app_handle: tauri::AppHandle, mod_id: String, archive_path: String) -> Result<Vec<String>, String> {
     let mods_dir = get_mods_dir(&app_handle)?;
+    ensure_editable(&mods_dir, &mod_id)?;
     let mod_dir = resolve_key(&mods_dir, &mod_id)?;
     let addons_dir = mod_dir.join("addons");
     std::fs::create_dir_all(&addons_dir).map_err(|e| format!("Failed to create addons directory: {}", e))?;
@@ -1548,6 +1558,7 @@ pub async fn install_addon(app_handle: tauri::AppHandle, mod_id: String, archive
         }
     }
     
+    mark_dirty(&mods_dir, &mod_id);
     Ok(added_files)
 }
 
@@ -1566,6 +1577,7 @@ fn get_paks_dir(app_handle: &tauri::AppHandle) -> Result<PathBuf, String> {
 #[tauri::command]
 pub async fn toggle_addon(app_handle: tauri::AppHandle, mod_id: String, filename: String, enable: bool) -> Result<(), String> {
     let mods_dir = get_mods_dir(&app_handle)?;
+    ensure_editable(&mods_dir, &mod_id)?;
     let mod_dir = resolve_key(&mods_dir, &mod_id)?;
     let addon_path = mod_dir.join("addons").join(&filename);
     
@@ -1605,6 +1617,7 @@ pub async fn toggle_addon(app_handle: tauri::AppHandle, mod_id: String, filename
         }
     }
     
+    mark_dirty(&mods_dir, &mod_id);
     Ok(())
 }
 
@@ -1619,9 +1632,10 @@ fn delete_addon_files(addons_dir: &Path, pak_filename: &str) -> Result<(), Strin
 
 #[tauri::command]
 pub async fn remove_addon(app_handle: tauri::AppHandle, mod_id: String, filename: String) -> Result<(), String> {
+    let mods_dir = get_mods_dir(&app_handle)?;
+    ensure_editable(&mods_dir, &mod_id)?;
     let _ = toggle_addon(app_handle.clone(), mod_id.clone(), filename.clone(), false).await;
     
-    let mods_dir = get_mods_dir(&app_handle)?;
     let mod_dir = resolve_key(&mods_dir, &mod_id)?;
     delete_addon_files(&mod_dir.join("addons"), &filename)?;
     
@@ -1637,6 +1651,7 @@ pub async fn remove_addon(app_handle: tauri::AppHandle, mod_id: String, filename
         }
     }
     
+    mark_dirty(&mods_dir, &mod_id);
     Ok(())
 }
 
@@ -1714,7 +1729,7 @@ mod tests {
         fs::create_dir_all(m.join("Casual-Shitters/3063")).unwrap();
         write_manifest(&m.join("Casual-Shitters"), &PackManifest {
             pack_id: "Casual-Shitters".into(), name: "Casual Shitters".into(),
-            version: Some("1.5".into()), mod_ids: vec!["3063".into()], imported_at: 0 }).unwrap();
+            version: Some("1.5".into()), mod_ids: vec!["3063".into()], imported_at: 0, ..Default::default() }).unwrap();
         let mut keys: Vec<_> = scan_dir(&m).into_iter().map(|i| (i.id, i.pack.map(|p| p.pack_id))).collect();
         keys.sort();
         assert_eq!(keys, [
@@ -1784,7 +1799,7 @@ mod tests {
         fs::write(m.join("P/3063/a.pak"), b"packed").unwrap();
         write_manifest(&m.join("P"), &PackManifest {
             pack_id: "P".into(), name: "P".into(), version: None,
-            mod_ids: vec!["3063".into()], imported_at: 0 }).unwrap();
+            mod_ids: vec!["3063".into()], imported_at: 0, ..Default::default() }).unwrap();
         enable_key(&m, &p, "3063").unwrap();
         assert!(entry_present(&p.join("3063_a.pak")));
 
@@ -1844,7 +1859,7 @@ mod tests {
         fs::create_dir_all(m.join("P/3063/addons")).unwrap();
         write_manifest(&m.join("P"), &PackManifest {
             pack_id: "P".into(), name: "P".into(), version: None,
-            mod_ids: vec!["3063".into()], imported_at: 0 }).unwrap();
+            mod_ids: vec!["3063".into()], imported_at: 0, ..Default::default() }).unwrap();
         fs::write(m.join("P/3063/a.pak"), b"x").unwrap();
         fs::write(m.join("P/3063/addons/x.pak"), b"x").unwrap();
         fs::write(m.join("P/3063/addons/x.ucas"), b"x").unwrap();
@@ -1940,7 +1955,7 @@ mod tests {
         put(m, "Other/3063/other.pak", b"o");
         write_manifest(&m.join("Other"), &PackManifest {
             pack_id: "Other".into(), name: "Other".into(), version: None,
-            mod_ids: vec!["3063".into()], imported_at: 0 }).unwrap();
+            mod_ids: vec!["3063".into()], imported_at: 0, ..Default::default() }).unwrap();
         put(m, "5543/a.pak", b"a");
         enable_key(m, p, "5543").unwrap();
         cs_v16_zip(&z.join("v16.zip"));
@@ -2134,7 +2149,7 @@ mod tests {
         put(m, "CS/3311/a.pak", b"a");
         write_manifest(&m.join("CS"), &PackManifest {
             pack_id: "CS".into(), name: "Casual Shitters".into(), version: Some("1.5".into()),
-            mod_ids: vec!["3311".into()], imported_at: 0 }).unwrap();
+            mod_ids: vec!["3311".into()], imported_at: 0, ..Default::default() }).unwrap();
     }
 
     #[test]
@@ -2209,7 +2224,23 @@ mod tests {
         use crate::packs::{write_manifest, PackManifest};
         write_manifest(&m.join("CS"), &PackManifest {
             pack_id: "CS".into(), name: "CS".into(), version: None,
-            mod_ids: ids.iter().map(|s| s.to_string()).collect(), imported_at: 0 }).unwrap();
+            mod_ids: ids.iter().map(|s| s.to_string()).collect(), imported_at: 0, ..Default::default() }).unwrap();
+    }
+
+    #[test]
+    fn move_into_linked_pack_is_refused() {
+        use crate::packs::{write_manifest, PackManifest, PackSource};
+        let m = scratch("mv-linked-mods");
+        put(&m, "7000/a.pak", b"a");
+        fs::create_dir_all(m.join("CS")).unwrap();
+        write_manifest(&m.join("CS"), &PackManifest {
+            pack_id: "CS".into(), name: "Casual Shitters".into(),
+            source: Some(PackSource { kind: "drive".into(), folder_id: "f".into(), resource_key: None }),
+            ..Default::default() }).unwrap();
+        let e = move_into_pack(&m, None, "7000", "CS").unwrap_err();
+        assert_eq!(e, "Casual Shitters is linked to its creator. Fork it to make changes.");
+        assert!(m.join("7000/a.pak").exists());
+        assert!(!m.join("CS/7000").exists());
     }
 
     #[cfg(unix)]
@@ -2416,7 +2447,7 @@ mod tests {
         use crate::packs::{write_manifest, PackManifest};
         write_manifest(&m.join("Casual-Shitters"), &PackManifest {
             pack_id: "Casual-Shitters".into(), name: "Casual Shitters".into(), version: None,
-            mod_ids: vec!["3063".into(), "4296".into()], imported_at: 0 }).unwrap();
+            mod_ids: vec!["3063".into(), "4296".into()], imported_at: 0, ..Default::default() }).unwrap();
         assert_eq!(old_pack_keys(&m, "casual-shitters").unwrap(), ["Casual-Shitters/3063", "Casual-Shitters/4296"]);
         assert_eq!(old_pack_keys(&m, "Casual-Shitters").unwrap(), ["Casual-Shitters/3063", "Casual-Shitters/4296"]);
     }
@@ -2476,7 +2507,7 @@ mod tests {
         put(&m, "Other/3063/o.pak", b"o");
         write_manifest(&m.join("Other"), &PackManifest {
             pack_id: "Other".into(), name: "Other".into(), version: None,
-            mod_ids: vec!["3063".into()], imported_at: 0 }).unwrap();
+            mod_ids: vec!["3063".into()], imported_at: 0, ..Default::default() }).unwrap();
         put(&m, "5543/l.pak", b"l");
         for key in ["CS/4296", "Other/3063", "5543"] {
             enable_key(&m, &p, key).unwrap();

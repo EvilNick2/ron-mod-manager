@@ -6,6 +6,9 @@ export interface PackManifest {
   version: string | null;
   mod_ids: string[];
   imported_at: number;
+  source?: { kind: string; folder_id: string; resource_key: string | null };
+  installed_hashes?: Record<string, { hash: string; files: Record<string, string> }>;
+  published?: { folder_id: string; dirty: boolean };
 }
 
 export const store = reactive({

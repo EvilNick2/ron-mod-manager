@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
@@ -11,13 +12,38 @@ pub struct PackRef {
     pub version: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct PackSource {
+    pub kind: String,
+    pub folder_id: String,
+    pub resource_key: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct InstalledMod {
+    pub hash: String,
+    pub files: BTreeMap<String, String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct Published {
+    pub folder_id: String,
+    pub dirty: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct PackManifest {
     pub pack_id: String,
     pub name: String,
     pub version: Option<String>,
     pub mod_ids: Vec<String>,
     pub imported_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<PackSource>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub installed_hashes: BTreeMap<String, InstalledMod>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published: Option<Published>,
 }
 
 pub fn read_manifest(pack_dir: &Path) -> Option<PackManifest> {
@@ -36,6 +62,41 @@ pub fn write_manifest(pack_dir: &Path, m: &PackManifest) -> Result<(), String> {
         let _ = fs::remove_file(&tmp);
         e.to_string()
     })
+}
+
+pub fn ensure_pack_editable(mods_dir: &Path, pack_id: &str) -> Result<(), String> {
+    match read_manifest(&mods_dir.join(pack_id)) {
+        Some(m) if m.source.is_some() => {
+            Err(format!("{} is linked to its creator. Fork it to make changes.", m.name))
+        }
+        _ => Ok(()),
+    }
+}
+
+pub fn ensure_editable(mods_dir: &Path, key: &str) -> Result<(), String> {
+    match parse_key(key) {
+        Ok(KeyKind::Pack { pack_id, .. }) => ensure_pack_editable(mods_dir, &pack_id),
+        _ => Ok(()),
+    }
+}
+
+pub fn mark_pack_dirty(mods_dir: &Path, pack_id: &str) {
+    let pack_dir = mods_dir.join(pack_id);
+    let Some(mut m) = read_manifest(&pack_dir) else { return };
+    let Some(published) = m.published.as_mut() else { return };
+    if published.dirty {
+        return;
+    }
+    published.dirty = true;
+    if let Err(e) = write_manifest(&pack_dir, &m) {
+        eprintln!("[PACKS] Could not mark {} as changed: {}", pack_id, e);
+    }
+}
+
+pub fn mark_dirty(mods_dir: &Path, key: &str) {
+    if let Ok(KeyKind::Pack { pack_id, .. }) = parse_key(key) {
+        mark_pack_dirty(mods_dir, &pack_id);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -244,12 +305,62 @@ mod tests {
     #[test]
     fn write_manifest_replaces_the_file_and_leaves_no_tmp() {
         let m = scratch("manifest");
-        let mut man = PackManifest { pack_id: "CS".into(), name: "CS".into(), version: None, mod_ids: vec!["1".into()], imported_at: 0 };
+        let mut man = PackManifest { pack_id: "CS".into(), name: "CS".into(), version: None, mod_ids: vec!["1".into()], imported_at: 0, ..Default::default() };
         write_manifest(&m, &man).unwrap();
         man.mod_ids.push("2".into());
         write_manifest(&m, &man).unwrap();
         assert_eq!(read_manifest(&m).unwrap().mod_ids, ["1", "2"]);
         let names: Vec<_> = fs::read_dir(&m).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
         assert_eq!(names, ["pack.json"]);
+    }
+
+    fn put_pack(mods: &Path, id: &str, name: &str, edit: impl FnOnce(&mut PackManifest)) {
+        let dir = mods.join(id);
+        fs::create_dir_all(&dir).unwrap();
+        let mut man = PackManifest { pack_id: id.into(), name: name.into(), mod_ids: vec!["3063".into()], ..Default::default() };
+        edit(&mut man);
+        write_manifest(&dir, &man).unwrap();
+    }
+
+    #[test]
+    fn old_pack_json_still_reads() {
+        let m = scratch("oldpack");
+        let old = r#"{"pack_id":"CS","name":"CS","version":null,"mod_ids":["1"],"imported_at":5}"#;
+        fs::write(m.join("pack.json"), old).unwrap();
+        let man = read_manifest(&m).unwrap();
+        assert!(man.source.is_none() && man.installed_hashes.is_empty() && man.published.is_none());
+        write_manifest(&m, &man).unwrap();
+        let out = fs::read_to_string(m.join("pack.json")).unwrap();
+        for key in ["source", "installed_hashes", "published"] {
+            assert!(!out.contains(key), "{key}");
+        }
+    }
+
+    #[test]
+    fn linked_pack_refuses_edits() {
+        let mods = scratch("linked");
+        put_pack(&mods, "CS", "Casual Shitters", |m| {
+            m.source = Some(PackSource { kind: "drive".into(), folder_id: "f".into(), resource_key: None });
+        });
+        assert_eq!(ensure_editable(&mods, "CS/3063").unwrap_err(),
+            "Casual Shitters is linked to its creator. Fork it to make changes.");
+        assert_eq!(ensure_pack_editable(&mods, "CS").unwrap_err(),
+            "Casual Shitters is linked to its creator. Fork it to make changes.");
+        assert!(ensure_editable(&mods, "5543").is_ok());
+        assert!(ensure_editable(&mods, "not a key").is_ok());
+    }
+
+    #[test]
+    fn mark_dirty_only_touches_published() {
+        let mods = scratch("dirty");
+        put_pack(&mods, "Pub", "Pub", |m| m.published = Some(Published { folder_id: "f".into(), dirty: false }));
+        put_pack(&mods, "Plain", "Plain", |_| {});
+        let before = fs::read(mods.join("Plain/pack.json")).unwrap();
+        mark_dirty(&mods, "Plain/3063");
+        mark_pack_dirty(&mods, "Plain");
+        assert_eq!(fs::read(mods.join("Plain/pack.json")).unwrap(), before);
+        mark_dirty(&mods, "Pub/3063");
+        assert!(read_manifest(&mods.join("Pub")).unwrap().published.unwrap().dirty);
+        mark_dirty(&mods, "5543");
     }
 }
