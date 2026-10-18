@@ -1,40 +1,43 @@
 <script setup lang="ts">
 import { store } from "../store";
+import { sectionMods, LOOSE_ID, type Section } from "../modSections";
+import { applyPack, refreshMods as rescanMods } from "../packActions";
 import { invoke } from "@tauri-apps/api/core";
 import { onMounted, onBeforeUnmount, ref, computed, watch } from "vue";
-import { Search, Plus, RefreshCw, X } from 'lucide-vue-next';
+import { Search, Plus, RefreshCw, X, ChevronDown, ChevronRight } from 'lucide-vue-next';
 
 const searchQuery = ref("");
 const activeCategory = ref("All");
 let onlineSearchDebounce: ReturnType<typeof setTimeout> | null = null;
 
+function matchesMod(mod: any) {
+  if (store.currentMode === 'Installed') {
+    if (store.activeDeploymentFilter === 'Enabled' && !mod.enabled) return false;
+    if (store.activeDeploymentFilter === 'Disabled' && mod.enabled) return false;
+  }
+
+  const s = searchQuery.value.toLowerCase();
+  const searchMatch = !s || mod.name.toLowerCase().includes(s) || (mod.description && mod.description.toLowerCase().includes(s));
+
+  let categoryMatch = true;
+  const bodyText = (mod.name + " " + (mod.description || "")).toLowerCase();
+
+  if (activeCategory.value === "Maps") {
+    categoryMatch = bodyText.includes("map") || bodyText.includes("level") || bodyText.includes("mission") || bodyText.includes("location") || bodyText.includes("environment");
+  } else if (activeCategory.value === "Weapons") {
+    categoryMatch = bodyText.includes("weapon") || bodyText.includes("gun") || bodyText.includes("rifle") || bodyText.includes("pistol") || bodyText.includes("optic") || bodyText.includes("attachment");
+  } else if (activeCategory.value === "AI") {
+    categoryMatch = bodyText.includes(" ai ") || bodyText.includes("behavior") || bodyText.includes("suspect") || bodyText.includes("swat") || bodyText.includes("civilian") || bodyText.includes("difficulty");
+  } else if (activeCategory.value === "UI") {
+    categoryMatch = bodyText.includes(" ui ") || bodyText.includes("menu") || bodyText.includes("hud") || bodyText.includes("interface") || bodyText.includes("indicator");
+  }
+
+  return searchMatch && categoryMatch;
+}
+
 const filteredMods = computed(() => {
   const sourceArray = store.currentMode === 'Online' ? store.onlineMods : store.mods;
-  
-  const filtered = sourceArray.filter((mod) => {
-    if (store.currentMode === 'Installed') {
-      if (store.activeDeploymentFilter === 'Enabled' && !mod.enabled) return false;
-      if (store.activeDeploymentFilter === 'Disabled' && mod.enabled) return false;
-    }
-
-    const s = searchQuery.value.toLowerCase();
-    const searchMatch = !s || mod.name.toLowerCase().includes(s) || (mod.description && mod.description.toLowerCase().includes(s));
-    
-    let categoryMatch = true;
-    const bodyText = (mod.name + " " + (mod.description || "")).toLowerCase();
-    
-    if (activeCategory.value === "Maps") {
-      categoryMatch = bodyText.includes("map") || bodyText.includes("level") || bodyText.includes("mission") || bodyText.includes("location") || bodyText.includes("environment");
-    } else if (activeCategory.value === "Weapons") {
-      categoryMatch = bodyText.includes("weapon") || bodyText.includes("gun") || bodyText.includes("rifle") || bodyText.includes("pistol") || bodyText.includes("optic") || bodyText.includes("attachment");
-    } else if (activeCategory.value === "AI") {
-      categoryMatch = bodyText.includes(" ai ") || bodyText.includes("behavior") || bodyText.includes("suspect") || bodyText.includes("swat") || bodyText.includes("civilian") || bodyText.includes("difficulty");
-    } else if (activeCategory.value === "UI") {
-      categoryMatch = bodyText.includes(" ui ") || bodyText.includes("menu") || bodyText.includes("hud") || bodyText.includes("interface") || bodyText.includes("indicator");
-    }
-    
-    return searchMatch && categoryMatch;
-  });
+  const filtered = sourceArray.filter(matchesMod);
 
   if (store.currentMode === 'Installed') {
     return filtered.sort((a: any, b: any) => a.name.localeCompare(b.name));
@@ -42,6 +45,147 @@ const filteredMods = computed(() => {
 
   return filtered;
 });
+
+const COLLAPSED_KEY = "ron.collapsedSections";
+
+interface Overrides { collapsed: string[]; expanded: string[] }
+
+function readOverrides(): Overrides {
+  const empty: Overrides = { collapsed: [], expanded: [] };
+  try {
+    const raw = localStorage.getItem(COLLAPSED_KEY);
+    if (raw === null) return empty;
+    const parsed = JSON.parse(raw);
+    const strings = (v: any): string[] => Array.isArray(v) ? v.filter((x) => typeof x === "string") : [];
+    if (Array.isArray(parsed)) return { collapsed: strings(parsed), expanded: [] };
+    if (parsed && typeof parsed === "object") {
+      return { collapsed: strings(parsed.collapsed), expanded: strings(parsed.expanded) };
+    }
+    return empty;
+  } catch {
+    return empty;
+  }
+}
+
+const overrides = ref<Overrides>(readOverrides());
+
+function writeOverrides() {
+  try {
+    localStorage.setItem(COLLAPSED_KEY, JSON.stringify(overrides.value));
+  } catch {
+    // storage unavailable, state stays in memory
+  }
+}
+
+const activePackId = computed(() => {
+  const name = store.activePresetName || "";
+  return name.startsWith("pack:") ? name.slice(5) : null;
+});
+
+const filterActive = computed(() =>
+  searchQuery.value !== "" || activeCategory.value !== "All" || store.activeDeploymentFilter !== "All"
+);
+
+const sectionData = computed(() =>
+  sectionMods(store.mods, store.packs, activePackId.value, matchesMod)
+);
+
+const hasPacks = computed(() => store.packs.length > 0);
+
+const displaySections = computed<Section[]>(() => {
+  if (store.currentMode === 'Online') {
+    return [{ id: "online", title: "", version: null, isActive: false, mods: filteredMods.value, enabledCount: 0, total: filteredMods.value.length }];
+  }
+  const all = sectionData.value.sections;
+  return filterActive.value ? all.filter((s) => s.mods.length > 0) : all;
+});
+
+function defaultCollapsed(section: Section) {
+  return section.id !== LOOSE_ID && !section.isActive;
+}
+
+function isCollapsed(section: Section) {
+  if (filterActive.value) return false;
+  if (overrides.value.collapsed.includes(section.id)) return true;
+  if (overrides.value.expanded.includes(section.id)) return false;
+  return defaultCollapsed(section);
+}
+
+function toggleCollapsed(section: Section) {
+  if (filterActive.value) return;
+  const collapse = !isCollapsed(section);
+  const others = (list: string[]) => list.filter((id) => id !== section.id);
+  overrides.value = collapse
+    ? { collapsed: [...others(overrides.value.collapsed), section.id], expanded: others(overrides.value.expanded) }
+    : { collapsed: others(overrides.value.collapsed), expanded: [...others(overrides.value.expanded), section.id] };
+  writeOverrides();
+}
+
+let activePackSeen = false;
+
+watch(activePackId, (id) => {
+  if (!activePackSeen) {
+    activePackSeen = true;
+    return;
+  }
+  if (!id) return;
+  overrides.value = {
+    collapsed: overrides.value.collapsed.filter((x) => x !== id),
+    expanded: overrides.value.expanded.filter((x) => x !== id),
+  };
+  writeOverrides();
+});
+
+function sectionHeaderless(section: Section) {
+  return store.currentMode === 'Online' || (section.id === LOOSE_ID && !hasPacks.value);
+}
+
+function sectionCount(section: Section) {
+  if (filterActive.value) {
+    return `${section.mods.length} ${section.mods.length === 1 ? "match" : "matches"}`;
+  }
+  return `${section.enabledCount} of ${section.total} enabled`;
+}
+
+function enabledInTitle(mod: any, section: Section) {
+  if (mod.nexus_mod_id == null) return null;
+  const other = sectionData.value.enabledElsewhere.get(mod.nexus_mod_id);
+  return other && other.id !== section.id ? other.title : null;
+}
+
+function modsOfSection(section: Section) {
+  const known = new Set(store.packs.map((p) => p.pack_id));
+  return store.mods.filter((m: any) =>
+    section.id === LOOSE_ID ? !m.pack || !known.has(m.pack.pack_id) : m.pack?.pack_id === section.id
+  );
+}
+
+async function setSectionEnabled(section: Section, enable: boolean) {
+  try {
+    for (const mod of modsOfSection(section)) {
+      await invoke("toggle_mod", { modId: mod.id, enable });
+    }
+  } catch (e: any) {
+    console.error("Section toggle failed:", e);
+    alert("Failed to update mods: " + e);
+  }
+  try {
+    await rescanMods();
+  } catch (e) {
+    console.error("Failed to refresh mods:", e);
+  }
+}
+
+async function applySectionPack(section: Section) {
+  const pack = store.packs.find((p) => p.pack_id === section.id);
+  if (!pack) return;
+  try {
+    await applyPack(pack);
+  } catch (e: any) {
+    console.error("Failed to apply pack:", e);
+    alert("Failed to apply pack: " + e);
+  }
+}
 
 async function loadMoreMods() {
   if (store.isFetchingOnline || !store.hasMoreOnlineMods) return;
@@ -171,6 +315,18 @@ async function toggleModRightClick(mod: any) {
   } catch (e: any) {
     console.error("Right-click deploy failed:", e);
     alert("Failed to toggle mod deployment: " + e);
+    return;
+  }
+  if (store.currentMode !== 'Installed') return;
+  try {
+    await rescanMods();
+    const selectedId = store.selectedMod?.id;
+    if (selectedId !== undefined) {
+      store.selectedMod = store.mods.find((m: any) => m.id === selectedId) ?? null;
+    }
+  } catch (e: any) {
+    console.error("Refresh after toggle failed:", e);
+    alert("Mod toggled, but the list could not be refreshed: " + e);
   }
 }
 
@@ -271,35 +427,63 @@ async function refreshModsFromButton() {
         <p v-if="store.currentMode === 'Installed' && store.mods.length === 0">Drop a .zip, .rar, or .pak file anywhere to install a new mod!</p>
       </div>
       
-      <div 
-        v-for="mod in filteredMods" 
-        :key="mod.id"
-        class="mod-card"
-        :class="{ 
-          'selected-mod': store.selectedMod?.id === mod.id,
-          'enabled-mod': mod.enabled
-        }"
-        @click="selectMod(mod)"
-        @contextmenu.prevent="toggleModRightClick(mod)"
+      <section
+        v-for="section in displaySections"
+        :key="section.id"
+        :id="`section-${section.id}`"
+        class="mod-section"
       >
-        <button
-          v-if="store.currentMode === 'Installed' && mod.update_available"
-          class="update-available-banner"
-          @click.stop="startModUpdateFlow(mod)"
-          title="Open Nexus files page and import the updated archive"
-        >
-          Update Available
-        </button>
-
-        <img :src="mod.thumbnail_url || 'https://images.unsplash.com/photo-1595590424283-b8f17842773f?auto=format&fit=crop&q=80&w=400&h=400'" alt="Mod Cover" class="mod-image" loading="lazy" decoding="async" />
-        <div class="mod-info">
-          <h3>{{ mod.name }}</h3>
+        <div v-if="!sectionHeaderless(section)" class="section-header">
+          <button class="section-toggle" @click="toggleCollapsed(section)">
+            <component :is="isCollapsed(section) ? ChevronRight : ChevronDown" :size="18" />
+            <span class="section-title">{{ section.title }}</span>
+            <span v-if="section.version" class="section-version">{{ section.version }}</span>
+          </button>
+          <span v-if="section.isActive" class="section-active-tag">active</span>
+          <span class="section-count">{{ sectionCount(section) }}</span>
+          <div class="section-actions">
+            <template v-if="section.id === LOOSE_ID">
+              <button v-if="!filterActive" class="section-btn" @click="setSectionEnabled(section, true)">Enable all</button>
+              <button v-if="!filterActive" class="section-btn" @click="setSectionEnabled(section, false)">Disable all</button>
+            </template>
+            <button v-else-if="!section.isActive" class="section-btn" @click="applySectionPack(section)">Apply</button>
+            <button v-else-if="!filterActive" class="section-btn" @click="setSectionEnabled(section, false)">Disable all</button>
+          </div>
         </div>
-        <button v-if="!mod.is_online" class="delete-mod" @click.stop="removeMod(mod)" title="Remove Mod Completely">
-          <X :size="16" color="#ffffff" />
-        </button>
-      </div>
-      
+
+        <div v-show="sectionHeaderless(section) || !isCollapsed(section)" class="card-grid">
+          <div
+            v-for="mod in section.mods"
+            :key="mod.id"
+            class="mod-card"
+            :class="{
+              'selected-mod': store.selectedMod?.id === mod.id,
+              'enabled-mod': mod.enabled
+            }"
+            @click="selectMod(mod)"
+            @contextmenu.prevent="toggleModRightClick(mod)"
+          >
+            <button
+              v-if="store.currentMode === 'Installed' && mod.update_available"
+              class="update-available-banner"
+              @click.stop="startModUpdateFlow(mod)"
+              title="Open Nexus files page and import the updated archive"
+            >
+              Update Available
+            </button>
+
+            <img :src="mod.thumbnail_url || 'https://images.unsplash.com/photo-1595590424283-b8f17842773f?auto=format&fit=crop&q=80&w=400&h=400'" alt="Mod Cover" class="mod-image" loading="lazy" decoding="async" />
+            <div class="mod-info">
+              <div v-if="store.currentMode === 'Installed' && enabledInTitle(mod, section)" class="enabled-in">Enabled in {{ enabledInTitle(mod, section) }}</div>
+              <h3>{{ mod.name }}</h3>
+            </div>
+            <button v-if="!mod.is_online" class="delete-mod" @click.stop="removeMod(mod)" title="Remove Mod Completely">
+              <X :size="16" color="#ffffff" />
+            </button>
+          </div>
+        </div>
+      </section>
+
       <button 
         v-if="store.currentMode === 'Online' && store.onlineMods.length > 0 && !store.isFetchingOnline && store.hasMoreOnlineMods" 
         class="load-more-btn" 
@@ -407,6 +591,88 @@ async function refreshModsFromButton() {
   grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
   gap: 1.5rem;
   align-content: start;
+}
+
+.mod-section {
+  grid-column: 1 / -1;
+}
+
+.card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 1.5rem;
+}
+
+.section-header {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin: 0.5rem 0 1rem;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid var(--border-light);
+}
+
+.section-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  background: none;
+  border: none;
+  color: var(--text-main);
+  font-size: 1.05rem;
+  font-weight: 700;
+  cursor: pointer;
+  padding: 0;
+}
+
+.section-version {
+  color: var(--text-muted);
+  font-weight: 500;
+  font-size: 0.9rem;
+}
+
+.section-active-tag {
+  background: rgba(34, 197, 94, 0.15);
+  color: #22c55e;
+  border: 1px solid #22c55e;
+  border-radius: 99px;
+  padding: 0.1rem 0.6rem;
+  font-size: 0.75rem;
+  font-weight: 700;
+}
+
+.section-count {
+  color: var(--text-muted);
+  font-size: 0.85rem;
+}
+
+.section-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 0.5rem;
+}
+
+.section-btn {
+  background: var(--bg-dark);
+  border: 1px solid var(--border-light);
+  color: var(--text-main);
+  padding: 0.35rem 0.9rem;
+  border-radius: 6px;
+  font-weight: 600;
+  font-size: 0.85rem;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.section-btn:hover {
+  border-color: var(--accent-primary);
+  color: var(--accent-primary);
+}
+
+.enabled-in {
+  font-size: 0.75rem;
+  color: #a7f3d0;
+  margin-bottom: 0.25rem;
 }
 
 .mod-card {
