@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { store } from "../store";
 import { sectionMods, LOOSE_ID, type Section } from "../modSections";
-import { applyPack, refreshMods as rescanMods } from "../packActions";
+import { applyPack, refreshMods as rescanMods, publishPack, copyText, folderLink, progressLine } from "../packActions";
 import { invoke } from "@tauri-apps/api/core";
 import { onMounted, onBeforeUnmount, ref, computed, watch } from "vue";
 import { Search, Plus, RefreshCw, X, ChevronDown, ChevronRight } from 'lucide-vue-next';
@@ -175,6 +175,15 @@ async function setSectionEnabled(section: Section, enable: boolean) {
   } catch (e) {
     console.error("Failed to refresh mods:", e);
   }
+}
+
+function packOf(section: Section) {
+  return section.id === LOOSE_ID ? undefined : store.packs.find((p) => p.pack_id === section.id);
+}
+
+async function copySectionLink(section: Section) {
+  const pack = packOf(section);
+  if (pack?.published) await copyText(folderLink(pack.published.folder_id));
 }
 
 async function applySectionPack(section: Section) {
@@ -436,8 +445,19 @@ async function refreshModsFromButton() {
             <span v-if="section.version" class="section-version">{{ section.version }}</span>
           </button>
           <span v-if="section.isActive" class="section-active-tag">active</span>
+          <span v-if="packOf(section)?.published?.dirty" class="section-dirty-tag">Changes not uploaded</span>
           <span class="section-count">{{ sectionCount(section) }}</span>
+          <span v-if="store.packProgress[section.id]" class="section-progress">{{ progressLine(store.packProgress[section.id]) }}</span>
           <div class="section-actions">
+            <template v-if="packOf(section)">
+              <button
+                v-if="store.google.email && !packOf(section)!.source"
+                class="section-btn"
+                @click="publishPack(packOf(section)!)"
+                :disabled="!!store.inFlight[section.id]"
+              >Publish</button>
+              <button v-if="packOf(section)!.published" class="section-btn" @click="copySectionLink(section)">Copy link</button>
+            </template>
             <template v-if="section.id === LOOSE_ID">
               <button v-if="!filterActive" class="section-btn" @click="setSectionEnabled(section, true)">Enable all</button>
               <button v-if="!filterActive" class="section-btn" @click="setSectionEnabled(section, false)">Disable all</button>
@@ -637,6 +657,30 @@ async function refreshModsFromButton() {
   font-weight: 700;
 }
 
+.section-dirty-tag {
+  background: rgba(245, 158, 11, 0.12);
+  color: #f59e0b;
+  border: 1px solid rgba(245, 158, 11, 0.5);
+  border-radius: 99px;
+  padding: 0.1rem 0.6rem;
+  font-size: 0.75rem;
+  font-weight: 700;
+}
+
+.section-progress {
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.section-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 .section-count {
   color: var(--text-muted);
   font-size: 0.85rem;
@@ -660,7 +704,7 @@ async function refreshModsFromButton() {
   transition: all 0.2s;
 }
 
-.section-btn:hover {
+.section-btn:hover:not(:disabled) {
   border-color: var(--accent-primary);
   color: var(--accent-primary);
 }

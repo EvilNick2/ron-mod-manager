@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { onMounted } from 'vue';
+import { computed, onMounted } from 'vue';
 import { invoke } from "@tauri-apps/api/core";
 import { store, type PackManifest } from "../store";
-import { applyPack, loadPacks, refreshMods } from "../packActions";
+import { applyPack, loadPacks, refreshMods, publishPack, copyText, folderLink, progressLine } from "../packActions";
 import { 
   Package, 
   Globe, 
@@ -13,7 +13,9 @@ import {
   X,
   Check,
   CircleOff,
-  Play
+  Play,
+  CloudUpload,
+  Link
 } from 'lucide-vue-next';
 
 async function loginNexus() {
@@ -76,6 +78,15 @@ async function exportPreset(name: string) {
       alert("Failed to export preset: " + e);
     }
   }
+}
+
+const orphanProgress = computed(() =>
+  Object.values(store.packProgress).filter((p) => !store.packs.some((pack) => pack.pack_id === p.pack_id))
+);
+
+async function onCopyLink(pack: PackManifest) {
+  if (!pack.published) return;
+  await copyText(folderLink(pack.published.folder_id));
 }
 
 function packLabel(name: string, version: string | null) {
@@ -321,6 +332,7 @@ async function launchGame() {
 
     <div class="sidebar-section" v-if="store.currentMode === 'Installed'">
       <h3 class="section-label">Modpacks</h3>
+      <p v-for="p in orphanProgress" :key="p.pack_id" class="pack-progress pack-progress-orphan">{{ progressLine(p) }}</p>
       <div class="preset-list" v-if="store.packs.length > 0">
         <div
           class="pack-card"
@@ -343,11 +355,25 @@ async function launchGame() {
               <button class="pack-icon-btn" @click.stop="exportPack(pack)" title="Export Modpack to .zip">
                 <Upload :size="13" color="#f59e0b" />
               </button>
+              <button
+                v-if="store.google.email && !pack.source"
+                class="pack-icon-btn"
+                @click.stop="publishPack(pack)"
+                :disabled="!!store.inFlight[pack.pack_id]"
+                title="Publish Modpack to Google Drive"
+              >
+                <CloudUpload :size="13" color="#3b82f6" />
+              </button>
+              <button v-if="pack.published" class="pack-icon-btn" @click.stop="onCopyLink(pack)" title="Copy share link">
+                <Link :size="13" color="#a1a1aa" />
+              </button>
               <button class="pack-icon-btn pack-icon-delete" @click.stop="removePack(pack)" title="Delete Modpack">
                 <X :size="13" color="#ef4444" />
               </button>
             </div>
           </div>
+          <span v-if="pack.published?.dirty" class="pack-dirty">Changes not uploaded</span>
+          <p v-if="store.packProgress[pack.pack_id]" class="pack-progress">{{ progressLine(store.packProgress[pack.pack_id]) }}</p>
         </div>
       </div>
       <p v-else class="preset-empty">No modpacks imported yet.</p>
@@ -756,9 +782,36 @@ async function launchGame() {
   transition: all 0.2s;
 }
 
-.pack-icon-btn:hover {
+.pack-icon-btn:hover:not(:disabled) {
   border-color: var(--border-light);
   background: var(--bg-darker);
+}
+
+.pack-icon-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.pack-dirty {
+  align-self: flex-start;
+  background: rgba(245, 158, 11, 0.12);
+  color: #f59e0b;
+  border: 1px solid rgba(245, 158, 11, 0.5);
+  border-radius: 99px;
+  padding: 0.05rem 0.5rem;
+  font-size: 0.65rem;
+  font-weight: 700;
+}
+
+.pack-progress {
+  color: var(--text-muted);
+  font-size: 0.7rem;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.pack-progress-orphan {
+  margin-bottom: 0.5rem;
 }
 
 .pack-icon-delete:hover {

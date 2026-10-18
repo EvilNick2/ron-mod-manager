@@ -16,15 +16,15 @@ use tauri::{Emitter, Manager};
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let app = window.app_handle();
                 let Ok(mods_dir) = vfs::get_mods_dir(app) else { return };
-                let dirty = publish::dirty_packs(&mods_dir);
-                if !dirty.is_empty() {
+                if let Some(blocked) = publish::close_blocked(&mods_dir) {
                     api.prevent_close();
-                    let _ = window.emit("close-blocked", dirty);
+                    let _ = window.emit("close-blocked", blocked);
                 }
             }
         })

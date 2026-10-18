@@ -1,13 +1,14 @@
 <script setup lang="ts">
 import { invoke } from "@tauri-apps/api/core";
 import { store } from "../store";
-import { refreshMods } from "../packActions";
+import { refreshMods, loadGoogleStatus } from "../packActions";
 import { onMounted, ref } from "vue";
 import { X, Globe, Crosshair, Info } from 'lucide-vue-next';
 
 const activeTab = ref("Global");
 const pendingGamePath = ref("");
 const pendingLaunchOptions = ref("");
+const googleBusy = ref(false);
 
 onMounted(async () => {
   try {
@@ -85,6 +86,32 @@ async function saveGameConfig() {
   }
 }
 
+async function signInGoogle() {
+  googleBusy.value = true;
+  try {
+    await invoke("google_sign_in");
+    await loadGoogleStatus();
+  } catch (e) {
+    console.error("Google sign-in failed:", e);
+    alert("Failed to sign in with Google: " + e);
+  } finally {
+    googleBusy.value = false;
+  }
+}
+
+async function signOutGoogle() {
+  googleBusy.value = true;
+  try {
+    await invoke("google_sign_out");
+    await loadGoogleStatus();
+  } catch (e) {
+    console.error("Google sign-out failed:", e);
+    alert("Failed to sign out of Google: " + e);
+  } finally {
+    googleBusy.value = false;
+  }
+}
+
 async function toggleBlur(state: boolean) {
   store.isBlurEnabled = state;
   try {
@@ -131,6 +158,20 @@ async function toggleBlur(state: boolean) {
             <div class="api-key-box">
               <code v-if="store.apiKeyStore">{{ store.apiKeyStore.substring(0, 15) }}...*****************</code>
               <code v-else>Authentication is completely missing.</code>
+            </div>
+          </div>
+
+          <div class="settings-section" v-if="store.google.signInAvailable">
+            <h3>Google Drive <Info :size="14" color="#3b82f6" class="info-icon" /></h3>
+            <p class="settings-desc" style="margin-bottom: 1rem;">Sign in to publish your modpacks to Google Drive and share them with a link.</p>
+            <div v-if="store.google.email" class="path-picker-row">
+              <span class="google-email">Signed in as {{ store.google.email }}</span>
+              <button class="secondary-action-btn" @click="signOutGoogle" :disabled="googleBusy">Sign out</button>
+            </div>
+            <div v-else>
+              <button class="action-btn" @click="signInGoogle" :disabled="googleBusy">
+                {{ googleBusy ? "Waiting for Google..." : "Sign in with Google" }}
+              </button>
             </div>
           </div>
 
@@ -435,6 +476,13 @@ h3 {
   display: flex;
   align-items: center;
   gap: 0.5rem;
+}
+
+.google-email {
+  flex: 1;
+  color: var(--text-main);
+  font-size: 0.9rem;
+  word-break: break-all;
 }
 
 .info-icon {

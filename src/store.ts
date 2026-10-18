@@ -11,6 +11,27 @@ export interface PackManifest {
   published?: { folder_id: string; dirty: boolean };
 }
 
+export interface PackRef {
+  pack_id: string;
+  name: string;
+  version: string | null;
+}
+
+export interface PackProgress {
+  pack_id: string;
+  stage: string;
+  done: number;
+  total: number;
+  file: string | null;
+  bytes_done: number;
+  bytes_total: number;
+}
+
+export interface CloseBlocked {
+  dirty: PackRef[];
+  uploading: PackRef[];
+}
+
 export const store = reactive({
   apiKeyStore: "",
   currentMode: "Installed",
@@ -45,5 +66,10 @@ export const store = reactive({
   packs: [] as PackManifest[],
   installingModPath: null as string | null,
   awaitingDropForId: null as string | null,
-  postInstallModId: null as string | null
+  postInstallModId: null as string | null,
+
+  google: { signInAvailable: false, linksAvailable: false, email: null as string | null },
+  packProgress: {} as Record<string, PackProgress>,
+  inFlight: {} as Record<string, true>,
+  closeBlocked: null as CloseBlocked | null
 });

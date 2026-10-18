@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -627,6 +628,60 @@ pub fn dirty_packs(mods_dir: &Path) -> Vec<PackRef> {
     out
 }
 
+static PUBLISHING: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+fn publishing_set() -> std::sync::MutexGuard<'static, BTreeSet<String>> {
+    PUBLISHING.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Marks a pack as publishing until dropped, so an error or a panic still clears it
+pub(crate) struct PublishingGuard(String);
+
+impl PublishingGuard {
+    pub(crate) fn begin(pack_id: &str) -> Option<PublishingGuard> {
+        publishing_set().insert(pack_id.to_string()).then(|| PublishingGuard(pack_id.to_string()))
+    }
+}
+
+impl Drop for PublishingGuard {
+    fn drop(&mut self) {
+        publishing_set().remove(&self.0);
+    }
+}
+
+pub fn publishing_packs(mods_dir: &Path) -> Vec<PackRef> {
+    let ids: Vec<String> = publishing_set().iter().cloned().collect();
+    let mut out: Vec<PackRef> = ids
+        .into_iter()
+        .map(|id| match packs::read_manifest(&mods_dir.join(&id)) {
+            Some(m) => PackRef { pack_id: id, name: m.name, version: m.version },
+            None => PackRef { name: id.clone(), pack_id: id, version: None },
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct CloseBlocked {
+    pub dirty: Vec<PackRef>,
+    pub uploading: Vec<PackRef>,
+}
+
+/// None when nothing stops the app from closing
+pub fn close_blocked(mods_dir: &Path) -> Option<CloseBlocked> {
+    let uploading = publishing_packs(mods_dir);
+    let dirty: Vec<PackRef> = dirty_packs(mods_dir)
+        .into_iter()
+        .filter(|d| !uploading.iter().any(|u| u.pack_id == d.pack_id))
+        .collect();
+    if dirty.is_empty() && uploading.is_empty() {
+        None
+    } else {
+        Some(CloseBlocked { dirty, uploading })
+    }
+}
+
 #[tauri::command]
 pub fn list_dirty_packs(app_handle: tauri::AppHandle) -> Result<Vec<PackRef>, String> {
     let mods_dir = crate::vfs::get_mods_dir(&app_handle)?;
@@ -646,9 +701,13 @@ pub async fn publish_pack_cmd(app_handle: tauri::AppHandle, pack_id: String, ver
     }
     let mods_dir = crate::vfs::get_mods_dir(&app_handle)?;
     let pack_dir = mods_dir.join(&pack_id);
-    if packs::parse_key(&format!("{}/1", pack_id)).is_err() || packs::read_manifest(&pack_dir).is_none() {
-        return Err(format!("No modpack folder for {:?}", pack_id));
-    }
+    let manifest = match packs::read_manifest(&pack_dir) {
+        Some(m) if packs::parse_key(&format!("{}/1", pack_id)).is_ok() => m,
+        _ => return Err(format!("No modpack folder for {:?}", pack_id)),
+    };
+    let Some(_publishing) = PublishingGuard::begin(&pack_id) else {
+        return Err(format!("{} is already publishing", manifest.name));
+    };
     tauri::async_runtime::spawn_blocking(move || {
         // Fail early with a clear sign-in error before any Drive call
         crate::google::access_token()?;
@@ -1390,6 +1449,26 @@ mod tests {
             "Casual Shitters is linked to its creator. Fork it to make changes."
         );
         assert!(fake.tree("root").is_empty());
+    }
+
+    #[test]
+    fn publishing_guard_clears_on_drop_and_panic() {
+        let mods = scratch("publishing-guard");
+        let id = format!("guard-{}", uuid::Uuid::new_v4());
+        let listed = |mods: &Path| publishing_packs(mods).iter().any(|p| p.pack_id == id);
+        {
+            let _guard = PublishingGuard::begin(&id).unwrap();
+            assert!(listed(&mods));
+            assert!(PublishingGuard::begin(&id).is_none());
+        }
+        assert!(!listed(&mods));
+        let caught = std::panic::catch_unwind(|| {
+            let _guard = PublishingGuard::begin(&id).unwrap();
+            panic!("publish died");
+        });
+        assert!(caught.is_err());
+        assert!(!listed(&mods));
+        assert!(PublishingGuard::begin(&id).is_some());
     }
 
     #[test]
