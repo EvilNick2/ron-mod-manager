@@ -346,27 +346,32 @@ async function launchGame() {
     <div class="sidebar-section" v-if="store.currentMode === 'Installed'">
       <h3 class="section-label">Modpacks</h3>
       <div class="preset-list" v-if="store.packs.length > 0">
-        <div class="preset-item" v-for="pack in store.packs" :key="pack.pack_id">
-          <button
-            class="preset-apply-btn"
-            :class="{ active: store.activePresetName === `pack:${pack.pack_id}` }"
-            @click="showPack(pack)"
-            :title="`${packLabel(pack.name, pack.version)} (${pack.mod_ids.length} mods)`"
-          >
-            {{ packLabel(pack.name, pack.version) }}
+        <div
+          class="pack-card"
+          v-for="pack in store.packs"
+          :key="pack.pack_id"
+          :class="{ active: store.activePresetName === `pack:${pack.pack_id}` }"
+          @click="showPack(pack)"
+          :title="`${packLabel(pack.name, pack.version)} (${pack.mod_ids.length} mods)`"
+        >
+          <div class="pack-card-top">
+            <span class="pack-card-name">{{ pack.name }}</span>
             <span class="preset-count">{{ pack.mod_ids.length }}</span>
-          </button>
-          <button class="preset-action-btn" @click="applyPack(pack)"
-            title="Apply Modpack"
-          >
-            <Check :size="14" color="#22c55e" />
-          </button>
-          <button class="preset-action-btn" @click="exportPack(pack)" title="Export Modpack to .zip">
-            <Upload :size="14" color="#f59e0b" />
-          </button>
-          <button class="preset-delete-btn preset-action-btn" @click="removePack(pack)" title="Delete Modpack">
-            <X :size="14" color="#ef4444" />
-          </button>
+          </div>
+          <div class="pack-card-bottom">
+            <span class="pack-card-version">{{ pack.version ? `v${pack.version}` : "" }}</span>
+            <div class="pack-card-actions">
+              <button class="pack-icon-btn" @click.stop="applyPack(pack)" title="Apply Modpack">
+                <Check :size="13" color="#22c55e" />
+              </button>
+              <button class="pack-icon-btn" @click.stop="exportPack(pack)" title="Export Modpack to .zip">
+                <Upload :size="13" color="#f59e0b" />
+              </button>
+              <button class="pack-icon-btn pack-icon-delete" @click.stop="removePack(pack)" title="Delete Modpack">
+                <X :size="13" color="#ef4444" />
+              </button>
+            </div>
+          </div>
         </div>
       </div>
       <p v-else class="preset-empty">No modpacks imported yet.</p>
@@ -704,6 +709,84 @@ async function launchGame() {
 .preset-delete-btn:hover {
   border-color: #ef4444;
   color: #ef4444;
+  background: rgba(239, 68, 68, 0.1);
+}
+
+.pack-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border-light);
+  border-radius: 6px;
+  padding: 0.5rem 0.6rem 0.4rem 0.75rem;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  transition: border-color 0.2s, background 0.2s;
+}
+
+.pack-card:hover {
+  border-color: var(--accent-primary);
+  background: var(--bg-hover);
+}
+
+.pack-card.active {
+  border-color: #22c55e;
+  box-shadow: 0 0 15px rgba(34, 197, 94, 0.2);
+  background: rgba(34, 197, 94, 0.08);
+}
+
+.pack-card.active .preset-count {
+  color: #22c55e;
+}
+
+.pack-card-top,
+.pack-card-bottom {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.pack-card-name {
+  color: var(--text-main);
+  font-size: 0.8rem;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+.pack-card-version {
+  color: var(--text-muted);
+  font-size: 0.7rem;
+}
+
+.pack-card-actions {
+  display: flex;
+  gap: 0.25rem;
+}
+
+.pack-icon-btn {
+  background: transparent;
+  border: 1px solid transparent;
+  width: 24px;
+  height: 22px;
+  border-radius: 5px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s;
+}
+
+.pack-icon-btn:hover {
+  border-color: var(--border-light);
+  background: var(--bg-darker);
+}
+
+.pack-icon-delete:hover {
+  border-color: #ef4444;
   background: rgba(239, 68, 68, 0.1);
 }
 
