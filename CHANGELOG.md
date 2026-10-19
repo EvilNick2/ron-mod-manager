@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/EvilNick2/ron-mod-manager/compare/v0.4.0...v0.4.1) (2026-10-19)
+
+
+### Bug Fixes
+
+* **ui:** render release notes as markdown in the update modal ([6b40586](https://github.com/EvilNick2/ron-mod-manager/commit/6b405865d2500930f4ab6798db79af56fa1b9015))
+
 ## [0.4.0](https://github.com/EvilNick2/ron-mod-manager/compare/v0.3.0...v0.4.0) (2026-10-19)
 
 
