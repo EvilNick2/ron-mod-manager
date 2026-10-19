@@ -4,6 +4,7 @@ use serde::{Serialize, Deserialize};
 use tauri::{AppHandle, Manager};
 use serde_json::Value;
 use crate::packs::{ensure_editable, ensure_pack_editable, mark_dirty, mark_pack_dirty, link_prefix, read_manifest, write_manifest, PackManifest, resolve_for_delete, resolve_key, parse_key, KeyKind, PackRef};
+use crate::subscribe::{OpGuard, OpKind};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AddonInfo {
@@ -25,6 +26,32 @@ pub struct ModInfo {
     pub enabled: bool,
     pub addons: Vec<AddonInfo>,
     pub pack: Option<PackRef>,
+}
+
+const STAGING_PREFIXES: [&str; 3] = [".import-", ".fork-", ".deleting-"];
+
+/// Staging folders a closed or crashed app left behind. List them at startup, before any op.
+pub(crate) fn leftover_staging(mods_dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(mods_dir) else { return Vec::new() };
+    entries
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .filter(|e| STAGING_PREFIXES.iter().any(|p| e.file_name().to_string_lossy().starts_with(p)))
+        .map(|e| e.path())
+        .collect()
+}
+
+pub(crate) fn remove_staging(paths: &[PathBuf]) {
+    for path in paths {
+        if let Err(e) = fs::remove_dir_all(path) {
+            eprintln!("[VFS] Could not remove leftover staging folder {}: {}", path.display(), e);
+        }
+    }
+}
+
+#[cfg(test)]
+fn sweep_staging(mods_dir: &Path) {
+    remove_staging(&leftover_staging(mods_dir));
 }
 
 pub fn get_mods_dir(app_handle: &AppHandle) -> Result<PathBuf, String> {
@@ -893,9 +920,11 @@ pub fn load_packs(app_handle: tauri::AppHandle) -> Result<Vec<crate::packs::Pack
 // so a partial failure never leaves a pack folder without its pack.json.
 fn delete_pack_dir(mods_dir: &Path, paks_dir: Option<&Path>, pack_id: &str) -> Result<(), String> {
     let pack_dir = mods_dir.join(pack_id);
-    if parse_key(&format!("{}/1", pack_id)).is_err() || read_manifest(&pack_dir).is_none() {
-        return Err(format!("No modpack folder for {:?}", pack_id));
-    }
+    let manifest = match read_manifest(&pack_dir) {
+        Some(m) if parse_key(&format!("{}/1", pack_id)).is_ok() => m,
+        _ => return Err(format!("No modpack folder for {:?}", pack_id)),
+    };
+    let _op = OpGuard::begin_named(&pack_dir, OpKind::Local, &manifest.name)?;
     if let Some(paks_dir) = paks_dir {
         for name in child_dirs(&pack_dir)? {
             let key = format!("{}/{}", pack_id, name);
@@ -955,6 +984,7 @@ fn fork_pack_dir(mods_dir: &Path, pack_id: &str, new_name: &str) -> Result<PackM
         Some(m) if parse_key(&format!("{}/1", pack_id)).is_ok() => m,
         _ => return Err(format!("No modpack folder for {:?}", pack_id)),
     };
+    let _op = OpGuard::begin_named(&pack_dir, OpKind::Local, &source.name)?;
     let name = new_name.trim();
     if name.is_empty() {
         return Err("Enter a name for the fork".to_string());
@@ -1509,6 +1539,7 @@ fn import_from_archive(archive: &Path, mods_dir: &Path, paks_dir: &Path) -> Resu
     let archive = read_pack_archive(&mut zip)?;
     let plan = plan_import(&archive, mods_dir)?;
     let pack_id = archive.pack.pack_id.clone();
+    let _op = OpGuard::begin_named(&mods_dir.join(&pack_id), OpKind::Local, &archive.pack.name)?;
 
     let staging = mods_dir.join(format!(".import-{}", uuid::Uuid::new_v4()));
     let staged = staging.join(&pack_id);
@@ -2078,6 +2109,44 @@ mod tests {
         put(m, "5543/a.pak", b"a");
         enable_key(m, p, "5543").unwrap();
         cs_v16_zip(&z.join("v16.zip"));
+    }
+
+    #[test]
+    fn busy_pack_refuses_delete_fork_and_import() {
+        use crate::subscribe::{OpGuard, OpKind};
+        let (m, p, z) = (scratch("busy-mods"), scratch("busy-paks"), scratch("busy-zips"));
+        cs_v15_zip(&z.join("v15.zip"));
+        import_from_archive(&z.join("v15.zip"), &m, &p).unwrap();
+        cs_v16_zip(&z.join("v16.zip"));
+        let before = tree(&m);
+        {
+            let _held = OpGuard::begin(&m.join("CS"), OpKind::Download).unwrap();
+            let busy = "CS is busy, try again when it finishes";
+            assert_eq!(delete_pack_dir(&m, Some(&p), "CS").unwrap_err(), busy);
+            assert_eq!(fork_pack_dir(&m, "CS", "Mine").unwrap_err(), busy);
+            let err = import_from_archive(&z.join("v16.zip"), &m, &p).unwrap_err();
+            assert_eq!(err, busy);
+            assert_eq!(tree(&m), before);
+            assert!(no_staging_left(&m));
+        }
+        import_from_archive(&z.join("v16.zip"), &m, &p).unwrap();
+        fork_pack_dir(&m, "CS", "Mine").unwrap();
+        delete_pack_dir(&m, Some(&p), "CS").unwrap();
+    }
+
+    #[test]
+    fn sweep_staging_removes_only_leftover_staging() {
+        let m = scratch("sweep-staging");
+        for dir in [".import-1/CS/3063", ".fork-2/Mine/3063", ".deleting-3/3063", "CS/3063", ".other/x", "3151"] {
+            fs::create_dir_all(m.join(dir)).unwrap();
+        }
+        put(&m, ".import-1/CS/3063/a.pak", b"a");
+        put(&m, ".import-file", b"not a folder");
+        put(&m, "CS/pack.json", b"{}");
+        sweep_staging(&m);
+        assert_eq!(names(&m), vec![".import-file", ".other", "3151", "CS"]);
+        assert!(m.join("CS/3063").is_dir() && m.join(".other/x").is_dir());
+        sweep_staging(&m.join("missing"));
     }
 
     #[test]

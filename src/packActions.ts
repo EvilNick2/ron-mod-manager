@@ -306,9 +306,18 @@ export async function importArchive(archivePath: string): Promise<void> {
   try {
     await loadPacks();
     const preview = await invoke("inspect_preset_archive", { archivePath }) as ImportPreview;
+    const busy = `${preview.pack.name} is busy, try again when it finishes`;
+    if (store.inFlight[preview.pack.pack_id]) {
+      await showAlert(busy);
+      return;
+    }
     const installed = store.packs.find((p) => p.pack_id === preview.pack.pack_id);
     const question = importQuestion(preview, installed);
     if (question && !(await showConfirm(question))) return;
+    if (store.inFlight[preview.pack.pack_id]) {
+      await showAlert(busy);
+      return;
+    }
 
     const summary = await invoke("import_preset", { archivePath }) as ImportSummary;
     await finishImport(summary, imported);

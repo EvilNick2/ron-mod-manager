@@ -15,9 +15,27 @@ use tauri::{Emitter, Manager};
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // A second instance would sweep the first one's staging folders, so it focuses the first and exits
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .setup(|app| {
+            // Runs before the window loads, so before the first scan and before any op can stage
+            // Listed now, removed off the main thread so a large leftover does not delay the window
+            if let Ok(mods_dir) = vfs::get_mods_dir(app.handle()) {
+                let leftovers = vfs::leftover_staging(&mods_dir);
+                if !leftovers.is_empty() {
+                    std::thread::spawn(move || vfs::remove_staging(&leftovers));
+                }
+            }
+            Ok(())
+        })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let app = window.app_handle();

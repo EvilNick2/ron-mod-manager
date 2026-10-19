@@ -50,6 +50,7 @@ export interface UpdateCheck {
 export interface CloseBlocked {
   dirty: PackRef[];
   uploading: PackRef[];
+  downloading: PackRef[];
 }
 
 export interface DialogRequest {

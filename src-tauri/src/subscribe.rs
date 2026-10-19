@@ -218,10 +218,22 @@ pub fn inspect_link(drive: &dyn DriveApi, link: &DriveLink, mods_dir: &Path) -> 
     })
 }
 
-// Cancel flags of the downloads running now, keyed by pack folder
-static RUNNING: Mutex<BTreeMap<PathBuf, Arc<AtomicBool>>> = Mutex::new(BTreeMap::new());
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OpKind {
+    Download,
+    Publish,
+    Local,
+}
 
-fn running() -> std::sync::MutexGuard<'static, BTreeMap<PathBuf, Arc<AtomicBool>>> {
+struct RunningOp {
+    kind: OpKind,
+    flag: Arc<AtomicBool>,
+}
+
+// Every op that writes to a pack, keyed by pack folder. The cancel flag is only read by downloads.
+static RUNNING: Mutex<BTreeMap<PathBuf, RunningOp>> = Mutex::new(BTreeMap::new());
+
+fn running() -> std::sync::MutexGuard<'static, BTreeMap<PathBuf, RunningOp>> {
     RUNNING.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -233,18 +245,18 @@ pub(crate) struct OpGuard {
 
 impl OpGuard {
     /// None while another op for the pack is running
-    pub(crate) fn begin(pack_dir: &Path) -> Option<OpGuard> {
+    pub(crate) fn begin(pack_dir: &Path, kind: OpKind) -> Option<OpGuard> {
         let mut ops = running();
         if ops.contains_key(pack_dir) {
             return None;
         }
         let flag = Arc::new(AtomicBool::new(false));
-        ops.insert(pack_dir.to_path_buf(), flag.clone());
+        ops.insert(pack_dir.to_path_buf(), RunningOp { kind, flag: flag.clone() });
         Some(OpGuard { pack_dir: pack_dir.to_path_buf(), flag })
     }
 
-    fn begin_named(pack_dir: &Path, name: &str) -> Result<OpGuard, String> {
-        OpGuard::begin(pack_dir).ok_or_else(|| format!("{} is busy, try again when it finishes", name))
+    pub(crate) fn begin_named(pack_dir: &Path, kind: OpKind, name: &str) -> Result<OpGuard, String> {
+        OpGuard::begin(pack_dir, kind).ok_or_else(|| format!("{} is busy, try again when it finishes", name))
     }
 
     pub(crate) fn cancelled(&self) -> bool {
@@ -258,15 +270,36 @@ impl Drop for OpGuard {
     }
 }
 
-/// Asks the op running for a pack to stop. False when none is running.
+/// Asks the download running for a pack to stop. False when none is running.
 pub(crate) fn request_cancel(pack_dir: &Path) -> bool {
     match running().get(pack_dir) {
-        Some(flag) => {
-            flag.store(true, Ordering::Relaxed);
+        Some(op) if op.kind == OpKind::Download => {
+            op.flag.store(true, Ordering::Relaxed);
             true
         }
-        None => false,
+        _ => false,
     }
+}
+
+/// The packs in mods_dir with an op of this kind running, by name
+pub(crate) fn running_packs(mods_dir: &Path, kind: OpKind) -> Vec<PackRef> {
+    let dirs: Vec<PathBuf> = running()
+        .iter()
+        .filter(|(dir, op)| op.kind == kind && dir.parent() == Some(mods_dir))
+        .map(|(dir, _)| dir.clone())
+        .collect();
+    let mut out: Vec<PackRef> = dirs
+        .into_iter()
+        .filter_map(|dir| {
+            let id = dir.file_name()?.to_string_lossy().to_string();
+            Some(match packs::read_manifest(&dir) {
+                Some(m) => PackRef { pack_id: id, name: m.name, version: m.version },
+                None => PackRef { name: id.clone(), pack_id: id, version: None },
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
 }
 
 #[tauri::command]
@@ -403,7 +436,7 @@ pub fn add_from_link(
     check_target(mods_dir, &remote.manifest.pack_id)?;
     let archive = pack_archive(&remote.manifest);
     let plan = vfs::plan_import(&archive, mods_dir)?;
-    let op = OpGuard::begin_named(&mods_dir.join(&remote.manifest.pack_id), &remote.manifest.name)?;
+    let op = OpGuard::begin_named(&mods_dir.join(&remote.manifest.pack_id), OpKind::Download, &remote.manifest.name)?;
     let staging = mods_dir.join(format!(".import-{}", uuid::Uuid::new_v4()));
     let staged = staging.join(&archive.pack.pack_id);
     let mod_ids = archive.folders.iter().map(|(id, _)| id.clone()).collect();
@@ -716,7 +749,7 @@ pub fn update_pack(
     progress: &mut dyn FnMut(Progress),
 ) -> Result<UpdateSummary, String> {
     let (pack_dir, local, link) = linked_pack(mods_dir, pack_id)?;
-    let op = OpGuard::begin_named(&pack_dir, &local.name)?;
+    let op = OpGuard::begin_named(&pack_dir, OpKind::Download, &local.name)?;
     let remote = fetch_remote(drive, &link)?;
     let manifest = &remote.manifest;
     if manifest.pack_id != pack_id {
@@ -1790,13 +1823,13 @@ mod tests {
     fn cancel_flag_cleared_after_op() {
         const ID: &str = "Cancel-Flag";
         {
-            let guard = OpGuard::begin(Path::new("Cancel-Guard")).unwrap();
+            let guard = OpGuard::begin(Path::new("Cancel-Guard"), OpKind::Download).unwrap();
             assert!(!guard.cancelled());
             assert!(request_cancel(Path::new("Cancel-Guard")));
             assert!(guard.cancelled());
         }
         assert!(!request_cancel(Path::new("Cancel-Guard")));
-        assert!(!OpGuard::begin(Path::new("Cancel-Guard")).unwrap().cancelled());
+        assert!(!OpGuard::begin(Path::new("Cancel-Guard"), OpKind::Download).unwrap().cancelled());
 
         let fake = FakeDrive::new();
         let remote = remote_fixture_as(&fake, &base_mods(), ID);
@@ -1821,6 +1854,48 @@ mod tests {
     }
 
     #[test]
+    fn publish_and_download_refuse_each_other() {
+        const ID: &str = "Publish-Clash";
+        let busy = format!("{} is busy, try again when it finishes", NAME);
+        let fake = FakeDrive::new();
+        let remote = remote_fixture_as(&fake, &base_mods(), ID);
+
+        // A publish started while an update downloads
+        let (mods, paks) = (scratch("sub-clash"), scratch("sub-clash-paks"));
+        add(&fake, &remote, &mods, &paks).unwrap();
+        bump(&fake, &remote);
+        let refused = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let (seen, pack_dir) = (refused.clone(), mods.join(ID));
+        fake.cancel_after(0, move || {
+            let other = FakeDrive::new();
+            *seen.borrow_mut() = crate::publish::publish_pack(&other, &pack_dir, "9.0.0", 0, &mut |_| {}).err();
+        });
+        update_pack(&fake, &mods, &paks, ID, false, &[], &mut |_| {}).unwrap();
+        assert_eq!(refused.borrow().as_deref(), Some(busy.as_str()));
+
+        // A download started while a publish runs
+        let (mods, paks) = (scratch("sub-clash-pub"), scratch("sub-clash-pub-paks"));
+        let pack_dir = mods.join(ID);
+        fs::create_dir_all(pack_dir.join("3063")).unwrap();
+        fs::write(pack_dir.join("3063/a.pak"), "a").unwrap();
+        let local = PackManifest { pack_id: ID.into(), name: NAME.into(), mod_ids: vec!["3063".into()], ..Default::default() };
+        packs::write_manifest(&pack_dir, &local).unwrap();
+        let before = listing(&mods);
+        let mut refused = None;
+        let downloads = fake.downloads();
+        crate::publish::publish_pack(&FakeDrive::new(), &pack_dir, "1.0.0", 0, &mut |_| {
+            if refused.is_none() {
+                refused = Some(add(&fake, &remote, &mods, &paks).unwrap_err());
+            }
+        })
+        .unwrap();
+        assert_eq!(refused, Some(busy));
+        assert_eq!(fake.downloads(), downloads);
+        assert!(no_staging(&mods));
+        assert_eq!(listing(&mods).len(), before.len());
+    }
+
+    #[test]
     fn second_op_on_a_pack_is_refused() {
         const ID: &str = "Busy-Pack";
         let fake = FakeDrive::new();
@@ -1831,8 +1906,8 @@ mod tests {
         let before = listing(&mods);
         let busy = format!("{} is busy, try again when it finishes", NAME);
         {
-            let held = OpGuard::begin(&mods.join(ID)).unwrap();
-            assert!(OpGuard::begin(&mods.join(ID)).is_none());
+            let held = OpGuard::begin(&mods.join(ID), OpKind::Download).unwrap();
+            assert!(OpGuard::begin(&mods.join(ID), OpKind::Download).is_none());
             let downloads = fake.downloads();
             assert_eq!(add(&fake, &remote, &mods, &paks).unwrap_err(), busy);
             assert_eq!(update_pack(&fake, &mods, &paks, ID, false, &[], &mut |_| {}).unwrap_err(), busy);
@@ -1842,7 +1917,7 @@ mod tests {
             assert_eq!(listing(&mods), before);
             assert!(!held.cancelled());
         }
-        assert!(OpGuard::begin(&mods.join(ID)).is_some());
+        assert!(OpGuard::begin(&mods.join(ID), OpKind::Download).is_some());
         let summary = update_pack(&fake, &mods, &paks, ID, false, &[], &mut |_| {}).unwrap();
         assert_eq!(summary.pack.version.as_deref(), Some("1.1"));
     }

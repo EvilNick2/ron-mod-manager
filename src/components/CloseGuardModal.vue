@@ -8,6 +8,8 @@ import { showAlert } from "../dialogs";
 const busy = ref(false);
 
 const uploading = computed(() => store.closeBlocked?.uploading ?? []);
+const downloading = computed(() => store.closeBlocked?.downloading ?? []);
+const transferring = computed(() => uploading.value.length > 0 || downloading.value.length > 0);
 
 const progress = computed(() => Object.values(store.packProgress).map((p) => ({
   key: p.pack_id,
@@ -23,14 +25,27 @@ function joinNames(packs: PackRef[]): string {
     : names.join("");
 }
 
+function stillDoing(packs: PackRef[], what: string): string {
+  return `${joinNames(packs)} ${packs.length > 1 ? "are" : "is"} still ${what}`;
+}
+
 const message = computed(() => {
-  if (uploading.value.length > 0) {
-    const verb = uploading.value.length > 1 ? "are" : "is";
-    return `${joinNames(uploading.value)} ${verb} still uploading. Close anyway, or cancel?`;
+  if (transferring.value) {
+    const parts = [];
+    if (uploading.value.length > 0) parts.push(stillDoing(uploading.value, "uploading"));
+    if (downloading.value.length > 0) parts.push(stillDoing(downloading.value, "downloading"));
+    return `${parts.join(" and ")}. Close anyway, or cancel?`;
   }
   const dirty = store.closeBlocked?.dirty ?? [];
   const verb = dirty.length > 1 ? "have" : "has";
   return `${joinNames(dirty)} ${verb} changes that are not uploaded. Upload now, close anyway, or cancel?`;
+});
+
+const title = computed(() => {
+  if (uploading.value.length > 0 && downloading.value.length > 0) return "Transfers In Progress";
+  if (uploading.value.length > 0) return "Upload In Progress";
+  if (downloading.value.length > 0) return "Download In Progress";
+  return "Changes Not Uploaded";
 });
 
 async function forceClose() {
@@ -46,7 +61,7 @@ async function uploadNow() {
   busy.value = true;
   try {
     const dirty = await invoke("list_dirty_packs") as PackRef[];
-    if (dirty.length > 0) store.closeBlocked = { dirty, uploading: [] };
+    if (dirty.length > 0) store.closeBlocked = { dirty, uploading: [], downloading: [] };
     await loadPacks();
     for (const entry of dirty) {
       const pack = store.packs.find((p) => p.pack_id === entry.pack_id);
@@ -73,7 +88,7 @@ function cancel() {
 <template>
   <div v-if="store.closeBlocked" class="modal-overlay">
     <div class="guard-modal">
-      <h2 class="modal-title">{{ uploading.length > 0 ? "Upload In Progress" : "Changes Not Uploaded" }}</h2>
+      <h2 class="modal-title">{{ title }}</h2>
       <p class="guard-desc">{{ message }}</p>
       <div v-for="p in progress" :key="p.key" class="guard-progress">
         <p class="guard-progress-line">{{ p.name }}: {{ p.line }}</p>
@@ -82,7 +97,7 @@ function cancel() {
       <div class="modal-actions">
         <button class="secondary-btn" @click="cancel" :disabled="busy">Cancel</button>
         <button class="secondary-btn" @click="forceClose" :disabled="busy">Close anyway</button>
-        <button v-if="uploading.length === 0" class="primary-btn" @click="uploadNow" :disabled="busy">
+        <button v-if="!transferring" class="primary-btn" @click="uploadNow" :disabled="busy">
           {{ busy ? "Uploading..." : "Upload now" }}
         </button>
       </div>

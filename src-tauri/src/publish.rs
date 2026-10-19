@@ -2,7 +2,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -12,6 +11,7 @@ use tauri::Emitter;
 use crate::drive::{DriveApi, HttpDrive, Progress, Quota, RemoteFile};
 use crate::hashing::{self, FileEntry};
 use crate::packs::{self, PackRef, Published};
+use crate::subscribe::{running_packs, OpGuard, OpKind};
 
 pub const ROOT_FOLDER: &str = "RoNMM";
 pub const MANIFEST_NAME: &str = "manifest.json";
@@ -148,10 +148,11 @@ pub fn hash_local_pack(pack_dir: &Path, pack_id: &str, progress: &mut dyn FnMut(
         let files = hashing::hash_mod_files_cached(&dir, id, &manifest.local_hashes, &mut fresh, &mut |path| {
             progress(progress_event(pack_id, "hashing", done, total, Some(path), (0, 0)));
         })?;
-        let addons = hashing::addon_states(&dir);
-        let hash = hashing::mod_hash(files.iter().map(|f| (f.path.as_str(), f.sha256.as_str())), &addons);
         let meta = crate::vfs::read_meta(&dir);
         let name = meta.as_ref().and_then(|m| m.get("name")).and_then(|n| n.as_str()).unwrap_or(id).to_string();
+        check_portable(&name, &files)?;
+        let addons = hashing::addon_states(&dir);
+        let hash = hashing::mod_hash(files.iter().map(|f| (f.path.as_str(), f.sha256.as_str())), &addons);
         let version = crate::vfs::meta_version(meta.as_ref());
         mods.push(LocalMod { id: id.clone(), name, version, dir, files, addons, hash });
     }
@@ -163,6 +164,20 @@ pub fn hash_local_pack(pack_dir: &Path, pack_id: &str, progress: &mut dyn FnMut(
     Ok(mods)
 }
 
+// Players refuse a pack with a path Windows cannot store, so the creator is stopped first
+fn check_portable(mod_name: &str, files: &[FileEntry]) -> Result<(), String> {
+    let mut seen: BTreeMap<String, &str> = BTreeMap::new();
+    for f in files {
+        if crate::subscribe::safe_rel_path(&f.path).is_err() {
+            return Err(format!("{}: {} cannot be published because Windows cannot store that name. Rename it first.", mod_name, f.path));
+        }
+        if let Some(other) = seen.insert(f.path.to_lowercase(), &f.path) {
+            return Err(format!("{} has two files that differ only in case: {} and {}", mod_name, other, f.path));
+        }
+    }
+    Ok(())
+}
+
 // Re-reads pack.json so only local_hashes changes, never a dirty flag set while hashing
 fn save_local_hashes(pack_dir: &Path, fresh: BTreeMap<String, packs::CachedHash>) -> Result<(), String> {
     let mut manifest = packs::read_manifest(pack_dir).ok_or("Could not read pack.json")?;
@@ -171,6 +186,16 @@ fn save_local_hashes(pack_dir: &Path, fresh: BTreeMap<String, packs::CachedHash>
     }
     manifest.local_hashes = fresh;
     packs::write_manifest(pack_dir, &manifest)
+}
+
+// A file edited without a new mtime or size keeps a stale cached hash, so the next publish rehashes it
+fn forget_cached_hash(pack_dir: &Path, key: &str) {
+    let Some(mut manifest) = packs::read_manifest(pack_dir) else { return };
+    if manifest.local_hashes.remove(key).is_some() {
+        if let Err(e) = packs::write_manifest(pack_dir, &manifest) {
+            eprintln!("[PUBLISH] Could not update the hash cache: {}", e);
+        }
+    }
 }
 
 fn is_mod_folder_name(name: &str) -> bool {
@@ -599,15 +624,17 @@ pub fn publish_pack(
     progress: &mut dyn FnMut(Progress),
 ) -> Result<PublishOutcome, String> {
     let manifest = packs::read_manifest(pack_dir).ok_or_else(|| format!("Could not read {}", pack_dir.join("pack.json").display()))?;
+    let _op = OpGuard::begin_named(pack_dir, OpKind::Publish, &manifest.name)?;
     let mods_dir = pack_dir.parent().ok_or("The pack folder has no parent")?;
     packs::ensure_pack_editable(mods_dir, &manifest.pack_id)?;
-    let was_dirty = manifest.published.as_ref().map(|p| p.dirty);
-    if was_dirty.is_some() {
+    let was_dirty = manifest.published.as_ref().is_some_and(|p| p.dirty);
+    if was_dirty {
         set_dirty(pack_dir, false)?;
     }
     let result = run_publish(drive, pack_dir, &manifest, version, now, progress);
-    if let (Err(_), Some(dirty)) = (&result, was_dirty) {
-        if let Err(e) = set_dirty(pack_dir, dirty) {
+    // Only ever sets the flag here, since an edit during the publish may have set it already
+    if result.is_err() && was_dirty {
+        if let Err(e) = set_dirty(pack_dir, true) {
             eprintln!("[PUBLISH] Could not mark {} as changed: {}", manifest.pack_id, e);
         }
     }
@@ -713,18 +740,24 @@ fn run_publish(
             };
             let mut sent = 0u64;
             let mut throttle = Throttle::new();
-            let id = drive.upload(&parent, name, &m.dir.join(&up.path), &mut |n| {
+            let uploaded = drive.upload(&parent, name, &m.dir.join(&up.path), &mut |n| {
                 sent += n;
                 if throttle.ready() {
                     let event = progress_event(&pack_id, "uploading", done, total, Some(&up.path), (sent, up.size));
                     progress(event.overall(sent_all + sent.min(up.size), plan.upload_bytes));
                 }
             })?;
+            // The manifest records the hash taken before the upload, so the bytes sent must match it
+            let hashed = m.files.iter().find(|f| f.path == up.path).map(|f| f.sha256.as_str());
+            if hashed != Some(uploaded.sha256.as_str()) {
+                forget_cached_hash(pack_dir, &format!("{}/{}", m.id, up.path));
+                return Err(format!("{} changed during the publish. Publish again.", up.path));
+            }
             done += 1;
             sent_all += up.size;
             let event = progress_event(&pack_id, "uploading", done, total, Some(&up.path), (up.size, up.size));
             progress(event.overall(sent_all, plan.upload_bytes));
-            new_ids.insert((m.id.as_str(), up.path.as_str()), id);
+            new_ids.insert((m.id.as_str(), up.path.as_str()), uploaded.id);
         }
         folder_ids.insert(m.id.as_str(), folder_id);
     }
@@ -803,57 +836,29 @@ pub fn dirty_packs(mods_dir: &Path) -> Vec<PackRef> {
     out
 }
 
-static PUBLISHING: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
-
-fn publishing_set() -> std::sync::MutexGuard<'static, BTreeSet<String>> {
-    PUBLISHING.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// Marks a pack as publishing until dropped, so an error or a panic still clears it
-pub(crate) struct PublishingGuard(String);
-
-impl PublishingGuard {
-    pub(crate) fn begin(pack_id: &str) -> Option<PublishingGuard> {
-        publishing_set().insert(pack_id.to_string()).then(|| PublishingGuard(pack_id.to_string()))
-    }
-}
-
-impl Drop for PublishingGuard {
-    fn drop(&mut self) {
-        publishing_set().remove(&self.0);
-    }
-}
-
 pub fn publishing_packs(mods_dir: &Path) -> Vec<PackRef> {
-    let ids: Vec<String> = publishing_set().iter().cloned().collect();
-    let mut out: Vec<PackRef> = ids
-        .into_iter()
-        .map(|id| match packs::read_manifest(&mods_dir.join(&id)) {
-            Some(m) => PackRef { pack_id: id, name: m.name, version: m.version },
-            None => PackRef { name: id.clone(), pack_id: id, version: None },
-        })
-        .collect();
-    out.sort_by(|a, b| a.name.cmp(&b.name));
-    out
+    running_packs(mods_dir, OpKind::Publish)
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq)]
 pub struct CloseBlocked {
     pub dirty: Vec<PackRef>,
     pub uploading: Vec<PackRef>,
+    pub downloading: Vec<PackRef>,
 }
 
 /// None when nothing stops the app from closing
 pub fn close_blocked(mods_dir: &Path) -> Option<CloseBlocked> {
     let uploading = publishing_packs(mods_dir);
+    let downloading = running_packs(mods_dir, OpKind::Download);
     let dirty: Vec<PackRef> = dirty_packs(mods_dir)
         .into_iter()
         .filter(|d| !uploading.iter().any(|u| u.pack_id == d.pack_id))
         .collect();
-    if dirty.is_empty() && uploading.is_empty() {
+    if dirty.is_empty() && uploading.is_empty() && downloading.is_empty() {
         None
     } else {
-        Some(CloseBlocked { dirty, uploading })
+        Some(CloseBlocked { dirty, uploading, downloading })
     }
 }
 
@@ -879,13 +884,9 @@ pub async fn publish_pack_cmd(app_handle: tauri::AppHandle, pack_id: String, ver
     }
     let mods_dir = crate::vfs::get_mods_dir(&app_handle)?;
     let pack_dir = mods_dir.join(&pack_id);
-    let manifest = match packs::read_manifest(&pack_dir) {
-        Some(m) if packs::parse_key(&format!("{}/1", pack_id)).is_ok() => m,
-        _ => return Err(format!("No modpack folder for {:?}", pack_id)),
-    };
-    let Some(_publishing) = PublishingGuard::begin(&pack_id) else {
-        return Err(format!("{} is already publishing", manifest.name));
-    };
+    if packs::read_manifest(&pack_dir).is_none() || packs::parse_key(&format!("{}/1", pack_id)).is_err() {
+        return Err(format!("No modpack folder for {:?}", pack_id));
+    }
     tauri::async_runtime::spawn_blocking(move || {
         // Fail early with a clear sign-in error before any Drive call
         crate::google::access_token()?;
@@ -1502,7 +1503,7 @@ mod tests {
         fn share_anyone(&self, file_id: &str) -> Result<(), String> {
             self.inner.share_anyone(file_id)
         }
-        fn upload(&self, parent: &str, name: &str, src: &Path, on_bytes: &mut dyn FnMut(u64)) -> Result<String, String> {
+        fn upload(&self, parent: &str, name: &str, src: &Path, on_bytes: &mut dyn FnMut(u64)) -> Result<crate::drive::Uploaded, String> {
             self.inner.upload(parent, name, src, on_bytes)
         }
         fn create_bytes(&self, parent: &str, name: &str, bytes: &[u8]) -> Result<String, String> {
@@ -1668,21 +1669,152 @@ mod tests {
     #[test]
     fn publishing_guard_clears_on_drop_and_panic() {
         let mods = scratch("publishing-guard");
-        let id = format!("guard-{}", uuid::Uuid::new_v4());
+        let id = "Guard-Pack";
         let listed = |mods: &Path| publishing_packs(mods).iter().any(|p| p.pack_id == id);
         {
-            let _guard = PublishingGuard::begin(&id).unwrap();
+            let _guard = OpGuard::begin(&mods.join(id), OpKind::Publish).unwrap();
             assert!(listed(&mods));
-            assert!(PublishingGuard::begin(&id).is_none());
+            assert!(OpGuard::begin(&mods.join(id), OpKind::Publish).is_none());
         }
         assert!(!listed(&mods));
         let caught = std::panic::catch_unwind(|| {
-            let _guard = PublishingGuard::begin(&id).unwrap();
+            let _guard = OpGuard::begin(&mods.join(id), OpKind::Publish).unwrap();
             panic!("publish died");
         });
         assert!(caught.is_err());
         assert!(!listed(&mods));
-        assert!(PublishingGuard::begin(&id).is_some());
+        assert!(OpGuard::begin(&mods.join(id), OpKind::Publish).is_some());
+    }
+
+    #[test]
+    fn close_blocked_tells_uploads_from_downloads() {
+        let mods = scratch("close-blocked");
+        let mk = |id: &str, name: &str, dirty: bool| {
+            let dir = mods.join(id);
+            fs::create_dir_all(&dir).unwrap();
+            let published = Some(Published { folder_id: "f".into(), dirty });
+            let man = PackManifest { pack_id: id.into(), name: name.into(), published, ..Default::default() };
+            packs::write_manifest(&dir, &man).unwrap();
+        };
+        mk("up", "Up", true);
+        mk("down", "Down", false);
+        mk("edit", "Edit", true);
+        assert_eq!(close_blocked(&mods).unwrap().dirty.len(), 2);
+        let _up = OpGuard::begin(&mods.join("up"), OpKind::Publish).unwrap();
+        let _down = OpGuard::begin(&mods.join("down"), OpKind::Download).unwrap();
+        let _local = OpGuard::begin(&mods.join("local-op"), OpKind::Local).unwrap();
+        let blocked = close_blocked(&mods).unwrap();
+        let names = |refs: &[PackRef]| refs.iter().map(|p| p.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&blocked.uploading), vec!["Up"]);
+        assert_eq!(names(&blocked.downloading), vec!["Down"]);
+        assert_eq!(names(&blocked.dirty), vec!["Edit"]);
+    }
+
+    #[test]
+    fn close_blocked_while_only_downloading() {
+        let mods = scratch("close-downloading");
+        assert!(close_blocked(&mods).is_none());
+        let guard = OpGuard::begin(&mods.join("Fresh-Pack"), OpKind::Download).unwrap();
+        let blocked = close_blocked(&mods).unwrap();
+        assert_eq!(blocked.downloading.len(), 1);
+        assert_eq!(blocked.downloading[0].pack_id, "Fresh-Pack");
+        assert!(blocked.dirty.is_empty() && blocked.uploading.is_empty());
+        drop(guard);
+        assert!(close_blocked(&mods).is_none());
+    }
+
+    #[test]
+    fn publish_error_keeps_dirty_set_during_publish() {
+        let pack_dir = pack_fixture("dirty-on-error", &base_mods());
+        let fake = FakeDrive::new();
+        publish(&fake, &pack_dir, "1.0").unwrap();
+        assert!(!packs::read_manifest(&pack_dir).unwrap().published.unwrap().dirty);
+        fs::write(pack_dir.join("3063").join(A_PAK), "vests-v2").unwrap();
+        fake.fail_uploads_after(0);
+        let mods_dir = pack_dir.parent().unwrap().to_path_buf();
+        let err = publish_pack(&fake, &pack_dir, "1.1", 1792364400, &mut |p: Progress| {
+            if p.stage == "checking_drive" {
+                packs::mark_pack_dirty(&mods_dir, PACK);
+            }
+        });
+        assert!(err.is_err());
+        assert!(packs::read_manifest(&pack_dir).unwrap().published.unwrap().dirty);
+    }
+
+    #[test]
+    fn publish_error_leaves_clean_pack_clean() {
+        let pack_dir = pack_fixture("clean-on-error", &base_mods());
+        let fake = FakeDrive::new();
+        publish(&fake, &pack_dir, "1.0").unwrap();
+        fs::write(pack_dir.join("3063").join(A_PAK), "vests-v2").unwrap();
+        fake.fail_uploads_after(0);
+        assert!(publish(&fake, &pack_dir, "1.1").is_err());
+        assert!(!packs::read_manifest(&pack_dir).unwrap().published.unwrap().dirty);
+    }
+
+    #[test]
+    fn file_changed_after_hashing_refused() {
+        let pack_dir = pack_fixture("changed-mid", &base_mods());
+        let fake = FakeDrive::new();
+        let vests = pack_dir.join("3063").join(A_PAK);
+        let err = publish_pack(&fake, &pack_dir, "1.0", 1792364400, &mut |p: Progress| {
+            // The last hashing event comes after every file is hashed
+            if p.stage == "hashing" && p.file.is_none() {
+                fs::write(&vests, "vests-edited").unwrap();
+            }
+        })
+        .unwrap_err();
+        assert_eq!(err, format!("{} changed during the publish. Publish again.", A_PAK));
+        assert_eq!(remote_manifest(&fake).status, "updating");
+        assert!(packs::read_manifest(&pack_dir).unwrap().published.is_none());
+
+        publish(&fake, &pack_dir, "1.0").unwrap();
+        let man = remote_manifest(&fake);
+        assert_eq!(man.status, "ready");
+        assert_manifest_matches_drive(&fake);
+        assert_eq!(fake.file_bytes(&pack_folder(&fake), &format!("3063/{}", A_PAK)), Some(b"vests-edited".to_vec()));
+    }
+
+    #[test]
+    fn stale_cached_hash_is_caught_and_dropped() {
+        let pack_dir = cache_fixture("cache-stale-upload");
+        local(&pack_dir);
+        let key = format!("3063/{}", A_PAK);
+        set_cached_sha(&pack_dir, &key, "bogus");
+        let fake = FakeDrive::new();
+        let err = publish(&fake, &pack_dir, "1.0").unwrap_err();
+        assert_eq!(err, format!("{} changed during the publish. Publish again.", A_PAK));
+        assert!(!packs::read_manifest(&pack_dir).unwrap().local_hashes.contains_key(&key));
+        publish(&fake, &pack_dir, "1.0").unwrap();
+        assert_manifest_matches_drive(&fake);
+    }
+
+    #[test]
+    fn names_windows_cannot_store_are_refused() {
+        let refused = |name: &str, path: &str| {
+            let pack_dir = pack_fixture(name, &base_mods());
+            put_mod(&pack_dir, "3063", &[(path, "x".to_string())]);
+            let fake = FakeDrive::new();
+            let err = publish(&fake, &pack_dir, "1.0").unwrap_err();
+            assert_eq!(err, format!("Better Vests: {} cannot be published because Windows cannot store that name. Rename it first.", path));
+            assert!(fake.tree("root").is_empty());
+        };
+        refused("win-colon", "a:b.pak");
+        refused("win-dot", "trailing.");
+        refused("win-space", "trailing ");
+        refused("win-reserved", "CON.pak");
+        refused("win-reserved-dir", "addons/aux/x.pak");
+        refused("win-backslash", "back\\slash.pak");
+    }
+
+    #[test]
+    fn case_only_duplicates_are_refused() {
+        let pack_dir = pack_fixture("win-case", &base_mods());
+        put_mod(&pack_dir, "3063", &[("Foo.pak", "a".to_string()), ("foo.pak", "b".to_string())]);
+        let fake = FakeDrive::new();
+        let err = publish(&fake, &pack_dir, "1.0").unwrap_err();
+        assert_eq!(err, "Better Vests has two files that differ only in case: Foo.pak and foo.pak");
+        assert!(fake.tree("root").is_empty());
     }
 
     #[test]

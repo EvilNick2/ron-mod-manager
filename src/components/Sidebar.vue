@@ -114,7 +114,9 @@ async function exportPack(pack: PackManifest) {
 }
 
 async function removePack(pack: PackManifest) {
+  if (store.inFlight[pack.pack_id]) return;
   if (!(await showConfirm(`Delete ${packLabel(pack.name, pack.version)} and its ${pack.mod_ids.length} mods from disk?`, { danger: true, confirmLabel: "Delete" }))) return;
+  if (store.inFlight[pack.pack_id]) return;
   try {
     await invoke("delete_pack", { packId: pack.pack_id });
     await refreshMods();
@@ -371,7 +373,12 @@ async function launchGame() {
                   <button class="pack-menu-item" @click="fromMenu(forkPack, pack)">Fork</button>
                 </div>
               </div>
-              <button class="pack-icon-btn pack-icon-delete" @click.stop="removePack(pack)" title="Delete Modpack">
+              <button
+                class="pack-icon-btn pack-icon-delete"
+                @click.stop="removePack(pack)"
+                :disabled="!!store.inFlight[pack.pack_id]"
+                title="Delete Modpack"
+              >
                 <X :size="13" color="#ef4444" />
               </button>
             </div>

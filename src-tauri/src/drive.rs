@@ -83,6 +83,13 @@ impl Progress {
     }
 }
 
+/// A finished upload, with the SHA-256 of the bytes Drive accepted
+#[derive(Clone, Debug, PartialEq)]
+pub struct Uploaded {
+    pub id: String,
+    pub sha256: String,
+}
+
 pub trait DriveApi {
     fn list(&self, folder_id: &str) -> Result<Vec<RemoteFile>, String>;
     fn read(&self, file_id: &str) -> Result<Vec<u8>, String>;
@@ -99,7 +106,7 @@ pub trait DriveApi {
     fn find_folder(&self, parent: Option<&str>, name: &str) -> Result<Option<String>, String>;
     fn create_folder(&self, parent: Option<&str>, name: &str) -> Result<String, String>;
     fn share_anyone(&self, file_id: &str) -> Result<(), String>;
-    fn upload(&self, parent: &str, name: &str, src: &Path, on_bytes: &mut dyn FnMut(u64)) -> Result<String, String>;
+    fn upload(&self, parent: &str, name: &str, src: &Path, on_bytes: &mut dyn FnMut(u64)) -> Result<Uploaded, String>;
     fn create_bytes(&self, parent: &str, name: &str, bytes: &[u8]) -> Result<String, String>;
     fn update_bytes(&self, file_id: &str, bytes: &[u8]) -> Result<(), String>;
     fn delete(&self, file_id: &str) -> Result<(), String>;
@@ -241,7 +248,8 @@ impl HttpDrive {
         v["id"].as_str().map(str::to_string).ok_or_else(|| "Google Drive did not return an id".to_string())
     }
 
-    /// Resumable upload where `read_at(offset, len)` supplies the bytes.
+    /// Resumable upload where `read_at(offset, len)` supplies the bytes. Hashes the bytes as Drive
+    /// confirms them, so the hash covers what was stored even when a chunk is read again on a retry.
     fn upload_resumable(
         &self,
         parent: &str,
@@ -249,7 +257,7 @@ impl HttpDrive {
         total: u64,
         read_at: &mut dyn FnMut(u64, usize) -> Result<Vec<u8>, String>,
         on_bytes: &mut dyn FnMut(u64),
-    ) -> Result<String, String> {
+    ) -> Result<Uploaded, String> {
         let meta = serde_json::json!({ "name": name, "parents": [parent] });
         let start = self.send(&[], || {
             self.client
@@ -265,16 +273,18 @@ impl HttpDrive {
             .map(str::to_string)
             .ok_or_else(|| "Google Drive did not start an upload session".to_string())?;
 
-        let finish = |resp: Response| -> Result<String, String> {
+        let mut hasher = Sha256::new();
+        let finish = |resp: Response, hasher: Sha256| -> Result<Uploaded, String> {
             let v: serde_json::Value = Self::json(resp)?;
-            v["id"].as_str().map(str::to_string).ok_or_else(|| "Google Drive did not return an id".to_string())
+            let id = v["id"].as_str().map(str::to_string).ok_or_else(|| "Google Drive did not return an id".to_string())?;
+            Ok(Uploaded { id, sha256: hashing::hex(&hasher.finalize()) })
         };
 
         if total == 0 {
             let resp = self.send(&[], || {
                 self.client.put(&session).header("Content-Length", "0").header("Content-Range", "bytes */0")
             })?;
-            return finish(resp);
+            return finish(resp, hasher);
         }
 
         let mut offset = 0u64;
@@ -282,6 +292,8 @@ impl HttpDrive {
         loop {
             let len = UPLOAD_CHUNK.min(total - offset);
             let chunk = read_at(offset, len as usize)?;
+            // Drive confirms a prefix of the chunk sent, which is hashed from this copy
+            let sent = chunk.clone();
             let range = format!("bytes {}-{}/{}", offset, offset + len - 1, total);
             let attempt = self.prepare(self.client.put(&session))?.header("Content-Range", range).body(chunk).send();
             let outcome = match attempt {
@@ -289,7 +301,8 @@ impl HttpDrive {
                     let status = resp.status().as_u16();
                     if status == 200 || status == 201 {
                         on_bytes(total - offset);
-                        return finish(resp);
+                        hasher.update(&sent);
+                        return finish(resp, hasher);
                     } else if status == 308 {
                         let next = next_offset(&resp);
                         if next > offset {
@@ -311,6 +324,7 @@ impl HttpDrive {
             match outcome {
                 Ok(next) => {
                     on_bytes(next.saturating_sub(offset));
+                    hasher.update(&sent[..(next - offset).min(len) as usize]);
                     offset = next;
                     failures = 0;
                 }
@@ -330,10 +344,20 @@ impl HttpDrive {
                         let status = resp.status().as_u16();
                         if status == 200 || status == 201 {
                             on_bytes(total - offset);
-                            return finish(resp);
+                            hasher.update(&sent);
+                            return finish(resp, hasher);
                         }
                         if status == 308 {
                             let next = next_offset(&resp);
+                            if next < offset {
+                                // Drive lost bytes it had confirmed, so the hash can only restart from zero
+                                if next != 0 {
+                                    return Err("Google Drive lost part of the upload".to_string());
+                                }
+                                hasher = Sha256::new();
+                            } else {
+                                hasher.update(&sent[..(next - offset).min(len) as usize]);
+                            }
                             on_bytes(next.saturating_sub(offset));
                             offset = next;
                         }
@@ -502,7 +526,7 @@ impl DriveApi for HttpDrive {
         self.send(&[], || self.client.post(&url).json(&body)).map(|_| ())
     }
 
-    fn upload(&self, parent: &str, name: &str, src: &Path, on_bytes: &mut dyn FnMut(u64)) -> Result<String, String> {
+    fn upload(&self, parent: &str, name: &str, src: &Path, on_bytes: &mut dyn FnMut(u64)) -> Result<Uploaded, String> {
         let total = fs::metadata(src).map_err(|e| format!("Could not read {}: {}", src.display(), e))?.len();
         let mut file = File::open(src).map_err(|e| format!("Could not open {}: {}", src.display(), e))?;
         let mut read_at = |offset: u64, len: usize| -> Result<Vec<u8>, String> {
@@ -516,7 +540,7 @@ impl DriveApi for HttpDrive {
 
     fn create_bytes(&self, parent: &str, name: &str, bytes: &[u8]) -> Result<String, String> {
         let mut read_at = |offset: u64, len: usize| Ok(bytes[offset as usize..offset as usize + len].to_vec());
-        self.upload_resumable(parent, name, bytes.len() as u64, &mut read_at, &mut |_| {})
+        self.upload_resumable(parent, name, bytes.len() as u64, &mut read_at, &mut |_| {}).map(|u| u.id)
     }
 
     fn update_bytes(&self, file_id: &str, bytes: &[u8]) -> Result<(), String> {
@@ -783,17 +807,18 @@ pub mod fake {
             }
         }
 
-        fn upload(&self, parent: &str, name: &str, src: &Path, on_bytes: &mut dyn FnMut(u64)) -> Result<String, String> {
+        fn upload(&self, parent: &str, name: &str, src: &Path, on_bytes: &mut dyn FnMut(u64)) -> Result<Uploaded, String> {
             let bytes = fs::read(src).map_err(|e| format!("Could not read {}: {}", src.display(), e))?;
             let len = bytes.len() as u64;
             if self.fail_after.get().is_some_and(|limit| self.uploads.get() >= limit) {
                 self.fail_after.set(None);
                 return Err("Google Drive error 500: injected upload failure".to_string());
             }
+            let sha256 = hashing::sha256_bytes(&bytes);
             let id = self.add_file(parent, name, bytes)?;
             self.uploads.set(self.uploads.get() + 1);
             on_bytes(len);
-            Ok(id)
+            Ok(Uploaded { id, sha256 })
         }
 
         fn create_bytes(&self, parent: &str, name: &str, bytes: &[u8]) -> Result<String, String> {
@@ -903,7 +928,9 @@ mod tests {
         assert_eq!(drive.find_folder(None, "Pack").unwrap(), Some(folder.clone()));
         let sub = drive.create_folder(Some(&folder), "Mod").unwrap();
         let mut seen = 0;
-        let id = drive.upload(&sub, "a.bin", &src, &mut |n| seen += n).unwrap();
+        let up = drive.upload(&sub, "a.bin", &src, &mut |n| seen += n).unwrap();
+        let id = up.id;
+        assert_eq!(up.sha256, crate::hashing::sha256_bytes(b"hello"));
         assert_eq!(seen, 5);
         assert_eq!(drive.uploads(), 1);
 
