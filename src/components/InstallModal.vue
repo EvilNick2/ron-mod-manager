@@ -1,13 +1,17 @@
 <script setup lang="ts">
 import { store } from "../store";
+import { refreshMods } from "../packActions";
+import { showAlert, showConfirm } from "../dialogs";
 import { invoke } from "@tauri-apps/api/core";
-import { ref, watch } from "vue";
+import { computed, ref, watch } from "vue";
 import { Archive, FileArchive, FolderOpen, Puzzle, Trash2, Plus } from 'lucide-vue-next';
 
 const nexusInput = ref("");
 const isInstalling = ref(false);
 const errorMsg = ref("");
+const installPackId = ref("");
 const postInstallAddons = ref<string[]>([]);
+const editablePacks = computed(() => store.packs.filter((p) => !p.source));
 
 watch(() => store.awaitingDropForId, (newId) => {
   if (newId) {
@@ -29,7 +33,8 @@ function extractModId(input: string): string | null {
 
 async function startInstall() {
   errorMsg.value = "";
-  if (!store.installingModPath) return;
+  const archivePath = store.installingModPath;
+  if (!archivePath) return;
 
   const modId = extractModId(nexusInput.value);
   if (!modId) {
@@ -37,19 +42,50 @@ async function startInstall() {
     return;
   }
 
+  const packId = installPackId.value;
+  if (packId) {
+    const archive = archivePath.split(/[\\/]/).pop();
+    const root = store.mods.find((m: any) => m.id === modId);
+    const packCopy = store.mods.find((m: any) => m.id === `${packId}/${modId}`);
+    const packName = store.packs.find((p) => p.pack_id === packId)?.name ?? packId;
+    let question = "";
+    if (packCopy) {
+      question = `Replaces ${packCopy.version} in ${packName} with ${archive}?`;
+      if (root) question += " The hand installed copy will be replaced too.";
+    } else if (root) {
+      question = `Replaces the hand installed copy ${root.version} with ${archive}?`;
+    }
+    if (question && !(await showConfirm(question))) return;
+  }
+
   isInstalling.value = true;
   try {
-    console.log("[InstallModal] Starting install for modId:", modId, "path:", store.installingModPath);
+    console.log("[InstallModal] Starting install for modId:", modId, "path:", archivePath);
     await invoke("install_mod_archive", { 
-      archivePath: store.installingModPath, 
+      archivePath, 
       modId: modId
     });
     
+    let postId = modId;
+    let moveWarning = "";
+    if (packId) {
+      try {
+        postId = await invoke("move_to_pack", { key: modId, packId });
+      } catch (e: any) {
+        const msg = String(e);
+        const match = msg.match(/^Moved to (\S+)/);
+        postId = match ? match[1] : modId;
+        moveWarning = match ? msg : "Installed, but could not add to the modpack: " + msg;
+      }
+    }
+
     console.log("[InstallModal] Install succeeded, scanning mods...");
-    store.mods = await invoke("scan_local_mods");
+    await refreshMods();
     
-    console.log("[InstallModal] Setting postInstallModId to:", modId);
-    store.postInstallModId = modId;
+    console.log("[InstallModal] Setting postInstallModId to:", postId);
+    store.postInstallModId = postId;
+    installPackId.value = "";
+    if (moveWarning) await showAlert(moveWarning);
     store.installingModPath = null;
     store.awaitingDropForId = null;
     nexusInput.value = "";
@@ -74,7 +110,7 @@ async function pickPostInstallAddon() {
     if (file) {
       const added: string[] = await invoke("install_addon", { modId: store.postInstallModId, archivePath: file });
       postInstallAddons.value = [...postInstallAddons.value, ...added];
-      store.mods = await invoke("scan_local_mods");
+      await refreshMods();
     }
   } catch (e: any) {
     errorMsg.value = "Failed to add addon: " + e;
@@ -86,7 +122,7 @@ async function removePostInstallAddon(filename: string) {
   try {
     await invoke("remove_addon", { modId: store.postInstallModId, filename });
     postInstallAddons.value = postInstallAddons.value.filter(f => f !== filename);
-    store.mods = await invoke("scan_local_mods");
+    await refreshMods();
   } catch (e: any) {
     errorMsg.value = "Failed to remove addon: " + e;
   }
@@ -98,6 +134,7 @@ function cancelInstall() {
   store.postInstallModId = null;
   postInstallAddons.value = [];
   nexusInput.value = "";
+  installPackId.value = "";
   errorMsg.value = "";
 }
 
@@ -173,6 +210,14 @@ async function browseForArchive() {
           class="dark-input" 
           :disabled="isInstalling"
         />
+      </div>
+      
+      <div class="input-group" v-if="editablePacks.length">
+        <label>Install into</label>
+        <select v-model="installPackId" class="dark-input" :disabled="isInstalling">
+          <option value="">None</option>
+          <option v-for="p in editablePacks" :key="p.pack_id" :value="p.pack_id">{{ p.name }}</option>
+        </select>
       </div>
       
       <div v-if="errorMsg" class="error-msg">{{ errorMsg }}</div>

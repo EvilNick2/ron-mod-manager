@@ -1,9 +1,10 @@
 use std::fs;
-use std::sync::Arc;
 use std::path::{Path, PathBuf};
 use serde::{Serialize, Deserialize};
 use tauri::{AppHandle, Manager};
 use serde_json::Value;
+use crate::packs::{ensure_editable, ensure_pack_editable, mark_dirty, mark_pack_dirty, link_prefix, read_manifest, write_manifest, PackManifest, resolve_for_delete, resolve_key, parse_key, KeyKind, PackRef};
+use crate::subscribe::{OpGuard, OpKind};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AddonInfo {
@@ -24,6 +25,33 @@ pub struct ModInfo {
     pub thumbnail_url: Option<String>,
     pub enabled: bool,
     pub addons: Vec<AddonInfo>,
+    pub pack: Option<PackRef>,
+}
+
+const STAGING_PREFIXES: [&str; 3] = [".import-", ".fork-", ".deleting-"];
+
+/// Staging folders a closed or crashed app left behind. List them at startup, before any op.
+pub(crate) fn leftover_staging(mods_dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(mods_dir) else { return Vec::new() };
+    entries
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .filter(|e| STAGING_PREFIXES.iter().any(|p| e.file_name().to_string_lossy().starts_with(p)))
+        .map(|e| e.path())
+        .collect()
+}
+
+pub(crate) fn remove_staging(paths: &[PathBuf]) {
+    for path in paths {
+        if let Err(e) = fs::remove_dir_all(path) {
+            eprintln!("[VFS] Could not remove leftover staging folder {}: {}", path.display(), e);
+        }
+    }
+}
+
+#[cfg(test)]
+fn sweep_staging(mods_dir: &Path) {
+    remove_staging(&leftover_staging(mods_dir));
 }
 
 pub fn get_mods_dir(app_handle: &AppHandle) -> Result<PathBuf, String> {
@@ -47,102 +75,128 @@ pub fn get_mods_dir(app_handle: &AppHandle) -> Result<PathBuf, String> {
     Ok(base_dir)
 }
 
-#[tauri::command]
-pub async fn scan_local_mods(app_handle: tauri::AppHandle) -> Result<Vec<ModInfo>, String> {
-    let mods_dir = get_mods_dir(&app_handle)?;
-    let mut mods = Vec::new();
+fn read_mod(dir: &Path, key: String, pack: Option<PackRef>) -> ModInfo {
+    let metadata_path = dir.join("metadata.json");
+    
+    let folder = dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let mut info = ModInfo {
+        id: key.clone(),
+        name: folder.clone(),
+        description: "No metadata found.".to_string(),
+        version: "1.0.0".to_string(),
+        latest_version: None,
+        update_available: false,
+        nexus_mod_id: folder.parse::<u32>().ok(),
+        author: "Unknown".to_string(),
+        thumbnail_url: None,
+        enabled: false,
+        addons: Vec::new(),
+        pack,
+    };
 
-    if let Ok(entries) = fs::read_dir(mods_dir) {
-        for entry in entries.filter_map(Result::ok) {
-            let path = entry.path();
+    if let Ok(content) = fs::read_to_string(&metadata_path) {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(name) = parsed.get("name").and_then(|n| n.as_str()) {
+                info.name = name.to_string();
+            }
+            if let Some(desc) = parsed.get("summary").or_else(|| parsed.get("description")).and_then(|d| d.as_str()) {
+                info.description = desc.to_string();
+            }
+            if let Some(author) = parsed.get("author").and_then(|a| a.as_str()) {
+                info.author = author.to_string();
+            }
+            if let Some(version) = parsed.get("version")
+                .or_else(|| parsed.get("version"))
+                .and_then(|v| v.as_str()) {
+                info.version = version.to_string();
+            }
+            if let Some(update_available) = parsed.get("update_available").and_then(|v| v.as_bool()) {
+                info.update_available = update_available;
+            }
+            if let Some(mod_id) = parsed.get("mod_id").and_then(|v| v.as_u64()) {
+                info.nexus_mod_id = Some(mod_id as u32);
+            }
             
-            if path.is_dir() {
-                let id = entry.file_name().to_string_lossy().to_string();
-                let metadata_path = path.join("metadata.json");
-                
-                let mut info = ModInfo {
-                    id: id.clone(),
-                    name: id.clone(),
-                    description: "No metadata found.".to_string(),
-                    version: "1.0.0".to_string(),
-                    latest_version: None,
-                    update_available: false,
-                    nexus_mod_id: id.parse::<u32>().ok(),
-                    author: "Unknown".to_string(),
-                    thumbnail_url: None,
-                    enabled: false,
-                    addons: Vec::new(),
-                };
+            let thumb_path = dir.join("thumbnail.jpg");
+            if let Ok(bytes) = std::fs::read(&thumb_path) {
+                use base64::prelude::*;
+                let b64 = BASE64_STANDARD.encode(&bytes);
+                info.thumbnail_url = Some(format!("data:image/jpeg;base64,{}", b64));
+            } else if let Some(pic) = parsed.get("picture_url").and_then(|p| p.as_str()) {
+                info.thumbnail_url = Some(pic.to_string());
+            }
 
-                if let Ok(content) = fs::read_to_string(&metadata_path) {
-                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content) {
-                        if let Some(name) = parsed.get("name").and_then(|n| n.as_str()) {
-                            info.name = name.to_string();
-                        }
-                        if let Some(desc) = parsed.get("summary").or_else(|| parsed.get("description")).and_then(|d| d.as_str()) {
-                            info.description = desc.to_string();
-                        }
-                        if let Some(author) = parsed.get("author").and_then(|a| a.as_str()) {
-                            info.author = author.to_string();
-                        }
-                        if let Some(version) = parsed.get("version")
-                            .or_else(|| parsed.get("version"))
-                            .and_then(|v| v.as_str()) {
-                            info.version = version.to_string();
-                        }
-                        if let Some(update_available) = parsed.get("update_available").and_then(|v| v.as_bool()) {
-                            info.update_available = update_available;
-                        }
-                        if let Some(mod_id) = parsed.get("mod_id").and_then(|v| v.as_u64()) {
-                            info.nexus_mod_id = Some(mod_id as u32);
-                        }
-                        
-                        let thumb_path = path.join("thumbnail.jpg");
-                        if let Ok(bytes) = std::fs::read(&thumb_path) {
-                            use base64::prelude::*;
-                            let b64 = BASE64_STANDARD.encode(&bytes);
-                            info.thumbnail_url = Some(format!("data:image/jpeg;base64,{}", b64));
-                        } else if let Some(pic) = parsed.get("picture_url").and_then(|p| p.as_str()) {
-                            info.thumbnail_url = Some(pic.to_string());
-                        }
-
-                        if let Some(enabled) = parsed.get("enabled").and_then(|e| e.as_bool()) {
-                            info.enabled = enabled;
-                        }
-                    }
-                }
-                
-                let addons_dir = path.join("addons");
-                if addons_dir.exists() && addons_dir.is_dir() {
-                    if let Ok(addon_entries) = fs::read_dir(&addons_dir) {
-                        for addon_entry in addon_entries.filter_map(Result::ok) {
-                            let ap = addon_entry.path();
-                            if ap.is_file() {
-                                let ext = ap.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-                                if ext == "pak" {
-                                    let filename = ap.file_name().unwrap().to_string_lossy().to_string();
-                                    let addon_enabled = if let Ok(content) = fs::read_to_string(&metadata_path) {
-                                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content) {
-                                            parsed.get("addons")
-                                                .and_then(|a| a.get(&filename))
-                                                .and_then(|a| a.get("enabled"))
-                                                .and_then(|e| e.as_bool())
-                                                .unwrap_or(false)
-                                        } else { false }
-                                    } else { false };
-                                    info.addons.push(AddonInfo { filename, enabled: addon_enabled });
-                                }
-                            }
-                        }
-                    }
-                }
-                
-                mods.push(info);
+            if let Some(enabled) = parsed.get("enabled").and_then(|e| e.as_bool()) {
+                info.enabled = enabled;
             }
         }
     }
     
-    Ok(mods)
+    let addons_dir = dir.join("addons");
+    if addons_dir.exists() && addons_dir.is_dir() {
+        if let Ok(addon_entries) = fs::read_dir(&addons_dir) {
+            for addon_entry in addon_entries.filter_map(Result::ok) {
+                let ap = addon_entry.path();
+                if ap.is_file() {
+                    let ext = ap.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+                    if ext == "pak" {
+                        let filename = ap.file_name().unwrap().to_string_lossy().to_string();
+                        let addon_enabled = if let Ok(content) = fs::read_to_string(&metadata_path) {
+                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content) {
+                                parsed.get("addons")
+                                    .and_then(|a| a.get(&filename))
+                                    .and_then(|a| a.get("enabled"))
+                                    .and_then(|e| e.as_bool())
+                                    .unwrap_or(false)
+                            } else { false }
+                        } else { false };
+                        info.addons.push(AddonInfo { filename, enabled: addon_enabled });
+                    }
+                }
+            }
+        }
+    }
+
+    info
+}
+
+fn scan_dir(mods_dir: &Path) -> Vec<ModInfo> {
+    let mut mods = Vec::new();
+    let Ok(entries) = fs::read_dir(mods_dir) else {
+        return mods;
+    };
+
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !path.is_dir() || name.starts_with('.') {
+            continue;
+        }
+
+        if let Some(manifest) = read_manifest(&path) {
+            let pack = PackRef { pack_id: name.clone(), name: manifest.name, version: manifest.version };
+            let Ok(children) = fs::read_dir(&path) else {
+                continue;
+            };
+            for child in children.filter_map(Result::ok) {
+                let child_path = child.path();
+                let child_name = child.file_name().to_string_lossy().to_string();
+                if child_path.is_dir() && !child_name.starts_with('.') {
+                    mods.push(read_mod(&child_path, format!("{}/{}", name, child_name), Some(pack.clone())));
+                }
+            }
+        } else {
+            mods.push(read_mod(&path, name, None));
+        }
+    }
+
+    mods
+}
+
+#[tauri::command]
+pub async fn scan_local_mods(app_handle: tauri::AppHandle) -> Result<Vec<ModInfo>, String> {
+    let mods_dir = get_mods_dir(&app_handle)?;
+    Ok(scan_dir(&mods_dir))
 }
 
 #[tauri::command]
@@ -239,13 +293,42 @@ pub async fn refresh_installed_mod_updates(app_handle: tauri::AppHandle) -> Resu
     Ok(updated_count)
 }
 
+fn extract_rar(archive: &Path, dest: &Path) -> Result<(), String> {
+    fs::create_dir_all(dest).map_err(|e| format!("Failed to create directory: {}", e))?;
+    let mut open = unrar::Archive::new(archive)
+        .open_for_processing()
+        .map_err(|e| format!("Failed to open RAR: {}", e))?;
+    while let Some(header) = open.read_header().map_err(|e| format!("Failed to read RAR: {}", e))? {
+        open = if header.entry().is_file() {
+            header.extract_with_base(dest)
+        } else {
+            header.skip()
+        }
+        .map_err(|e| format!("Failed to extract RAR: {}", e))?;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn install_mod_archive(app_handle: tauri::AppHandle, archive_path: String, mod_id: String) -> Result<(), String> {
     let mods_dir = get_mods_dir(&app_handle)?;
-    let target_dir = mods_dir.join(&mod_id);
-    
+    if !matches!(parse_key(&mod_id)?, KeyKind::Loose(_)) {
+        return Err(format!("Archives can only be installed to a loose mod, not {}", mod_id));
+    }
+    let target_dir = resolve_key(&mods_dir, &mod_id)?;
+    let paks_dir = get_paks_dir(&app_handle).ok();
+
+    let was_enabled = fs::read_to_string(target_dir.join("metadata.json"))
+        .ok()
+        .and_then(|c| serde_json::from_str::<Value>(&c).ok())
+        .and_then(|v| v.get("enabled").and_then(Value::as_bool))
+        .unwrap_or(false);
+    if let Some(paks_dir) = &paks_dir {
+        unlink_mod(paks_dir, &mod_id)?;
+    }
+
     if target_dir.exists() {
-        std::fs::remove_dir_all(&target_dir).ok();
+        std::fs::remove_dir_all(&target_dir).map_err(|e| format!("Failed to remove the old copy of {}: {}", mod_id, e))?;
     }
     std::fs::create_dir_all(&target_dir).map_err(|e| format!("Failed to create mod directory: {}", e))?;
     
@@ -258,27 +341,10 @@ pub async fn install_mod_archive(app_handle: tauri::AppHandle, archive_path: Str
         let outpath = target_dir.join(file_name);
         std::fs::copy(&archive_path, &outpath).map_err(|e| format!("Failed to copy .pak file: {}", e))?;
     } else if extension == "rar" {
-        let media = Arc::new(rar_stream::LocalFileMedia::new(&archive_path).map_err(|e| format!("Failed to open RAR: {}", e))?);
-        let pkg = rar_stream::RarFilesPackage::new(vec![media]);
-        let files = pkg.parse(rar_stream::ParseOptions::default()).await
-            .map_err(|e| format!("Failed to parse RAR: {}", e))?;
-
-        for file in files {
-            let outpath = target_dir.join(&file.name);
-            if let Some(parent) = outpath.parent() {
-                std::fs::create_dir_all(parent).map_err(|_| "Failed to create directory in RAR")?;
-            }
-            
-            if file.name.ends_with('/') || file.name.ends_with('\\') {
-                continue;
-            }
-
-            let content = file.read_to_end().await
-                .map_err(|e| format!("Failed to read file {}: {}", file.name, e))?;
-            
-            std::fs::write(&outpath, content)
-                .map_err(|e| format!("Failed to write extracted file {}: {}", file.name, e))?;
-        }
+        let (a, d) = (path.to_path_buf(), target_dir.clone());
+        tauri::async_runtime::spawn_blocking(move || extract_rar(&a, &d))
+            .await
+            .map_err(|e| e.to_string())??;
     } else {
         // Assume it's a zip and extract
         let file = std::fs::File::open(&archive_path).map_err(|e| format!("Failed to open archive: {}", e))?;
@@ -319,6 +385,13 @@ pub async fn install_mod_archive(app_handle: tauri::AppHandle, archive_path: Str
             }
         }
     }
+
+    set_enabled_flag(&target_dir, was_enabled);
+    if was_enabled {
+        if let Some(paks_dir) = &paks_dir {
+            enable_key(&mods_dir, paks_dir, &mod_id)?;
+        }
+    }
     
     Ok(())
 }
@@ -333,114 +406,240 @@ fn create_link(src: &Path, dst: &Path) -> std::io::Result<()> {
     std::fs::hard_link(src, dst).or_else(|_| std::fs::copy(src, dst).map(|_| ()))
 }
 
-#[tauri::command]
-pub async fn toggle_mod(app_handle: tauri::AppHandle, mod_id: String, enable: bool) -> Result<(), String> {
-    let mods_dir = get_mods_dir(&app_handle)?;
-    let target_dir = mods_dir.join(&mod_id);
-    
-    let config = crate::config::load_config(app_handle.clone()).map_err(|e| e.to_string())?;
-    let game_path_str = config.game_path.ok_or("Game installation path is not set! Please configure it in the Settings tab.")?;
-    let game_path = PathBuf::from(game_path_str);
-    
-    let mut paks_mod_dir = game_path.clone();
-    if !paks_mod_dir.ends_with("Paks") {
-        paks_mod_dir.push("ReadyOrNot");
-        paks_mod_dir.push("Content");
-        paks_mod_dir.push("Paks");
-    }
-    
-    if enable && !paks_mod_dir.exists() {
-        std::fs::create_dir_all(&paks_mod_dir).map_err(|e| format!("Failed to create Paks directory: {}", e))?;
-    }
-    
-    fn find_paks(dir: &Path, paks: &mut Vec<PathBuf>) {
+fn is_deployable(path: &Path) -> bool {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    matches!(ext.as_str(), "pak" | "ucas" | "utoc")
+}
+
+fn collect_deployables(mod_dir: &Path) -> Vec<PathBuf> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.filter_map(Result::ok) {
                 let path = entry.path();
                 if path.is_dir() {
-                    if path.file_name().and_then(|n| n.to_str()) == Some("addons") {
-                        continue;
+                    if path.file_name().and_then(|n| n.to_str()) != Some("addons") {
+                        walk(&path, out);
                     }
-                    find_paks(&path, paks);
-                } else if path.is_file() {
-                    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-                    if ext == "pak" {
-                        paks.push(path);
-                    }
+                } else if path.is_file() && is_deployable(&path) {
+                    out.push(path);
                 }
             }
         }
     }
+    let mut out = Vec::new();
+    walk(mod_dir, &mut out);
+    out.sort();
+    out
+}
 
-    let mut paks = Vec::new();
-    find_paks(&target_dir, &mut paks);
-
-    for path in paks {
-        let file_name = path.file_name().unwrap();
-        let link_name = format!("{}_{}", mod_id, file_name.to_string_lossy());
-        let link_path = paks_mod_dir.join(&link_name);
-        
-        if enable {
-            if !link_path.exists() {
-                create_link(&path, &link_path).map_err(|e| format!("Failed to inject mod: {}", e))?;
-            }
-        } else {
-            if link_path.exists() {
-                std::fs::remove_file(&link_path).map_err(|e| format!("Failed to remove injected mod: {}", e))?;
+fn addon_files(addons_dir: &Path, pak_filename: &str) -> Vec<PathBuf> {
+    let pak = addons_dir.join(pak_filename);
+    let mut out = vec![pak.clone()];
+    if let Ok(entries) = std::fs::read_dir(addons_dir) {
+        for p in entries.filter_map(Result::ok).map(|e| e.path()) {
+            let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+            if p.is_file() && p != pak && (ext == "ucas" || ext == "utoc") && p.file_stem() == pak.file_stem() {
+                out.push(p);
             }
         }
     }
-    
-    let metadata_path = target_dir.join("metadata.json");
-    if let Ok(content) = std::fs::read_to_string(&metadata_path) {
-        if let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(&content) {
-            if let Some(obj) = parsed.as_object_mut() {
-                obj.insert("enabled".to_string(), serde_json::Value::Bool(enable));
-            }
-            if let Ok(json_str) = serde_json::to_string_pretty(&parsed) {
-                std::fs::write(&metadata_path, json_str).ok();
-            }
-        }
-    }
-    
-    let addons_dir = target_dir.join("addons");
-    if addons_dir.exists() {
-        if let Ok(entries) = std::fs::read_dir(&addons_dir) {
-            for entry in entries.filter_map(Result::ok) {
-                let ap = entry.path();
-                if ap.is_file() {
-                    let ext = ap.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-                    if ext == "pak" {
-                        let fname = ap.file_name().unwrap().to_string_lossy().to_string();
-                        let link_name = format!("{}_addon_{}", mod_id, fname);
-                        let link_path = paks_mod_dir.join(&link_name);
-                        
-                        if !enable {
-                            if link_path.exists() {
-                                std::fs::remove_file(&link_path).ok();
-                            }
-                        } else {
-                            let addon_enabled = if let Ok(content) = std::fs::read_to_string(&metadata_path) {
-                                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content) {
-                                    parsed.get("addons")
-                                        .and_then(|a| a.get(&fname))
-                                        .and_then(|a| a.get("enabled"))
-                                        .and_then(|e| e.as_bool())
-                                        .unwrap_or(false)
-                                } else { false }
-                            } else { false };
-                            
-                            if addon_enabled && !link_path.exists() {
-                                create_link(&ap, &link_path).ok();
-                            }
-                        }
-                    }
+    out.sort();
+    out
+}
+
+fn entry_present(path: &Path) -> bool {
+    path.symlink_metadata().is_ok()
+}
+
+pub(crate) fn unlink_mod(paks_dir: &Path, key: &str) -> Result<usize, String> {
+    let prefix = link_prefix(key);
+    let entries = match fs::read_dir(paks_dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(format!("Failed to read Paks directory: {}", e)),
+    };
+    let mut removed = 0;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("Failed to read Paks directory: {}", e))?;
+        if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            fs::remove_file(entry.path()).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::PermissionDenied || (cfg!(windows) && e.raw_os_error() == Some(32)) {
+                    "Close Ready or Not and try again".to_string()
+                } else {
+                    format!("Failed to remove injected mod: {}", e)
                 }
+            })?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+#[cfg(unix)]
+pub(crate) fn sweep_orphans(paks_dir: &Path, mods_dir: &Path) -> usize {
+    if !mods_dir.exists() {
+        return 0;
+    }
+    let Ok(entries) = fs::read_dir(paks_dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let is_link = path.symlink_metadata().map(|m| m.file_type().is_symlink()).unwrap_or(false);
+        if !is_link {
+            continue;
+        }
+        if let Ok(target) = fs::read_link(&path) {
+            if target.starts_with(mods_dir) && !target.exists() && fs::remove_file(&path).is_ok() {
+                removed += 1;
             }
         }
     }
-    
+    removed
+}
+
+#[cfg(windows)]
+pub(crate) fn sweep_orphans(_paks_dir: &Path, _mods_dir: &Path) -> usize {
+    0
+}
+
+pub(crate) fn set_enabled_flag(mod_dir: &Path, enabled: bool) {
+    let metadata_path = mod_dir.join("metadata.json");
+    let mut parsed = fs::read_to_string(&metadata_path)
+        .ok()
+        .and_then(|c| serde_json::from_str::<Value>(&c).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if let Some(obj) = parsed.as_object_mut() {
+        obj.insert("enabled".to_string(), Value::Bool(enabled));
+    }
+    if let Ok(json_str) = serde_json::to_string_pretty(&parsed) {
+        fs::write(&metadata_path, json_str).ok();
+    }
+}
+
+pub(crate) fn enable_key(mods_dir: &Path, paks_dir: &Path, key: &str) -> Result<(), String> {
+    parse_key(key)?;
+    let mod_dir = resolve_key(mods_dir, key)?;
+
+    let nexus_id = scan_dir(mods_dir).into_iter().find(|m| m.id == key).and_then(|m| m.nexus_mod_id);
+    if let Some(nexus_id) = nexus_id {
+        for other in scan_dir(mods_dir) {
+            if other.id != key && other.nexus_mod_id == Some(nexus_id) && parse_key(&other.id).is_ok() {
+                unlink_mod(paks_dir, &other.id)?;
+                set_enabled_flag(&resolve_key(mods_dir, &other.id)?, false);
+            }
+        }
+    }
+
+    unlink_mod(paks_dir, key)?;
+    fs::create_dir_all(paks_dir).map_err(|e| format!("Failed to create Paks directory: {}", e))?;
+
+    let result = link_mod_files(&mod_dir, paks_dir, key);
+    if let Err(e) = result {
+        let _ = unlink_mod(paks_dir, key);
+        return Err(e);
+    }
+
+    set_enabled_flag(&mod_dir, true);
     Ok(())
+}
+
+fn shallowest_per_name(files: Vec<PathBuf>, base: &Path) -> Vec<PathBuf> {
+    let mut best: std::collections::BTreeMap<std::ffi::OsString, (usize, PathBuf)> = Default::default();
+    for path in files {
+        let rel = path.strip_prefix(base).unwrap_or(&path);
+        let depth = rel.components().count();
+        let name = path.file_name().unwrap().to_os_string();
+        let better = match best.get(&name) {
+            Some((d, cur)) => (depth, rel) < (*d, cur.strip_prefix(base).unwrap_or(cur)),
+            None => true,
+        };
+        if better {
+            best.insert(name, (depth, path));
+        }
+    }
+    best.into_values().map(|(_, p)| p).collect()
+}
+
+// Every (source, link) pair for a key, the bool marks addon files.
+fn planned_links(mod_dir: &Path, paks_dir: &Path, key: &str) -> Vec<(PathBuf, PathBuf, bool)> {
+    let prefix = link_prefix(key);
+    let mut out = Vec::new();
+    for path in shallowest_per_name(collect_deployables(mod_dir), mod_dir) {
+        let link_path = paks_dir.join(format!("{}{}", prefix, path.file_name().unwrap().to_string_lossy()));
+        out.push((path, link_path, false));
+    }
+
+    let addons_dir = mod_dir.join("addons");
+    let metadata: Option<Value> = fs::read_to_string(mod_dir.join("metadata.json"))
+        .ok()
+        .and_then(|c| serde_json::from_str(&c).ok());
+    if let Ok(entries) = fs::read_dir(&addons_dir) {
+        for ap in entries.filter_map(Result::ok).map(|e| e.path()) {
+            let is_pak = ap.is_file() && ap.extension().and_then(|e| e.to_str()).unwrap_or("").eq_ignore_ascii_case("pak");
+            if !is_pak {
+                continue;
+            }
+            let fname = ap.file_name().unwrap().to_string_lossy().to_string();
+            let addon_enabled = metadata.as_ref()
+                .and_then(|m| m.get("addons"))
+                .and_then(|a| a.get(&fname))
+                .and_then(|a| a.get("enabled"))
+                .and_then(|e| e.as_bool())
+                .unwrap_or(false);
+            if !addon_enabled {
+                continue;
+            }
+            for file in shallowest_per_name(addon_files(&addons_dir, &fname), &addons_dir) {
+                let link_path = paks_dir.join(format!("{}addon_{}", prefix, file.file_name().unwrap().to_string_lossy()));
+                out.push((file, link_path, true));
+            }
+        }
+    }
+    out
+}
+
+fn create_planned(src: &Path, link: &Path, addon: bool) -> Result<(), String> {
+    create_link(src, link).map_err(|e| format!("Failed to inject {}: {}", if addon { "addon" } else { "mod" }, e))
+}
+
+fn link_mod_files(mod_dir: &Path, paks_dir: &Path, key: &str) -> Result<(), String> {
+    for (src, link, addon) in planned_links(mod_dir, paks_dir, key) {
+        create_planned(&src, &link, addon)?;
+    }
+    Ok(())
+}
+
+// Rollback relinking: creates only the links that are gone, so a partly unlinked key is made whole.
+pub(crate) fn link_missing(mods_dir: &Path, paks_dir: &Path, key: &str) -> Result<(), String> {
+    for (src, link, addon) in planned_links(&resolve_key(mods_dir, key)?, paks_dir, key) {
+        if !entry_present(&link) {
+            create_planned(&src, &link, addon)?;
+        }
+    }
+    Ok(())
+}
+
+fn disable_key(mods_dir: &Path, paks_dir: &Path, key: &str) -> Result<(), String> {
+    parse_key(key)?;
+    let mod_dir = resolve_key(mods_dir, key)?;
+    unlink_mod(paks_dir, key)?;
+    set_enabled_flag(&mod_dir, false);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn toggle_mod(app_handle: tauri::AppHandle, mod_id: String, enable: bool) -> Result<(), String> {
+    let config = crate::config::load_config(app_handle.clone()).map_err(|e| e.to_string())?;
+    config.game_path.ok_or("Game installation path is not set! Please configure it in the Settings tab.")?;
+    let paks_dir = get_paks_dir(&app_handle)?;
+    let mods_dir = get_mods_dir(&app_handle)?;
+    if enable {
+        enable_key(&mods_dir, &paks_dir, &mod_id)
+    } else {
+        disable_key(&mods_dir, &paks_dir, &mod_id)
+    }
 }
 
 #[tauri::command]
@@ -456,38 +655,394 @@ pub async fn pick_mod_archive() -> Result<Option<String>, String> {
 
 #[tauri::command]
 pub async fn delete_mod(app_handle: tauri::AppHandle, mod_id: String) -> Result<(), String> {
-    let _ = toggle_mod(app_handle.clone(), mod_id.clone(), false).await;
-    
     let mods_dir = get_mods_dir(&app_handle)?;
-    let target_dir = mods_dir.join(&mod_id);
+    ensure_editable(&mods_dir, &mod_id)?;
+    let target_dir = resolve_for_delete(&mods_dir, &mod_id)?;
+    if parse_key(&mod_id).is_ok() {
+        if let Ok(paks_dir) = get_paks_dir(&app_handle) {
+            disable_key(&mods_dir, &paks_dir, &mod_id)?;
+        }
+    }
     
     if target_dir.exists() {
         std::fs::remove_dir_all(&target_dir).map_err(|e| format!("Failed to obliterate mod directory: {}", e))?;
     }
-    
+    drop_from_manifest(&mods_dir, &mod_id)?;
+    mark_dirty(&mods_dir, &mod_id);
+
+    Ok(())
+}
+
+pub(crate) fn flag_enabled(mod_dir: &Path) -> bool {
+    read_meta(mod_dir).and_then(|m| m.get("enabled").and_then(Value::as_bool)).unwrap_or(false)
+}
+
+// Moves a mod folder to a new key, parking any folder already there aside until the manifest edit lands.
+// On failure everything is put back and relinked as it was. Returns whether the new key should be enabled.
+// Without a Paks folder (no game path) nothing is linked or unlinked.
+fn relocate(
+    mods_dir: &Path,
+    paks_dir: Option<&Path>,
+    old_key: &str,
+    new_key: &str,
+    pack_dir: &Path,
+    edit: impl FnOnce(&mut PackManifest),
+) -> Result<bool, String> {
+    let from = resolve_key(mods_dir, old_key)?;
+    let to = resolve_key(mods_dir, new_key)?;
+    if !from.is_dir() {
+        return Err(format!("No mod folder for key: {:?}", old_key));
+    }
+    let was_enabled = flag_enabled(&from);
+    let replaced = to.exists();
+    let replaced_enabled = replaced && flag_enabled(&to);
+    let aside = to.with_file_name(format!(".replaced-{}", uuid::Uuid::new_v4()));
+
+    let unlink = |key: &str| paks_dir.map_or(Ok(0), |p| unlink_mod(p, key));
+    let restore = |moved: bool, parked: bool| {
+        if moved {
+            let _ = fs::rename(&to, &from);
+        }
+        if parked {
+            let _ = fs::rename(&aside, &to);
+        }
+        if let Some(paks_dir) = paks_dir {
+            if replaced_enabled {
+                let _ = link_missing(mods_dir, paks_dir, new_key);
+            }
+            if was_enabled {
+                let _ = link_missing(mods_dir, paks_dir, old_key);
+            }
+        }
+    };
+
+    if let Err(e) = unlink(old_key) {
+        restore(false, false);
+        return Err(e);
+    }
+    let mut parked = false;
+    if replaced {
+        if let Err(e) = unlink(new_key) {
+            restore(false, false);
+            return Err(e);
+        }
+        if let Err(e) = fs::rename(&to, &aside) {
+            restore(false, false);
+            return Err(format!("Failed to set the old copy aside: {}", e));
+        }
+        parked = true;
+    }
+    if let Err(e) = fs::rename(&from, &to) {
+        restore(false, parked);
+        return Err(format!("Failed to move mod folder: {}", e));
+    }
+    if let Some(mut m) = read_manifest(pack_dir) {
+        edit(&mut m);
+        if let Err(e) = write_manifest(pack_dir, &m) {
+            restore(true, parked);
+            return Err(e);
+        }
+    }
+    if parked {
+        let _ = fs::remove_dir_all(&aside);
+    }
+    Ok(was_enabled || replaced_enabled)
+}
+
+fn enable_moved(mods_dir: &Path, paks_dir: Option<&Path>, new_key: &str) -> Result<(), String> {
+    let Some(paks_dir) = paks_dir else {
+        set_enabled_flag(&resolve_key(mods_dir, new_key)?, true);
+        return Ok(());
+    };
+    enable_key(mods_dir, paks_dir, new_key).map_err(|e| {
+        if let Ok(dir) = resolve_key(mods_dir, new_key) {
+            set_enabled_flag(&dir, false);
+        }
+        format!("Moved to {} but could not enable it: {}", new_key, e)
+    })
+}
+
+// Returns the new key and, when the move worked but relinking did not, the message to report.
+fn move_into_pack(mods_dir: &Path, paks_dir: Option<&Path>, key: &str, pack_id: &str) -> Result<(String, Option<String>), String> {
+    let nexus_id = match parse_key(key)? {
+        KeyKind::Loose(id) => id.to_string(),
+        KeyKind::Pack { .. } => return Err(format!("{:?} is already in a modpack", key)),
+    };
+    let new_key = format!("{}/{}", pack_id, nexus_id);
+    parse_key(&new_key)?;
+    ensure_editable(mods_dir, key)?;
+    ensure_pack_editable(mods_dir, pack_id)?;
+    let pack_dir = mods_dir.join(pack_id);
+    if read_manifest(&pack_dir).is_none() {
+        return Err(format!("No modpack folder for {:?}", pack_id));
+    }
+
+    let enable = relocate(mods_dir, paks_dir, key, &new_key, &pack_dir, |m| {
+        if !m.mod_ids.contains(&nexus_id) {
+            m.mod_ids.push(nexus_id.clone());
+        }
+    })?;
+    mark_dirty(mods_dir, key);
+    mark_pack_dirty(mods_dir, pack_id);
+    let warning = if enable { enable_moved(mods_dir, paks_dir, &new_key).err() } else { None };
+    Ok((new_key, warning))
+}
+
+fn move_out_of_pack(mods_dir: &Path, paks_dir: Option<&Path>, key: &str, replace_root: bool) -> Result<(String, Option<String>), String> {
+    let (pack_id, nexus_id) = match parse_key(key)? {
+        KeyKind::Pack { pack_id, nexus_id } => (pack_id, nexus_id.to_string()),
+        KeyKind::Loose(_) => return Err(format!("{:?} is not in a modpack", key)),
+    };
+    ensure_editable(mods_dir, key)?;
+    if mods_dir.join(&nexus_id).exists() && !replace_root {
+        return Err("root-exists".to_string());
+    }
+    let pack_dir = mods_dir.join(&pack_id);
+
+    let enable = relocate(mods_dir, paks_dir, key, &nexus_id, &pack_dir, |m| m.mod_ids.retain(|id| *id != nexus_id))?;
+    mark_dirty(mods_dir, key);
+    let warning = if enable { enable_moved(mods_dir, paks_dir, &nexus_id).err() } else { None };
+    Ok((nexus_id, warning))
+}
+
+fn drop_from_manifest(mods_dir: &Path, key: &str) -> Result<(), String> {
+    if let Ok(KeyKind::Pack { pack_id, nexus_id }) = parse_key(key) {
+        let pack_dir = mods_dir.join(&pack_id);
+        if let Some(mut m) = read_manifest(&pack_dir) {
+            let id = nexus_id.to_string();
+            m.mod_ids.retain(|x| *x != id);
+            write_manifest(&pack_dir, &m)?;
+        }
+    }
     Ok(())
 }
 
 #[tauri::command]
-pub async fn apply_preset(app_handle: tauri::AppHandle, name: String, mod_ids: Vec<String>) -> Result<(), String> {
-    let all_mods = scan_local_mods(app_handle.clone()).await?;
-    let preset_set: std::collections::HashSet<String> = mod_ids.iter().cloned().collect();
-    
-    for m in &all_mods {
-        if !preset_set.contains(&m.id) && m.enabled {
-            toggle_mod(app_handle.clone(), m.id.clone(), false).await?;
+pub async fn move_to_pack(app_handle: tauri::AppHandle, key: String, pack_id: String) -> Result<String, String> {
+    let mods_dir = get_mods_dir(&app_handle)?;
+    let paks_dir = get_paks_dir(&app_handle).ok();
+    let (new_key, warning) = move_into_pack(&mods_dir, paks_dir.as_deref(), &key, &pack_id)?;
+    finish_move(app_handle, &key, new_key, warning)
+}
+
+#[tauri::command]
+pub async fn remove_from_pack(app_handle: tauri::AppHandle, key: String, replace_root: bool) -> Result<String, String> {
+    let mods_dir = get_mods_dir(&app_handle)?;
+    let paks_dir = get_paks_dir(&app_handle).ok();
+    let (new_key, warning) = move_out_of_pack(&mods_dir, paks_dir.as_deref(), &key, replace_root)?;
+    finish_move(app_handle, &key, new_key, warning)
+}
+
+fn finish_move(app_handle: tauri::AppHandle, old: &str, new_key: String, warning: Option<String>) -> Result<String, String> {
+    let saved = save_renamed_key(app_handle, old, &new_key);
+    match (warning, saved) {
+        (Some(w), Err(e)) => Err(format!("{}. Saved presets were not updated either: {}", w, e)),
+        (Some(w), Ok(())) => Err(w),
+        (None, Err(e)) => Err(format!("Moved to {} but saved presets were not updated: {}", new_key, e)),
+        (None, Ok(())) => Ok(new_key),
+    }
+}
+
+fn save_renamed_key(app_handle: tauri::AppHandle, old: &str, new: &str) -> Result<(), String> {
+    let mut config = crate::config::load_config(app_handle.clone())?;
+    crate::config::rename_key_in_presets(&mut config, old, new);
+    crate::config::save_config(app_handle, config)
+}
+
+#[derive(Serialize, Debug, Default)]
+pub struct ApplySummary {
+    pub enabled: usize,
+    pub disabled: usize,
+    pub missing: usize,
+}
+
+// `disabled` counts mods that had links in Paks or were flagged enabled, not every mod outside the set
+fn apply_keys(mods_dir: &Path, paks_dir: &Path, keys: &[String]) -> Result<ApplySummary, String> {
+    let wanted: std::collections::HashSet<&String> = keys.iter().collect();
+    let mut summary = ApplySummary::default();
+
+    for m in scan_dir(mods_dir) {
+        if wanted.contains(&m.id) || parse_key(&m.id).is_err() {
+            continue;
+        }
+        let had_links = unlink_mod(paks_dir, &m.id)? > 0;
+        disable_key(mods_dir, paks_dir, &m.id)?;
+        if had_links || m.enabled {
+            summary.disabled += 1;
         }
     }
-    
-    for id in mod_ids {
-        toggle_mod(app_handle.clone(), id, true).await?;
+
+    sweep_orphans(paks_dir, mods_dir);
+
+    for key in keys {
+        if resolve_key(mods_dir, key).map(|p| p.is_dir()).unwrap_or(false) {
+            enable_key(mods_dir, paks_dir, key)?;
+            summary.enabled += 1;
+        } else {
+            summary.missing += 1;
+        }
     }
+    Ok(summary)
+}
+
+#[tauri::command]
+pub async fn apply_preset(app_handle: tauri::AppHandle, name: String, mod_ids: Vec<String>) -> Result<ApplySummary, String> {
+    let config = crate::config::load_config(app_handle.clone()).map_err(|e| e.to_string())?;
+    config.game_path.ok_or("Game installation path is not set! Please configure it in the Settings tab.")?;
+    let paks_dir = get_paks_dir(&app_handle)?;
+    let mods_dir = get_mods_dir(&app_handle)?;
+    let summary = apply_keys(&mods_dir, &paks_dir, &mod_ids)?;
 
     let mut config = crate::config::load_config(app_handle.clone())?;
     config.active_preset = Some(name);
     crate::config::save_config(app_handle, config)?;
-    
+
+    Ok(summary)
+}
+
+#[tauri::command]
+pub fn load_packs(app_handle: tauri::AppHandle) -> Result<Vec<crate::packs::PackManifest>, String> {
+    let mods_dir = get_mods_dir(&app_handle)?;
+    let mut packs: Vec<_> = child_dirs(&mods_dir)?
+        .into_iter()
+        .filter_map(|name| read_manifest(&mods_dir.join(name)))
+        .map(|mut m| {
+            // The UI never reads the hash cache, so a big pack does not ship it over IPC
+            m.local_hashes.clear();
+            m
+        })
+        .collect();
+    packs.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(packs)
+}
+
+// Unlinks every mod of the pack, then renames the folder aside before deleting it,
+// so a partial failure never leaves a pack folder without its pack.json.
+fn delete_pack_dir(mods_dir: &Path, paks_dir: Option<&Path>, pack_id: &str) -> Result<(), String> {
+    let pack_dir = mods_dir.join(pack_id);
+    let manifest = match read_manifest(&pack_dir) {
+        Some(m) if parse_key(&format!("{}/1", pack_id)).is_ok() => m,
+        _ => return Err(format!("No modpack folder for {:?}", pack_id)),
+    };
+    let _op = OpGuard::begin_named(&pack_dir, OpKind::Local, &manifest.name)?;
+    if let Some(paks_dir) = paks_dir {
+        for name in child_dirs(&pack_dir)? {
+            let key = format!("{}/{}", pack_id, name);
+            if parse_key(&key).is_ok() {
+                unlink_mod(paks_dir, &key)?;
+            }
+        }
+    }
+    let aside = mods_dir.join(format!(".deleting-{}", uuid::Uuid::new_v4()));
+    fs::rename(&pack_dir, &aside).map_err(|e| format!("Failed to remove modpack folder: {}", e))?;
+    fs::remove_dir_all(&aside).map_err(|e| format!("Failed to remove modpack folder {}: {}", aside.display(), e))
+}
+
+#[tauri::command]
+pub async fn delete_pack(app_handle: tauri::AppHandle, pack_id: String) -> Result<(), String> {
+    let mods_dir = get_mods_dir(&app_handle)?;
+    let paks_dir = get_paks_dir(&app_handle).ok();
+    delete_pack_dir(&mods_dir, paks_dir.as_deref(), &pack_id)?;
+
+    let mut config = crate::config::load_config(app_handle.clone())?;
+    if config.active_preset.as_deref() == Some(&format!("pack:{}", pack_id)) {
+        config.active_preset = None;
+        crate::config::save_config(app_handle, config)?;
+    }
     Ok(())
+}
+
+pub fn pack_size(pack_dir: &Path) -> u64 {
+    walkdir::WalkDir::new(pack_dir)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .filter_map(|e| e.metadata().ok())
+        .map(|m| m.len())
+        .sum()
+}
+
+fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
+    for entry in walkdir::WalkDir::new(from).follow_links(false) {
+        let entry = entry.map_err(|e| format!("Failed to read {}: {}", from.display(), e))?;
+        let rel = entry.path().strip_prefix(from).map_err(|e| e.to_string())?;
+        let dest = to.join(rel);
+        if entry.file_type().is_dir() {
+            fs::create_dir_all(&dest).map_err(|e| format!("Failed to create {}: {}", dest.display(), e))?;
+        } else if entry.file_type().is_file() {
+            fs::copy(entry.path(), &dest).map_err(|e| format!("Failed to copy {}: {}", entry.path().display(), e))?;
+        }
+    }
+    Ok(())
+}
+
+// Copies the pack into a staging folder and renames it into place, so a failure leaves nothing behind.
+fn fork_pack_dir(mods_dir: &Path, pack_id: &str, new_name: &str) -> Result<PackManifest, String> {
+    let pack_dir = mods_dir.join(pack_id);
+    let source = match read_manifest(&pack_dir) {
+        Some(m) if parse_key(&format!("{}/1", pack_id)).is_ok() => m,
+        _ => return Err(format!("No modpack folder for {:?}", pack_id)),
+    };
+    let _op = OpGuard::begin_named(&pack_dir, OpKind::Local, &source.name)?;
+    let name = new_name.trim();
+    if name.is_empty() {
+        return Err("Enter a name for the fork".to_string());
+    }
+    let new_id = crate::packs::slugify(name);
+    let taken = crate::subscribe::is_reserved_name(&new_id)
+        || fs::read_dir(mods_dir)
+            .map_err(|e| format!("Failed to read {}: {}", mods_dir.display(), e))?
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().eq_ignore_ascii_case(&new_id));
+    if taken {
+        return Err(format!("A modpack called {} already exists", new_id));
+    }
+
+    let staging = mods_dir.join(format!(".fork-{}", uuid::Uuid::new_v4()));
+    let build = || -> Result<PackManifest, String> {
+        let staged = staging.join(&new_id);
+        fs::create_dir_all(&staged).map_err(|e| format!("Failed to create staging folder: {}", e))?;
+        for dir_name in child_dirs(&pack_dir)? {
+            copy_tree(&pack_dir.join(&dir_name), &staged.join(&dir_name))?;
+            clear_enabled_flag(&staged.join(&dir_name))?;
+        }
+        let manifest = PackManifest {
+            pack_id: new_id.clone(),
+            name: name.to_string(),
+            version: source.version.clone(),
+            mod_ids: source.mod_ids.clone(),
+            imported_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            ..Default::default()
+        };
+        write_manifest(&staged, &manifest)?;
+        fs::rename(&staged, mods_dir.join(&new_id)).map_err(|e| format!("Failed to create the fork: {}", e))?;
+        Ok(manifest)
+    };
+    let result = build();
+    let _ = fs::remove_dir_all(&staging);
+    result
+}
+
+#[tauri::command]
+pub async fn fork_pack(app_handle: tauri::AppHandle, pack_id: String, name: String) -> Result<PackManifest, String> {
+    let mods_dir = get_mods_dir(&app_handle)?;
+    tauri::async_runtime::spawn_blocking(move || fork_pack_dir(&mods_dir, &pack_id, &name))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn get_pack_size(app_handle: tauri::AppHandle, pack_id: String) -> Result<u64, String> {
+    let mods_dir = get_mods_dir(&app_handle)?;
+    let pack_dir = mods_dir.join(&pack_id);
+    if parse_key(&format!("{}/1", pack_id)).is_err() || read_manifest(&pack_dir).is_none() {
+        return Err(format!("No modpack folder for {:?}", pack_id));
+    }
+    tauri::async_runtime::spawn_blocking(move || pack_size(&pack_dir)).await.map_err(|e| e.to_string())
 }
 
 fn zip_dir(
@@ -507,9 +1062,8 @@ fn zip_dir(
             };
             
             if path.is_dir() {
-                let dir_prefix = format!("{}/", new_prefix);
-                writer.add_directory(&dir_prefix, options).map_err(|e| e.to_string())?;
-                zip_dir(&path, &dir_prefix, writer, options)?;
+                writer.add_directory(&format!("{}/", new_prefix), options).map_err(|e| e.to_string())?;
+                zip_dir(&path, &new_prefix, writer, options)?;
             } else {
                 writer.start_file(&new_prefix, options).map_err(|e| e.to_string())?;
                 if let Ok(mut f) = std::fs::File::open(&path) {
@@ -521,15 +1075,83 @@ fn zip_dir(
     Ok(())
 }
 
+fn write_pack_zip(out: &Path, preset_json: &Value, folders: &[(String, PathBuf)]) -> Result<(), String> {
+    let file = std::fs::File::create(out).map_err(|e| e.to_string())?;
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Stored);
+
+    zip.start_file("preset.json", options).map_err(|e| e.to_string())?;
+    std::io::Write::write_all(&mut zip, preset_json.to_string().as_bytes()).map_err(|e| e.to_string())?;
+
+    for (name, src) in folders {
+        zip.add_directory(&format!("{}/", name), options).map_err(|e| e.to_string())?;
+        zip_dir(src, name, &mut zip, options)?;
+    }
+
+    zip.finish().map_err(|e| format!("Failed to complete zip: {}", e))?;
+    Ok(())
+}
+
+// The preset.json and the (zip folder name, source folder) pairs for `pack:<id>` or a saved preset
+fn export_plan(
+    mods_dir: &Path,
+    presets: &std::collections::HashMap<String, Vec<String>>,
+    name: &str,
+    version: Option<String>,
+) -> Result<(Value, Vec<(String, PathBuf)>), String> {
+    let (preset_json, keys) = if let Some(pack_id) = name.strip_prefix("pack:") {
+        if parse_key(&format!("{}/1", pack_id)).is_err() {
+            return Err("Modpack not found".to_string());
+        }
+        let manifest = read_manifest(&mods_dir.join(pack_id)).ok_or("Modpack not found")?;
+        let json = serde_json::json!({
+            "name": manifest.name,
+            "pack_id": pack_id,
+            "version": version.or(manifest.version.clone()),
+            "mod_ids": manifest.mod_ids,
+        });
+        let keys = manifest.mod_ids.iter().map(|id| format!("{}/{}", pack_id, id)).collect::<Vec<_>>();
+        (json, keys)
+    } else {
+        let keys = presets.get(name).ok_or("Preset not found")?.clone();
+        (Value::Null, keys)
+    };
+
+    let mut seen = std::collections::HashSet::new();
+    let mut nexus_ids = Vec::new();
+    let mut folders = Vec::new();
+    for key in &keys {
+        let nexus_id = key.rsplit('/').next().unwrap_or(key).to_string();
+        if !seen.insert(nexus_id.clone()) {
+            return Err(format!("Two mods in this preset share Nexus id {}", nexus_id));
+        }
+        let src = resolve_key(mods_dir, key)?;
+        if src.is_dir() {
+            folders.push((nexus_id.clone(), src));
+        }
+        nexus_ids.push(nexus_id);
+    }
+
+    let preset_json = if preset_json.is_null() {
+        serde_json::json!({ "name": name, "mod_ids": nexus_ids })
+    } else {
+        preset_json
+    };
+    Ok((preset_json, folders))
+}
+
 #[tauri::command]
-pub async fn export_preset(app_handle: tauri::AppHandle, preset_name: String) -> Result<(), String> {
+pub async fn export_preset(app_handle: tauri::AppHandle, preset_name: String, version: Option<String>) -> Result<(), String> {
     let config = crate::config::load_config(app_handle.clone())?;
-    let mod_ids = config.presets.get(&preset_name).ok_or("Preset not found")?;
-    
+    let mods_dir = get_mods_dir(&app_handle)?;
+    let (preset_json, folders) = export_plan(&mods_dir, &config.presets, &preset_name, version)?;
+    let file_name = preset_json["name"].as_str().unwrap_or("preset").to_string();
+
     let result = rfd::AsyncFileDialog::new()
         .set_title("Export Preset Zip Archive")
         .add_filter("zip", &["zip"])
-        .set_file_name(&format!("{}.zip", preset_name))
+        .set_file_name(&format!("{}.zip", file_name))
         .save_file()
         .await;
         
@@ -537,120 +1159,479 @@ pub async fn export_preset(app_handle: tauri::AppHandle, preset_name: String) ->
         Some(f) => f.path().to_path_buf(),
         None => return Err("Export cancelled".to_string()),
     };
-    
-    let mods_dir = get_mods_dir(&app_handle)?;
-    
-    let file = std::fs::File::create(&save_path).map_err(|e| e.to_string())?;
-    let mut zip = zip::ZipWriter::new(file);
-    let options = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Stored);
-        
-    let preset_json_content = serde_json::json!({
-        "name": preset_name,
-        "mod_ids": mod_ids
-    }).to_string();
-    
-    zip.start_file("preset.json", options.clone()).map_err(|e| e.to_string())?;
-    std::io::Write::write_all(&mut zip, preset_json_content.as_bytes()).map_err(|e| e.to_string())?;
-    
-    for mod_id in mod_ids {
-        let mod_dir = mods_dir.join(mod_id);
-        if !mod_dir.exists() { continue; }
-        
-        let prefix = format!("{}/", mod_id);
-        zip.add_directory(&prefix, options.clone()).map_err(|e| e.to_string())?;
-        zip_dir(&mod_dir, &mod_id, &mut zip, options.clone())?;
-    }
-    
-    zip.finish().map_err(|e| format!("Failed to complete zip: {}", e))?;
-    
-    Ok(())
+
+    write_pack_zip(&save_path, &preset_json, &folders)
 }
 
 #[tauri::command]
-pub async fn import_preset(app_handle: tauri::AppHandle) -> Result<String, String> {
+pub async fn pick_preset_archive() -> Result<Option<String>, String> {
     let result = rfd::AsyncFileDialog::new()
         .set_title("Select Preset Zip Archive")
         .add_filter("zip", &["zip"])
         .pick_file()
         .await;
-        
-    let archive_path = match result {
-        Some(f) => f.path().to_path_buf(),
-        None => return Err("Import cancelled".to_string()),
-    };
-    
-    let mods_dir = get_mods_dir(&app_handle)?;
-    
-    let file = std::fs::File::open(&archive_path).map_err(|e| format!("Failed to open zip: {}", e))?;
-    let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("Invalid zip archive: {}", e))?;
-    
-    let mut preset_json_content = String::new();
-    
-    for i in 0..archive.len() {
-        let mut file = archive.by_index(i).map_err(|e| e.to_string())?;
-        if file.name() == "preset.json" {
-            std::io::Read::read_to_string(&mut file, &mut preset_json_content).ok();
-            break;
-        }
-    }
-    
-    if preset_json_content.is_empty() {
-        return Err("Invalid preset archive: missing preset.json".to_string());
-    }
-    
-    let preset: serde_json::Value = serde_json::from_str(&preset_json_content).map_err(|e| format!("Bad preset.json: {}", e))?;
-    let name = preset.get("name").and_then(|n| n.as_str()).unwrap_or("Imported Preset").to_string();
-    let mod_ids: Vec<String> = preset.get("mod_ids")
-        .and_then(|ids| ids.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
-        .unwrap_or_default();
-        
-    for i in 0..archive.len() {
-        let mut file = archive.by_index(i).map_err(|e| e.to_string())?;
-        let name_str = file.name().to_string();
-        if name_str == "preset.json" || name_str.starts_with("__MACOSX") {
-            continue;
-        }
-        
-        let outpath = match file.enclosed_name() {
-            Some(path) => mods_dir.join(path),
-            None => continue,
-        };
-        
-        if file.is_dir() {
-            std::fs::create_dir_all(&outpath).map_err(|e| format!("Failed to create directory in preset: {}", e))?;
-        } else {
-            if let Some(p) = outpath.parent() {
-                std::fs::create_dir_all(p).map_err(|e| format!("Failed to create parent directory for {}: {}", outpath.display(), e))?;
-            }
-            let mut outfile = std::fs::File::create(&outpath).map_err(|e| format!("Failed to create file {}: {}", outpath.display(), e))?;
-            std::io::copy(&mut file, &mut outfile).map_err(|e| format!("Failed to extract file {}: {}", outpath.display(), e))?;
-        }
-    }
-    
-    let mut config = crate::config::load_config(app_handle.clone())?;
-    config.presets.insert(name.clone(), mod_ids);
-    crate::config::save_config(app_handle, config)?;
-    
-    Ok(name)
+
+    Ok(result.map(|f| f.path().to_string_lossy().to_string()))
 }
 
 #[tauri::command]
-pub async fn toggle_all_mods(app_handle: tauri::AppHandle, enable: bool) -> Result<(), String> {
-    let mods = scan_local_mods(app_handle.clone()).await?;
-    for m in mods {
-        if m.enabled != enable {
-            toggle_mod(app_handle.clone(), m.id, enable).await?;
+pub async fn inspect_preset_archive(app_handle: tauri::AppHandle, archive_path: String) -> Result<ImportPreview, String> {
+    let mods_dir = get_mods_dir(&app_handle)?;
+    inspect_archive(Path::new(&archive_path), &mods_dir)
+}
+
+#[tauri::command]
+pub async fn import_preset(app_handle: tauri::AppHandle, archive_path: String) -> Result<ImportSummary, String> {
+    let mods_dir = get_mods_dir(&app_handle)?;
+    // without a game path nothing can be linked, so a Paks folder that does not exist is enough
+    let paks_dir = get_paks_dir(&app_handle).unwrap_or_else(|_| mods_dir.join(".no-game-path"));
+    let summary = import_from_archive(Path::new(&archive_path), &mods_dir, &paks_dir)?;
+
+    let mut config = crate::config::load_config(app_handle.clone())?;
+    crate::config::tidy_presets_after_import(&mut config, &summary.pack.pack_id, &summary.superseded_ids, &summary.removed_keys);
+    crate::config::save_config(app_handle, config)
+        .map_err(|e| format!("The pack was imported but saved presets could not be updated: {}", e))?;
+
+    Ok(summary)
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct ModRef {
+    pub key: String,
+    pub nexus_mod_id: Option<u32>,
+    pub name: String,
+    pub version: Option<String>,
+}
+
+#[derive(Serialize, Debug)]
+pub struct ImportPreview {
+    pub pack: PackRef,
+    pub installed_version: Option<String>,
+    pub added: Vec<ModRef>,
+    pub removed: Vec<ModRef>,
+    pub changed: Vec<ModRef>,
+    pub superseded: Vec<ModRef>,
+}
+
+#[derive(Serialize, Debug)]
+pub struct ImportSummary {
+    pub pack: PackRef,
+    pub keys: Vec<String>,
+    pub added: usize,
+    pub changed: usize,
+    pub removed_keys: Vec<String>,
+    pub superseded_ids: Vec<String>,
+    pub failed_deletes: Vec<String>,
+}
+
+pub(crate) struct PackArchive {
+    pub(crate) pack: PackRef,
+    // mod folder id and that folder's metadata.json, in numeric order
+    pub(crate) folders: Vec<(String, Option<Value>)>,
+}
+
+pub(crate) struct ImportPlan {
+    pub(crate) installed: Option<PathBuf>,
+    pub(crate) installed_version: Option<String>,
+    pub(crate) added: Vec<ModRef>,
+    pub(crate) removed: Vec<ModRef>,
+    pub(crate) changed: Vec<ModRef>,
+    pub(crate) superseded: Vec<ModRef>,
+}
+
+fn is_numeric(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn numeric_order(a: &String, b: &String) -> std::cmp::Ordering {
+    (a.len(), a).cmp(&(b.len(), b))
+}
+
+pub(crate) fn read_meta(mod_dir: &Path) -> Option<Value> {
+    serde_json::from_str(&fs::read_to_string(mod_dir.join("metadata.json")).ok()?).ok()
+}
+
+pub(crate) fn meta_version(meta: Option<&Value>) -> Option<String> {
+    let meta = meta?;
+    meta.get("installed_version").or_else(|| meta.get("version")).and_then(|v| v.as_str()).map(str::to_string)
+}
+
+pub(crate) fn mod_ref(key: String, id: &str, meta: Option<&Value>) -> ModRef {
+    let name = meta.and_then(|m| m.get("name")).and_then(|n| n.as_str()).unwrap_or(id).to_string();
+    ModRef { key, nexus_mod_id: id.parse().ok(), name, version: meta_version(meta) }
+}
+
+fn open_zip(archive: &Path) -> Result<zip::ZipArchive<fs::File>, String> {
+    let file = fs::File::open(archive).map_err(|e| format!("Failed to open zip: {}", e))?;
+    zip::ZipArchive::new(file).map_err(|e| format!("Invalid zip archive: {}", e))
+}
+
+// The mod folder an archive entry belongs to, or None for entries that are not extracted.
+fn archive_folder(rel: &Path, is_dir: bool) -> Result<Option<String>, String> {
+    if rel.components().any(|c| !matches!(c, std::path::Component::Normal(_))) {
+        return Err(format!("Invalid preset archive: unsafe path {:?}", rel));
+    }
+    let mut parts = rel.components();
+    let first = match parts.next() {
+        Some(std::path::Component::Normal(s)) => s.to_string_lossy().to_string(),
+        _ => return Ok(None),
+    };
+    let nested = parts.next().is_some();
+    if first == "__MACOSX" || (!nested && !is_dir) {
+        return Ok(None);
+    }
+    if !is_numeric(&first) {
+        return Err(format!("Invalid preset archive: folder {:?} is not a Nexus mod id", first));
+    }
+    Ok(Some(first))
+}
+
+fn read_pack_archive(zip: &mut zip::ZipArchive<fs::File>) -> Result<PackArchive, String> {
+    let mut preset_text: Option<String> = None;
+    let mut ids: Vec<String> = Vec::new();
+    for i in 0..zip.len() {
+        let mut file = zip.by_index(i).map_err(|e| format!("Invalid zip archive: {}", e))?;
+        if file.name() == "preset.json" {
+            let mut text = String::new();
+            std::io::Read::read_to_string(&mut file, &mut text).map_err(|e| format!("Bad preset.json: {}", e))?;
+            preset_text = Some(text);
+            continue;
+        }
+        let rel = file.enclosed_name().ok_or_else(|| format!("Invalid preset archive: unsafe path {:?}", file.name()))?;
+        if let Some(id) = archive_folder(&rel, file.is_dir())? {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
+    let preset_text = preset_text.ok_or("Invalid preset archive: missing preset.json")?;
+    let preset: Value = serde_json::from_str(&preset_text).map_err(|e| format!("Bad preset.json: {}", e))?;
+    if ids.is_empty() {
+        return Err("Invalid preset archive: it contains no mod folders".to_string());
+    }
+    ids.sort_by(numeric_order);
+
+    let folders = ids.into_iter().map(|id| {
+        let meta = zip.by_name(&format!("{}/metadata.json", id)).ok().and_then(|mut f| {
+            let mut text = String::new();
+            std::io::Read::read_to_string(&mut f, &mut text).ok()?;
+            serde_json::from_str(&text).ok()
+        });
+        (id, meta)
+    }).collect();
+
+    Ok(PackArchive { pack: crate::packs::pack_identity(&preset), folders })
+}
+
+pub(crate) fn child_dirs(dir: &Path) -> Result<Vec<String>, String> {
+    let entries = fs::read_dir(dir).map_err(|e| format!("Failed to read {}: {}", dir.display(), e))?;
+    let mut out = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("Failed to read {}: {}", dir.display(), e))?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if entry.path().is_dir() && !name.starts_with('.') {
+            out.push(name);
+        }
+    }
+    out.sort_by(numeric_order);
+    Ok(out)
+}
+
+// The installed folder of this pack, or an error when a folder that is not a pack is in the way.
+fn installed_pack_dir(mods_dir: &Path, pack_id: &str) -> Result<Option<PathBuf>, String> {
+    let dir = mods_dir.join(pack_id);
+    match fs::symlink_metadata(&dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("Failed to read {}: {}", dir.display(), e)),
+        Ok(md) if md.is_dir() && read_manifest(&dir).is_some() => Ok(Some(dir)),
+        Ok(_) => Err(format!(
+            "{} already exists in mod storage and is not a modpack. Rename or remove it and try again",
+            dir.display()
+        )),
+    }
+}
+
+pub(crate) fn plan_import(archive: &PackArchive, mods_dir: &Path) -> Result<ImportPlan, String> {
+    let pack_id = &archive.pack.pack_id;
+    let installed = installed_pack_dir(mods_dir, pack_id)?;
+    let installed_version = installed.as_deref().and_then(read_manifest).and_then(|m| m.version);
+    let on_disk = match &installed {
+        Some(dir) => child_dirs(dir)?,
+        None => Vec::new(),
+    };
+    let key = |id: &str| format!("{}/{}", pack_id, id);
+
+    let mut plan = ImportPlan { installed, installed_version, added: vec![], removed: vec![], changed: vec![], superseded: vec![] };
+    for (id, meta) in &archive.folders {
+        if on_disk.contains(id) {
+            let disk_meta = plan.installed.as_ref().and_then(|d| read_meta(&d.join(id)));
+            if meta_version(disk_meta.as_ref()) != meta_version(meta.as_ref()) {
+                plan.changed.push(mod_ref(key(id), id, meta.as_ref()));
+            }
+        } else {
+            plan.added.push(mod_ref(key(id), id, meta.as_ref()));
+        }
+        let loose = mods_dir.join(id);
+        if loose.is_dir() && read_manifest(&loose).is_none() {
+            plan.superseded.push(mod_ref(id.clone(), id, read_meta(&loose).as_ref()));
+        }
+    }
+    for id in &on_disk {
+        if !archive.folders.iter().any(|(f, _)| f == id) {
+            let disk_meta = plan.installed.as_ref().and_then(|d| read_meta(&d.join(id)));
+            plan.removed.push(mod_ref(key(id), id, disk_meta.as_ref()));
+        }
+    }
+    Ok(plan)
+}
+
+fn inspect_archive(archive: &Path, mods_dir: &Path) -> Result<ImportPreview, String> {
+    let mut zip = open_zip(archive)?;
+    let archive = read_pack_archive(&mut zip)?;
+    let plan = plan_import(&archive, mods_dir)?;
+    Ok(ImportPreview {
+        pack: archive.pack,
+        installed_version: plan.installed_version,
+        added: plan.added,
+        removed: plan.removed,
+        changed: plan.changed,
+        superseded: plan.superseded,
+    })
+}
+
+pub(crate) fn clear_enabled_flag(mod_dir: &Path) -> Result<(), String> {
+    let path = mod_dir.join("metadata.json");
+    let Some(mut meta) = read_meta(mod_dir) else {
+        return Ok(());
+    };
+    let Some(obj) = meta.as_object_mut() else {
+        return Ok(());
+    };
+    obj.insert("enabled".to_string(), Value::Bool(false));
+    obj.insert("update_available".to_string(), Value::Bool(false));
+    let json = serde_json::to_string_pretty(&meta).map_err(|e| e.to_string())?;
+    fs::write(&path, json).map_err(|e| format!("Failed to write {}: {}", path.display(), e))
+}
+
+fn stage_pack(zip: &mut zip::ZipArchive<fs::File>, archive: &PackArchive, staged: &Path) -> Result<(), String> {
+    fs::create_dir_all(staged).map_err(|e| format!("Failed to create staging folder: {}", e))?;
+    for i in 0..zip.len() {
+        let mut file = zip.by_index(i).map_err(|e| format!("Invalid zip archive: {}", e))?;
+        if file.name() == "preset.json" {
+            continue;
+        }
+        let rel = file.enclosed_name().ok_or_else(|| format!("Invalid preset archive: unsafe path {:?}", file.name()))?;
+        if archive_folder(&rel, file.is_dir())?.is_none() {
+            continue;
+        }
+        let out = staged.join(&rel);
+        if file.is_dir() {
+            fs::create_dir_all(&out).map_err(|e| format!("Failed to create {}: {}", out.display(), e))?;
+        } else {
+            if let Some(parent) = out.parent() {
+                fs::create_dir_all(parent).map_err(|e| format!("Failed to create {}: {}", parent.display(), e))?;
+            }
+            let mut outfile = fs::File::create(&out).map_err(|e| format!("Failed to create {}: {}", out.display(), e))?;
+            std::io::copy(&mut file, &mut outfile).map_err(|e| format!("Failed to extract {}: {}", out.display(), e))?;
+        }
+    }
+
+    let mut mod_ids = Vec::new();
+    for (id, _) in &archive.folders {
+        let dir = staged.join(id);
+        fs::create_dir_all(&dir).map_err(|e| format!("Failed to create {}: {}", dir.display(), e))?;
+        clear_enabled_flag(&dir)?;
+        mod_ids.push(id.clone());
+    }
+    let imported_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    crate::packs::write_manifest(staged, &crate::packs::PackManifest {
+        pack_id: archive.pack.pack_id.clone(),
+        name: archive.pack.name.clone(),
+        version: archive.pack.version.clone(),
+        mod_ids,
+        imported_at,
+        ..Default::default()
+    })
+}
+
+// Removes the staging folder on a failed import and returns the error to report.
+pub(crate) fn abandon_staging(staging: &Path, err: String) -> String {
+    match fs::remove_dir_all(staging) {
+        Ok(()) => err,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => err,
+        Err(e) => format!("{} (could not remove {}: {})", err, staging.display(), e),
+    }
+}
+
+// Starts the note relink adds to an error
+pub(crate) const RELINK_NOTE: &str = " (could not re-enable ";
+
+// Restores the links of keys unlinked by a failed swap. Unlike enable_key it leaves other copies and metadata alone.
+fn relink(mods_dir: &Path, paks_dir: &Path, keys: &[String], err: String) -> String {
+    let failed: Vec<&str> = keys.iter()
+        .filter(|k| link_missing(mods_dir, paks_dir, k).is_err())
+        .map(String::as_str)
+        .collect();
+    if failed.is_empty() {
+        err
+    } else {
+        format!("{}{}{})", err, RELINK_NOTE, failed.join(", "))
+    }
+}
+
+pub(crate) enum SwapError {
+    // the library is as it was, staging can be deleted
+    RolledBack(String),
+    // the old pack is only inside staging, which must be kept
+    Stranded(String),
+}
+
+// The installed folder name for a pack id. On a case-insensitive filesystem it can differ from the id in case only.
+pub(crate) fn pack_folder_name(mods_dir: &Path, pack_id: &str) -> String {
+    let dirs = child_dirs(mods_dir).unwrap_or_default();
+    if dirs.iter().any(|n| n == pack_id) {
+        return pack_id.to_string();
+    }
+    dirs.into_iter().find(|n| n.eq_ignore_ascii_case(pack_id)).unwrap_or_else(|| pack_id.to_string())
+}
+
+// Keys of the installed pack, built from its folder name on disk so old links match their real prefix.
+pub(crate) fn old_pack_keys(mods_dir: &Path, pack_id: &str) -> Result<Vec<String>, String> {
+    let folder = pack_folder_name(mods_dir, pack_id);
+    Ok(child_dirs(&mods_dir.join(&folder))?.iter().map(|c| format!("{}/{}", folder, c)).collect())
+}
+
+// Unlinks the old pack, sets it aside inside staging and moves the staged pack in.
+pub(crate) fn swap_pack(mods_dir: &Path, paks_dir: &Path, staging: &Path, staged: &Path, target: &Path, pack_id: &str) -> Result<(), SwapError> {
+    let old_keys = old_pack_keys(mods_dir, pack_id).map_err(SwapError::RolledBack)?;
+    let old_dir = mods_dir.join(pack_folder_name(mods_dir, pack_id));
+    let mut linked: Vec<String> = Vec::new();
+    for key in &old_keys {
+        match unlink_mod(paks_dir, key) {
+            Ok(0) => {}
+            Ok(_) => linked.push(key.clone()),
+            Err(e) => {
+                linked.push(key.clone());
+                return Err(SwapError::RolledBack(relink(mods_dir, paks_dir, &linked, e)));
+            }
+        }
+    }
+
+    let aside = staging.join(format!("old-{}", pack_id));
+    if fs::rename(&old_dir, &aside).is_err() {
+        return Err(SwapError::RolledBack(relink(mods_dir, paks_dir, &linked, "Close Ready or Not and try again".to_string())));
+    }
+    if let Err(e) = fs::rename(staged, target) {
+        let err = format!("Failed to move the new pack into place: {}", e);
+        if let Err(back) = fs::rename(&aside, &old_dir) {
+            return Err(SwapError::Stranded(format!("{}. The previous pack could not be restored ({}) and is kept at {}", err, back, aside.display())));
+        }
+        return Err(SwapError::RolledBack(relink(mods_dir, paks_dir, &linked, err)));
+    }
+    Ok(())
+}
+
+fn import_from_archive(archive: &Path, mods_dir: &Path, paks_dir: &Path) -> Result<ImportSummary, String> {
+    let mut zip = open_zip(archive)?;
+    let archive = read_pack_archive(&mut zip)?;
+    let plan = plan_import(&archive, mods_dir)?;
+    let pack_id = archive.pack.pack_id.clone();
+    let _op = OpGuard::begin_named(&mods_dir.join(&pack_id), OpKind::Local, &archive.pack.name)?;
+
+    let staging = mods_dir.join(format!(".import-{}", uuid::Uuid::new_v4()));
+    let staged = staging.join(&pack_id);
+    if let Err(e) = stage_pack(&mut zip, &archive, &staged) {
+        return Err(abandon_staging(&staging, e));
+    }
+
+    if let Some(published) = plan.installed.as_deref().and_then(crate::packs::read_manifest).and_then(|m| m.published) {
+        let carried = crate::packs::read_manifest(&staged)
+            .ok_or_else(|| "Failed to read the staged pack".to_string())
+            .and_then(|mut man| {
+                man.published = Some(crate::packs::Published { dirty: true, ..published });
+                crate::packs::write_manifest(&staged, &man)
+            });
+        if let Err(e) = carried {
+            return Err(abandon_staging(&staging, e));
+        }
+    }
+
+    finish_import(&archive, plan, mods_dir, paks_dir, &staging)
+}
+
+// Swaps the pack staged at staging/<pack id> into the library and cleans up after it.
+pub(crate) fn finish_import(archive: &PackArchive, plan: ImportPlan, mods_dir: &Path, paks_dir: &Path, staging: &Path) -> Result<ImportSummary, String> {
+    let pack_id = archive.pack.pack_id.clone();
+    let staged = staging.join(&pack_id);
+    let target = mods_dir.join(&pack_id);
+    if plan.installed.is_some() {
+        match swap_pack(mods_dir, paks_dir, staging, &staged, &target, &pack_id) {
+            Ok(()) => {}
+            Err(SwapError::RolledBack(e)) => return Err(abandon_staging(staging, e)),
+            Err(SwapError::Stranded(e)) => return Err(e),
+        }
+    } else if let Err(e) = fs::rename(&staged, &target) {
+        return Err(abandon_staging(staging, format!("Failed to move the new pack into place: {}", e)));
+    }
+
+    let mut failed_deletes: Vec<String> = Vec::new();
+    let mut superseded_ids: Vec<String> = Vec::new();
+    for m in &plan.superseded {
+        let dir = mods_dir.join(&m.key);
+        superseded_ids.push(m.key.clone());
+        if unlink_mod(paks_dir, &m.key).is_err() || fs::remove_dir_all(&dir).is_err() {
+            failed_deletes.push(dir.display().to_string());
+        }
+    }
+
+    sweep_orphans(paks_dir, mods_dir);
+
+    if let Err(e) = fs::remove_dir_all(staging) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            failed_deletes.push(staging.display().to_string());
+        }
+    }
+
+    Ok(ImportSummary {
+        keys: archive.folders.iter().map(|(id, _)| format!("{}/{}", pack_id, id)).collect(),
+        added: plan.added.len(),
+        changed: plan.changed.len(),
+        removed_keys: plan.removed.into_iter().map(|m| m.key).collect(),
+        superseded_ids,
+        failed_deletes,
+        pack: archive.pack.clone(),
+    })
+}
+
+fn toggle_all_keys(mods_dir: &Path, paks_dir: &Path, enable: bool) -> Result<(), String> {
+    if !enable {
+        return apply_keys(mods_dir, paks_dir, &[]).map(|_| ());
+    }
+    for m in scan_dir(mods_dir) {
+        if !m.enabled && parse_key(&m.id).is_ok() {
+            enable_key(mods_dir, paks_dir, &m.id)?;
         }
     }
     Ok(())
 }
 
 #[tauri::command]
+pub async fn toggle_all_mods(app_handle: tauri::AppHandle, enable: bool) -> Result<(), String> {
+    let config = crate::config::load_config(app_handle.clone()).map_err(|e| e.to_string())?;
+    config.game_path.ok_or("Game installation path is not set! Please configure it in the Settings tab.")?;
+    let paks_dir = get_paks_dir(&app_handle)?;
+    let mods_dir = get_mods_dir(&app_handle)?;
+    toggle_all_keys(&mods_dir, &paks_dir, enable)
+}
+
+#[tauri::command]
 pub async fn install_addon(app_handle: tauri::AppHandle, mod_id: String, archive_path: String) -> Result<Vec<String>, String> {
     let mods_dir = get_mods_dir(&app_handle)?;
-    let mod_dir = mods_dir.join(&mod_id);
+    ensure_editable(&mods_dir, &mod_id)?;
+    let mod_dir = resolve_key(&mods_dir, &mod_id)?;
     let addons_dir = mod_dir.join("addons");
     std::fs::create_dir_all(&addons_dir).map_err(|e| format!("Failed to create addons directory: {}", e))?;
     
@@ -677,37 +1658,21 @@ pub async fn install_addon(app_handle: tauri::AppHandle, mod_id: String, archive
             };
             
             let ext = std::path::Path::new(&fname).extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-            if ext == "pak" {
+            if is_deployable(Path::new(&fname)) {
                 let outpath = addons_dir.join(&fname);
                 let mut outfile = std::fs::File::create(&outpath).map_err(|e| format!("Failed to create addon file: {}", e))?;
                 std::io::copy(&mut file, &mut outfile).map_err(|e| format!("Failed to extract addon: {}", e))?;
-                added_files.push(fname);
+                if ext == "pak" {
+                    added_files.push(fname);
+                }
             }
         }
     } else if extension == "rar" {
-        let media = Arc::new(rar_stream::LocalFileMedia::new(&archive_path)
-            .map_err(|e| format!("Failed to open RAR: {}", e))?);
-        let pkg = rar_stream::RarFilesPackage::new(vec![media]);
-        let files = pkg.parse(rar_stream::ParseOptions::default()).await
-            .map_err(|e| format!("Failed to parse RAR: {}", e))?;
+        let (a, d) = (std::path::PathBuf::from(&archive_path), addons_dir.clone());
+        tauri::async_runtime::spawn_blocking(move || extract_rar(&a, &d))
+            .await
+            .map_err(|e| e.to_string())??;
 
-        for file in files {
-            let outpath = addons_dir.join(&file.name);
-            if let Some(parent) = outpath.parent() {
-                std::fs::create_dir_all(parent).map_err(|_| "Failed to create directory in RAR")?;
-            }
-            
-            if file.name.ends_with('/') || file.name.ends_with('\\') {
-                continue;
-            }
-
-            let content = file.read_to_end().await
-                .map_err(|e| format!("Failed to read file {}: {}", file.name, e))?;
-            
-            std::fs::write(&outpath, content)
-                .map_err(|e| format!("Failed to write extracted file {}: {}", file.name, e))?;
-        }
-        
         if let Ok(entries) = std::fs::read_dir(&addons_dir) {
             for entry in entries.filter_map(Result::ok) {
                 let p = entry.path();
@@ -743,10 +1708,11 @@ pub async fn install_addon(app_handle: tauri::AppHandle, mod_id: String, archive
         }
     }
     
+    mark_dirty(&mods_dir, &mod_id);
     Ok(added_files)
 }
 
-fn get_paks_dir(app_handle: &tauri::AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn get_paks_dir(app_handle: &tauri::AppHandle) -> Result<PathBuf, String> {
     let config = crate::config::load_config(app_handle.clone()).map_err(|e| e.to_string())?;
     let game_path_str = config.game_path.ok_or("Game installation path is not set!")?;
     let mut paks_dir = PathBuf::from(game_path_str);
@@ -761,7 +1727,8 @@ fn get_paks_dir(app_handle: &tauri::AppHandle) -> Result<PathBuf, String> {
 #[tauri::command]
 pub async fn toggle_addon(app_handle: tauri::AppHandle, mod_id: String, filename: String, enable: bool) -> Result<(), String> {
     let mods_dir = get_mods_dir(&app_handle)?;
-    let mod_dir = mods_dir.join(&mod_id);
+    ensure_editable(&mods_dir, &mod_id)?;
+    let mod_dir = resolve_key(&mods_dir, &mod_id)?;
     let addon_path = mod_dir.join("addons").join(&filename);
     
     if !addon_path.exists() {
@@ -773,15 +1740,17 @@ pub async fn toggle_addon(app_handle: tauri::AppHandle, mod_id: String, filename
         std::fs::create_dir_all(&paks_dir).map_err(|e| format!("Failed to create Paks dir: {}", e))?;
     }
     
-    let link_name = format!("{}_addon_{}", mod_id, filename);
-    let link_path = paks_dir.join(&link_name);
-    
-    if enable {
-        if !link_path.exists() {
-            create_link(&addon_path, &link_path).map_err(|e| format!("Failed to inject addon: {}", e))?;
-        }
-    } else {
-        if link_path.exists() {
+    let prefix = link_prefix(&mod_id);
+    for file in addon_files(&mod_dir.join("addons"), &filename) {
+        let link_name = format!("{}addon_{}", prefix, file.file_name().unwrap().to_string_lossy());
+        let link_path = paks_dir.join(&link_name);
+
+        if enable {
+            if entry_present(&link_path) {
+                fs::remove_file(&link_path).map_err(|e| format!("Failed to replace addon link: {}", e))?;
+            }
+            create_link(&file, &link_path).map_err(|e| format!("Failed to inject addon: {}", e))?;
+        } else if entry_present(&link_path) {
             std::fs::remove_file(&link_path).map_err(|e| format!("Failed to remove addon link: {}", e))?;
         }
     }
@@ -798,21 +1767,29 @@ pub async fn toggle_addon(app_handle: tauri::AppHandle, mod_id: String, filename
         }
     }
     
+    mark_dirty(&mods_dir, &mod_id);
+    Ok(())
+}
+
+fn delete_addon_files(addons_dir: &Path, pak_filename: &str) -> Result<(), String> {
+    for file in addon_files(addons_dir, pak_filename) {
+        if file.exists() {
+            std::fs::remove_file(&file).map_err(|e| format!("Failed to delete addon: {}", e))?;
+        }
+    }
     Ok(())
 }
 
 #[tauri::command]
 pub async fn remove_addon(app_handle: tauri::AppHandle, mod_id: String, filename: String) -> Result<(), String> {
+    let mods_dir = get_mods_dir(&app_handle)?;
+    ensure_editable(&mods_dir, &mod_id)?;
     let _ = toggle_addon(app_handle.clone(), mod_id.clone(), filename.clone(), false).await;
     
-    let mods_dir = get_mods_dir(&app_handle)?;
-    let addon_path = mods_dir.join(&mod_id).join("addons").join(&filename);
+    let mod_dir = resolve_key(&mods_dir, &mod_id)?;
+    delete_addon_files(&mod_dir.join("addons"), &filename)?;
     
-    if addon_path.exists() {
-        std::fs::remove_file(&addon_path).map_err(|e| format!("Failed to delete addon: {}", e))?;
-    }
-    
-    let metadata_path = mods_dir.join(&mod_id).join("metadata.json");
+    let metadata_path = mod_dir.join("metadata.json");
     if let Ok(content) = std::fs::read_to_string(&metadata_path) {
         if let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(&content) {
             if let Some(addons_obj) = parsed.get_mut("addons").and_then(|a| a.as_object_mut()) {
@@ -824,5 +1801,1057 @@ pub async fn remove_addon(app_handle: tauri::AppHandle, mod_id: String, filename
         }
     }
     
+    mark_dirty(&mods_dir, &mod_id);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ron-test-{}-{}", name, uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn extract_rar_handles_rar5_and_rar4() {
+        for name in ["rar5_small.rar", "rar4_small.rar"] {
+            let dest = scratch("rar");
+            let archive = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata").join(name);
+            extract_rar(&archive, &dest).unwrap();
+            assert_eq!(fs::read(dest.join("Mod/a.pak")).unwrap(), b"pak-a ".repeat(200));
+            assert_eq!(fs::read(dest.join("Mod/a.ucas")).unwrap(), b"ucas-a ".repeat(200));
+            assert_eq!(fs::read(dest.join("Mod/sub/b.utoc")).unwrap(), b"utoc-b ".repeat(50));
+        }
+    }
+
+    #[test]
+    fn extract_rar_rejects_a_non_rar_file() {
+        let dir = scratch("rar-junk");
+        let junk = dir.join("junk.rar");
+        fs::write(&junk, b"not a rar").unwrap();
+        let err = extract_rar(&junk, &dir.join("out")).unwrap_err();
+        assert!(err.starts_with("Failed to open RAR"), "{err}");
+    }
+
+    #[test]
+    fn collect_deployables_takes_pak_ucas_utoc_and_skips_addons() {
+        let m = scratch("deploy");
+        for f in ["a.pak", "a.ucas", "a.UTOC", "readme.txt", "sub/b.pak", "addons/x.pak"] {
+            let p = m.join(f);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, b"x").unwrap();
+        }
+        let got: Vec<_> = collect_deployables(&m).iter()
+            .map(|p| p.strip_prefix(&m).unwrap().to_string_lossy().replace('\\', "/")).collect();
+        assert_eq!(got, ["a.UTOC", "a.pak", "a.ucas", "sub/b.pak"]);
+    }
+
+    #[test]
+    fn addon_files_pairs_companions_by_stem() {
+        let a = scratch("addon");
+        for f in ["x.pak", "x.ucas", "x.utoc", "y.ucas"] { fs::write(a.join(f), b"x").unwrap(); }
+        let got: Vec<_> = addon_files(&a, "x.pak").iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        assert_eq!(got, ["x.pak", "x.ucas", "x.utoc"]);
+    }
+
+    #[test]
+    fn delete_addon_files_removes_companions_only() {
+        let a = scratch("addon-del");
+        for f in ["x.pak", "x.ucas", "x.utoc", "y.ucas"] { fs::write(a.join(f), b"x").unwrap(); }
+        delete_addon_files(&a, "x.pak").unwrap();
+        assert!(!a.join("x.pak").exists());
+        assert!(!a.join("x.ucas").exists());
+        assert!(!a.join("x.utoc").exists());
+        assert!(a.join("y.ucas").exists());
+    }
+
+    #[test]
+    fn scan_dir_reads_loose_mods_and_packs_and_skips_staging() {
+        use crate::packs::{write_manifest, PackManifest};
+        let m = scratch("scan");
+        fs::create_dir_all(m.join("5543")).unwrap();
+        fs::create_dir_all(m.join("notes")).unwrap();
+        fs::create_dir_all(m.join(".import-x/Casual-Shitters/1")).unwrap();
+        fs::create_dir_all(m.join("Casual-Shitters/3063")).unwrap();
+        write_manifest(&m.join("Casual-Shitters"), &PackManifest {
+            pack_id: "Casual-Shitters".into(), name: "Casual Shitters".into(),
+            version: Some("1.5".into()), mod_ids: vec!["3063".into()], imported_at: 0, ..Default::default() }).unwrap();
+        let mut keys: Vec<_> = scan_dir(&m).into_iter().map(|i| (i.id, i.pack.map(|p| p.pack_id))).collect();
+        keys.sort();
+        assert_eq!(keys, [
+            ("5543".to_string(), None),
+            ("Casual-Shitters/3063".to_string(), Some("Casual-Shitters".to_string())),
+            ("notes".to_string(), None),
+        ]);
+    }
+
+    #[test]
+    fn unlink_mod_matches_whole_prefixes_only() {
+        let p = scratch("paks");
+        for f in ["12_a.pak", "12_addon_b.pak", "123_a.pak", "pakchunk0-Windows.pak",
+                  "Casual-Shitters.3063_x.pak", "3063_x.pak"] { fs::write(p.join(f), b"x").unwrap(); }
+        assert_eq!(unlink_mod(&p, "12").unwrap(), 2);
+        assert_eq!(unlink_mod(&p, "Casual-Shitters/3063").unwrap(), 1);
+        let mut left: Vec<_> = fs::read_dir(&p).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        left.sort();
+        assert_eq!(left, ["123_a.pak", "3063_x.pak", "pakchunk0-Windows.pak"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_link_counts_as_present_and_is_removed() {
+        let p = scratch("dangling");
+        std::os::unix::fs::symlink(p.join("gone.pak"), p.join("5543_gone.pak")).unwrap();
+        assert!(entry_present(&p.join("5543_gone.pak")));
+        assert_eq!(unlink_mod(&p, "5543").unwrap(), 1);
+    }
+
+    #[test]
+    fn enable_replaces_a_stale_entry() {
+        let m = scratch("mods");
+        let p = scratch("paks");
+        fs::create_dir_all(m.join("5543")).unwrap();
+        fs::write(m.join("5543/a.pak"), b"new").unwrap();
+        fs::write(p.join("5543_a.pak"), b"old").unwrap();
+        enable_key(&m, &p, "5543").unwrap();
+        assert_eq!(fs::read(p.join("5543_a.pak")).unwrap(), b"new");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sweep_orphans_removes_links_into_deleted_folders_only() {
+        let m = scratch("mods");
+        let p = scratch("paks");
+        fs::create_dir_all(m.join("5543")).unwrap();
+        fs::write(m.join("5543/a.pak"), b"x").unwrap();
+        std::os::unix::fs::symlink(m.join("7/b.pak"), p.join("7_b.pak")).unwrap();
+        std::os::unix::fs::symlink(m.join("5543/a.pak"), p.join("5543_a.pak")).unwrap();
+        fs::write(p.join("pakchunk0-Windows.pak"), b"x").unwrap();
+        assert_eq!(sweep_orphans(&p, &m), 1);
+        assert!(!entry_present(&p.join("7_b.pak")));
+        assert!(entry_present(&p.join("5543_a.pak")));
+        assert!(p.join("pakchunk0-Windows.pak").exists());
+    }
+
+    #[test]
+    fn enabling_a_pack_copy_disables_the_loose_copy() {
+        use crate::packs::{write_manifest, PackManifest};
+        let m = scratch("mods");
+        let p = scratch("paks");
+        fs::create_dir_all(m.join("3063")).unwrap();
+        fs::write(m.join("3063/a.pak"), b"loose").unwrap();
+        fs::write(m.join("3063/metadata.json"), r#"{"enabled": true}"#).unwrap();
+        fs::create_dir_all(m.join("P/3063")).unwrap();
+        fs::write(m.join("P/3063/a.pak"), b"packed").unwrap();
+        write_manifest(&m.join("P"), &PackManifest {
+            pack_id: "P".into(), name: "P".into(), version: None,
+            mod_ids: vec!["3063".into()], imported_at: 0, ..Default::default() }).unwrap();
+        enable_key(&m, &p, "3063").unwrap();
+        assert!(entry_present(&p.join("3063_a.pak")));
+
+        enable_key(&m, &p, "P/3063").unwrap();
+        assert!(!entry_present(&p.join("3063_a.pak")));
+        assert_eq!(fs::read(p.join("P.3063_a.pak")).unwrap(), b"packed");
+        let flag = |dir: &str| -> bool {
+            let v: Value = serde_json::from_str(&fs::read_to_string(m.join(dir).join("metadata.json")).unwrap()).unwrap();
+            v["enabled"].as_bool().unwrap()
+        };
+        assert!(!flag("3063"));
+        assert!(flag("P/3063"));
+    }
+
+    #[test]
+    fn toggling_a_non_numeric_folder_names_it() {
+        let m = scratch("mods");
+        let p = scratch("paks");
+        fs::create_dir_all(m.join("notes")).unwrap();
+        let err = enable_key(&m, &p, "notes").unwrap_err();
+        assert!(err.contains("notes"), "{err}");
+    }
+
+    #[test]
+    fn same_name_files_link_the_shallowest_copy() {
+        let m = scratch("mods");
+        let p = scratch("paks");
+        fs::create_dir_all(m.join("5543/sub")).unwrap();
+        fs::write(m.join("5543/a.pak"), b"root").unwrap();
+        fs::write(m.join("5543/sub/a.pak"), b"deep").unwrap();
+        enable_key(&m, &p, "5543").unwrap();
+        let names: Vec<_> = fs::read_dir(&p).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        assert_eq!(names, ["5543_a.pak"]);
+        assert_eq!(fs::read(p.join("5543_a.pak")).unwrap(), b"root");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_enable_leaves_nothing_linked() {
+        let m = scratch("mods");
+        let p = scratch("paks");
+        fs::create_dir_all(m.join("5543")).unwrap();
+        fs::write(m.join("5543/a.pak"), b"x").unwrap();
+        // link name is 5 bytes longer than the file name, so it exceeds the 255 byte limit
+        let long = format!("{}.pak", "b".repeat(250));
+        fs::write(m.join("5543").join(&long), b"x").unwrap();
+        let err = enable_key(&m, &p, "5543").unwrap_err();
+        assert!(err.contains("Failed to inject mod"), "{err}");
+        assert_eq!(fs::read_dir(&p).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn enable_links_enabled_addons_under_pack_key() {
+        use crate::packs::{write_manifest, PackManifest};
+        let m = scratch("mods");
+        let p = scratch("paks");
+        fs::create_dir_all(m.join("P/3063/addons")).unwrap();
+        write_manifest(&m.join("P"), &PackManifest {
+            pack_id: "P".into(), name: "P".into(), version: None,
+            mod_ids: vec!["3063".into()], imported_at: 0, ..Default::default() }).unwrap();
+        fs::write(m.join("P/3063/a.pak"), b"x").unwrap();
+        fs::write(m.join("P/3063/addons/x.pak"), b"x").unwrap();
+        fs::write(m.join("P/3063/addons/x.ucas"), b"x").unwrap();
+        fs::write(m.join("P/3063/metadata.json"), r#"{"addons": {"x.pak": {"enabled": true}}}"#).unwrap();
+        enable_key(&m, &p, "P/3063").unwrap();
+        let mut got: Vec<_> = fs::read_dir(&p).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        got.sort();
+        assert_eq!(got, ["P.3063_a.pak", "P.3063_addon_x.pak", "P.3063_addon_x.ucas"]);
+    }
+
+    fn make_pack_zip(path: &Path, preset: serde_json::Value, files: &[(&str, &[u8])]) {
+        use std::io::Write;
+        let mut zip = zip::ZipWriter::new(fs::File::create(path).unwrap());
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("preset.json", options).unwrap();
+        zip.write_all(preset.to_string().as_bytes()).unwrap();
+        for (name, bytes) in files {
+            zip.start_file(*name, options).unwrap();
+            zip.write_all(bytes).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    fn put(dir: &Path, rel: &str, bytes: &[u8]) {
+        let p = dir.join(rel);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, bytes).unwrap();
+    }
+
+    fn read_json(path: &Path) -> Value {
+        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut out: Vec<_> = fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        out.sort();
+        out
+    }
+
+    fn tree(dir: &Path) -> Vec<String> {
+        fn walk(base: &Path, dir: &Path, out: &mut Vec<String>) {
+            for e in fs::read_dir(dir).unwrap().map(|e| e.unwrap()) {
+                let p = e.path();
+                let md = p.symlink_metadata().unwrap();
+                let rel = p.strip_prefix(base).unwrap().to_string_lossy().to_string();
+                if md.is_dir() {
+                    out.push(format!("{}/", rel));
+                    walk(base, &p, out);
+                } else {
+                    out.push(format!("{} {}", rel, md.len()));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(dir, dir, &mut out);
+        out.sort();
+        out
+    }
+
+    fn no_staging_left(m: &Path) -> bool {
+        names(m).iter().all(|n| !n.starts_with(".import-"))
+    }
+
+    fn keys(refs: &[ModRef]) -> Vec<String> {
+        refs.iter().map(|r| r.key.clone()).collect()
+    }
+
+    fn cs_v15_zip(path: &Path) {
+        make_pack_zip(path, serde_json::json!({"name": "CS v1.5", "mod_ids": ["3063", "4296"]}), &[
+            ("3063/metadata.json", br#"{"version": "1.0"}"#),
+            ("3063/old.pak", b"old"),
+            ("4296/metadata.json", br#"{"version": "1.0"}"#),
+            ("4296/b.pak", b"b"),
+        ]);
+    }
+
+    fn cs_v16_zip(path: &Path) {
+        make_pack_zip(path, serde_json::json!({"name": "CS v1.6", "mod_ids": ["3063", "7000"]}), &[
+            ("3063/metadata.json", br#"{"version": "2.0"}"#),
+            ("3063/new.pak", b"new"),
+            ("7000/metadata.json", br#"{"version": "1.0"}"#),
+            ("7000/c.pak", b"c"),
+        ]);
+    }
+
+    // CS v1.5 installed with both mods enabled, a second pack Other/3063 and loose 5543
+    fn upgrade_setup(m: &Path, p: &Path, z: &Path) {
+        use crate::packs::{write_manifest, PackManifest};
+        cs_v15_zip(&z.join("v15.zip"));
+        import_from_archive(&z.join("v15.zip"), m, p).unwrap();
+        enable_key(m, p, "CS/3063").unwrap();
+        enable_key(m, p, "CS/4296").unwrap();
+        put(m, "Other/3063/other.pak", b"o");
+        write_manifest(&m.join("Other"), &PackManifest {
+            pack_id: "Other".into(), name: "Other".into(), version: None,
+            mod_ids: vec!["3063".into()], imported_at: 0, ..Default::default() }).unwrap();
+        put(m, "5543/a.pak", b"a");
+        enable_key(m, p, "5543").unwrap();
+        cs_v16_zip(&z.join("v16.zip"));
+    }
+
+    #[test]
+    fn busy_pack_refuses_delete_fork_and_import() {
+        use crate::subscribe::{OpGuard, OpKind};
+        let (m, p, z) = (scratch("busy-mods"), scratch("busy-paks"), scratch("busy-zips"));
+        cs_v15_zip(&z.join("v15.zip"));
+        import_from_archive(&z.join("v15.zip"), &m, &p).unwrap();
+        cs_v16_zip(&z.join("v16.zip"));
+        let before = tree(&m);
+        {
+            let _held = OpGuard::begin(&m.join("CS"), OpKind::Download).unwrap();
+            let busy = "CS is busy, try again when it finishes";
+            assert_eq!(delete_pack_dir(&m, Some(&p), "CS").unwrap_err(), busy);
+            assert_eq!(fork_pack_dir(&m, "CS", "Mine").unwrap_err(), busy);
+            let err = import_from_archive(&z.join("v16.zip"), &m, &p).unwrap_err();
+            assert_eq!(err, busy);
+            assert_eq!(tree(&m), before);
+            assert!(no_staging_left(&m));
+        }
+        import_from_archive(&z.join("v16.zip"), &m, &p).unwrap();
+        fork_pack_dir(&m, "CS", "Mine").unwrap();
+        delete_pack_dir(&m, Some(&p), "CS").unwrap();
+    }
+
+    #[test]
+    fn sweep_staging_removes_only_leftover_staging() {
+        let m = scratch("sweep-staging");
+        for dir in [".import-1/CS/3063", ".fork-2/Mine/3063", ".deleting-3/3063", "CS/3063", ".other/x", "3151"] {
+            fs::create_dir_all(m.join(dir)).unwrap();
+        }
+        put(&m, ".import-1/CS/3063/a.pak", b"a");
+        put(&m, ".import-file", b"not a folder");
+        put(&m, "CS/pack.json", b"{}");
+        sweep_staging(&m);
+        assert_eq!(names(&m), vec![".import-file", ".other", "3151", "CS"]);
+        assert!(m.join("CS/3063").is_dir() && m.join(".other/x").is_dir());
+        sweep_staging(&m.join("missing"));
+    }
+
+    #[test]
+    fn import_over_flat_library() {
+        let (m, p, z) = (scratch("mods"), scratch("paks"), scratch("zips"));
+        for id in ["3063", "3151", "5543"] {
+            put(&m, &format!("{}/a.pak", id), id.as_bytes());
+            put(&m, &format!("{}/metadata.json", id), br#"{"version": "1"}"#);
+            enable_key(&m, &p, id).unwrap();
+        }
+        let zip = z.join("cs.zip");
+        make_pack_zip(&zip, serde_json::json!({"name": "CS v1.5", "mod_ids": ["3063", "3151"]}), &[
+            ("3063/metadata.json", br#"{"version": "1", "enabled": true, "addons": {"x.pak": {"enabled": true}}}"#),
+            ("3063/a.pak", b"packed"),
+            ("3063/addons/x.pak", b"x"),
+            ("3151/metadata.json", br#"{"version": "1", "enabled": true}"#),
+            ("3151/a.pak", b"packed"),
+        ]);
+        let s = import_from_archive(&zip, &m, &p).unwrap();
+        assert!(m.join("CS/3063").is_dir());
+        assert!(m.join("CS/3151").is_dir());
+        assert!(!m.join("3063").exists());
+        assert!(!m.join("3151").exists());
+        assert_eq!(fs::read(m.join("5543/a.pak")).unwrap(), b"5543");
+        assert!(names(&p).iter().all(|n| !n.starts_with("3063_") && !n.starts_with("3151_")));
+        assert!(entry_present(&p.join("5543_a.pak")));
+        assert_eq!(s.superseded_ids, ["3063", "3151"]);
+        for id in ["3063", "3151"] {
+            assert_eq!(read_json(&m.join("CS").join(id).join("metadata.json"))["enabled"], false);
+        }
+        assert_eq!(read_json(&m.join("CS/3063/metadata.json"))["addons"], serde_json::json!({"x.pak": {"enabled": true}}));
+        assert!(no_staging_left(&m));
+    }
+
+    #[test]
+    fn zip_import_keeps_published_and_marks_dirty() {
+        use crate::packs::{read_manifest, write_manifest, Published};
+        let (m, p, z) = (scratch("mods"), scratch("paks"), scratch("zips"));
+        upgrade_setup(&m, &p, &z);
+        let mut man = read_manifest(&m.join("CS")).unwrap();
+        man.published = Some(Published { folder_id: "F".into(), dirty: false });
+        write_manifest(&m.join("CS"), &man).unwrap();
+        import_from_archive(&z.join("v16.zip"), &m, &p).unwrap();
+        let after = read_manifest(&m.join("CS")).unwrap();
+        assert_eq!(after.published, Some(Published { folder_id: "F".into(), dirty: true }));
+    }
+
+    #[test]
+    fn zip_import_drops_source() {
+        use crate::packs::{read_manifest, write_manifest, InstalledMod, PackSource};
+        let (m, p, z) = (scratch("mods"), scratch("paks"), scratch("zips"));
+        upgrade_setup(&m, &p, &z);
+        let mut man = read_manifest(&m.join("CS")).unwrap();
+        man.source = Some(PackSource { kind: "drive".into(), folder_id: "F".into(), resource_key: None });
+        man.installed_hashes.insert("3063".into(), InstalledMod::default());
+        write_manifest(&m.join("CS"), &man).unwrap();
+        import_from_archive(&z.join("v16.zip"), &m, &p).unwrap();
+        let after = read_manifest(&m.join("CS")).unwrap();
+        assert!(after.source.is_none());
+        assert!(after.installed_hashes.is_empty());
+        assert!(after.published.is_none());
+    }
+
+    #[test]
+    fn zip_import_drops_local_hashes() {
+        use crate::packs::{read_manifest, write_manifest, CachedHash, Published};
+        let (m, p, z) = (scratch("mods"), scratch("paks"), scratch("zips"));
+        upgrade_setup(&m, &p, &z);
+        let mut man = read_manifest(&m.join("CS")).unwrap();
+        man.published = Some(Published { folder_id: "F".into(), dirty: false });
+        man.local_hashes.insert("3063/a.pak".into(), CachedHash { size: 1, mtime_ns: 1, sha256: "x".into() });
+        write_manifest(&m.join("CS"), &man).unwrap();
+        import_from_archive(&z.join("v16.zip"), &m, &p).unwrap();
+        assert!(read_manifest(&m.join("CS")).unwrap().local_hashes.is_empty());
+    }
+
+    #[test]
+    fn upgrade_replaces_only_this_pack() {
+        let (m, p, z) = (scratch("mods"), scratch("paks"), scratch("zips"));
+        upgrade_setup(&m, &p, &z);
+        let s = import_from_archive(&z.join("v16.zip"), &m, &p).unwrap();
+        assert!(!m.join("CS/4296").exists());
+        let paks: Vec<_> = names(&m.join("CS/3063")).into_iter().filter(|n| n.ends_with(".pak")).collect();
+        assert_eq!(paks, ["new.pak"]);
+        assert!(m.join("CS/7000").is_dir());
+        assert_eq!(fs::read(m.join("Other/3063/other.pak")).unwrap(), b"o");
+        assert_eq!(fs::read(m.join("5543/a.pak")).unwrap(), b"a");
+        assert!(entry_present(&p.join("5543_a.pak")));
+        assert!(names(&p).iter().all(|n| !n.starts_with("CS.")));
+        assert_eq!(s.removed_keys, ["CS/4296"]);
+        assert_eq!(s.added, 1);
+        assert_eq!(s.changed, 1);
+        assert_eq!(s.keys, ["CS/3063", "CS/7000"]);
+        assert_eq!(read_json(&m.join("CS/pack.json"))["version"], "1.6");
+        assert!(no_staging_left(&m));
+    }
+
+    #[test]
+    fn truncated_zip_changes_nothing() {
+        let (m, p, z) = (scratch("mods"), scratch("paks"), scratch("zips"));
+        upgrade_setup(&m, &p, &z);
+        let bytes = fs::read(z.join("v16.zip")).unwrap();
+        let cut = z.join("cut.zip");
+        fs::write(&cut, &bytes[..bytes.len() / 2]).unwrap();
+        let before = (tree(&m), tree(&p));
+        assert!(import_from_archive(&cut, &m, &p).is_err());
+        assert_eq!((tree(&m), tree(&p)), before);
+        assert!(no_staging_left(&m));
+    }
+
+    #[test]
+    fn reimport_same_zip_is_stable() {
+        let (m, p, z) = (scratch("mods"), scratch("paks"), scratch("zips"));
+        upgrade_setup(&m, &p, &z);
+        put(&m, "7000/c.pak", b"loose");
+        let zip = z.join("v16.zip");
+        import_from_archive(&zip, &m, &p).unwrap();
+        let count = names(&m).len();
+        let again = import_from_archive(&zip, &m, &p).unwrap();
+        assert!(again.removed_keys.is_empty() && again.superseded_ids.is_empty());
+        assert_eq!((again.added, again.changed), (0, 0));
+        let v = inspect_archive(&zip, &m).unwrap();
+        assert!(v.added.is_empty() && v.removed.is_empty() && v.changed.is_empty() && v.superseded.is_empty(), "{v:?}");
+        assert_eq!(v.installed_version.as_deref(), Some("1.6"));
+        assert_eq!(names(&m).len(), count);
+        assert!(no_staging_left(&m));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_delete_of_old_pack_is_reported() {
+        use std::os::unix::fs::PermissionsExt;
+        let (m, p, z) = (scratch("mods"), scratch("paks"), scratch("zips"));
+        upgrade_setup(&m, &p, &z);
+        put(&m, "CS/4296/sub/locked.pak", b"x");
+        fs::set_permissions(m.join("CS/4296/sub"), fs::Permissions::from_mode(0o500)).unwrap();
+        let s = import_from_archive(&z.join("v16.zip"), &m, &p);
+        let staging: Vec<_> = names(&m).into_iter().filter(|n| n.starts_with(".import-")).collect();
+        for n in &staging {
+            let sub = m.join(n).join("old-CS/4296/sub");
+            if sub.exists() {
+                fs::set_permissions(&sub, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+        if m.join("CS/4296/sub").exists() {
+            fs::set_permissions(m.join("CS/4296/sub"), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let s = s.unwrap();
+        assert!(!s.failed_deletes.is_empty());
+        assert_eq!(staging.len(), 1);
+        assert_eq!(read_json(&m.join("CS/pack.json"))["version"], "1.6");
+        assert!(m.join("CS/7000").is_dir());
+        assert!(!m.join("CS/4296").exists());
+    }
+
+    #[test]
+    fn pack_holds_folders_present() {
+        let (m, p, z) = (scratch("mods"), scratch("paks"), scratch("zips"));
+        let zip = z.join("n.zip");
+        make_pack_zip(&zip, serde_json::json!({"name": "N", "mod_ids": ["1", "2", "3"]}), &[
+            ("2/a.pak", b"a"), ("3/a.pak", b"a"), ("4/a.pak", b"a"),
+        ]);
+        import_from_archive(&zip, &m, &p).unwrap();
+        assert_eq!(read_json(&m.join("N/pack.json"))["mod_ids"], serde_json::json!(["2", "3", "4"]));
+    }
+
+    #[test]
+    fn non_numeric_loose_folder_is_left_alone() {
+        let (m, p, z) = (scratch("mods"), scratch("paks"), scratch("zips"));
+        put(&m, "notes/readme.txt", b"keep");
+        cs_v15_zip(&z.join("v15.zip"));
+        import_from_archive(&z.join("v15.zip"), &m, &p).unwrap();
+        assert_eq!(fs::read(m.join("notes/readme.txt")).unwrap(), b"keep");
+        assert_eq!(names(&m), ["CS", "notes"]);
+    }
+
+    #[test]
+    fn inspect_lists_removed_and_superseded() {
+        let (m, p, z) = (scratch("mods"), scratch("paks"), scratch("zips"));
+        upgrade_setup(&m, &p, &z);
+        put(&m, "7000/c.pak", b"loose");
+        let before = tree(&m);
+        let v = inspect_archive(&z.join("v16.zip"), &m).unwrap();
+        assert_eq!(v.pack.pack_id, "CS");
+        assert_eq!(v.pack.version.as_deref(), Some("1.6"));
+        assert_eq!(v.installed_version.as_deref(), Some("1.5"));
+        assert_eq!(keys(&v.removed), ["CS/4296"]);
+        assert_eq!(keys(&v.added), ["CS/7000"]);
+        assert_eq!(keys(&v.changed), ["CS/3063"]);
+        assert_eq!(keys(&v.superseded), ["7000"]);
+        assert_eq!(tree(&m), before);
+    }
+
+    #[test]
+    fn import_rejects_non_numeric_top_folder_and_a_non_pack_folder_in_the_way() {
+        let (m, p, z) = (scratch("mods"), scratch("paks"), scratch("zips"));
+        let bad = z.join("bad.zip");
+        make_pack_zip(&bad, serde_json::json!({"name": "CS"}), &[("3063/a.pak", b"a"), ("Stuff/a.pak", b"a")]);
+        let err = import_from_archive(&bad, &m, &p).unwrap_err();
+        assert!(err.contains("Stuff"), "{err}");
+        make_pack_zip(&bad, serde_json::json!({"name": "CS"}), &[("3063/a.pak", b"a"), ("3063/../Stuff/a.pak", b"a")]);
+        assert!(import_from_archive(&bad, &m, &p).is_err());
+        assert!(inspect_archive(&bad, &m).is_err());
+        put(&m, "CS/readme.txt", b"mine");
+        cs_v15_zip(&z.join("v15.zip"));
+        assert!(import_from_archive(&z.join("v15.zip"), &m, &p).is_err());
+        assert_eq!(fs::read(m.join("CS/readme.txt")).unwrap(), b"mine");
+        assert_eq!(names(&m), ["CS"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_rename_aside_restores_links() {
+        use std::os::unix::fs::PermissionsExt;
+        let (m, p, z) = (scratch("mods"), scratch("paks"), scratch("zips"));
+        upgrade_setup(&m, &p, &z);
+        let before = (tree(&m), tree(&p));
+        // moving a folder to a new parent needs write access to it, to update its ".." entry
+        fs::set_permissions(m.join("CS"), fs::Permissions::from_mode(0o500)).unwrap();
+        let r = import_from_archive(&z.join("v16.zip"), &m, &p);
+        fs::set_permissions(m.join("CS"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(r.unwrap_err(), "Close Ready or Not and try again");
+        assert_eq!((tree(&m), tree(&p)), before);
+        assert!(no_staging_left(&m));
+    }
+
+    fn cs_pack(m: &Path) {
+        use crate::packs::{write_manifest, PackManifest};
+        put(m, "CS/3311/addons/x.pak", b"x");
+        put(m, "CS/3311/a.pak", b"a");
+        write_manifest(&m.join("CS"), &PackManifest {
+            pack_id: "CS".into(), name: "Casual Shitters".into(), version: Some("1.5".into()),
+            mod_ids: vec!["3311".into()], imported_at: 0, ..Default::default() }).unwrap();
+    }
+
+    #[test]
+    fn apply_disables_by_folder_not_flag() {
+        let m = scratch("apply-mods");
+        let p = scratch("apply-paks");
+        put(&m, "5543/a.pak", b"a");
+        put(&m, "5543/metadata.json", br#"{"enabled": false}"#);
+        put(&m, "3063/b.pak", b"b");
+        fs::create_dir_all(&p).unwrap();
+        create_link(&m.join("5543/a.pak"), &p.join("5543_a.pak")).unwrap();
+
+        let s = apply_keys(&m, &p, &["3063".to_string()]).unwrap();
+        assert!(names(&p).iter().all(|n| !n.starts_with("5543_")));
+        assert!(names(&p).iter().any(|n| n.starts_with("3063_")));
+        assert!(s.disabled >= 1);
+        assert_eq!((s.enabled, s.missing), (1, 0));
+    }
+
+    #[test]
+    fn apply_counts_missing_keys() {
+        let m = scratch("apply-missing-mods");
+        let p = scratch("apply-missing-paks");
+        fs::create_dir_all(&m).unwrap();
+        let s = apply_keys(&m, &p, &["CS/9999".to_string()]).unwrap();
+        assert_eq!((s.enabled, s.missing), (0, 1));
+    }
+
+    #[test]
+    fn exported_zip_has_no_double_slash() {
+        let m = scratch("export-mods");
+        let out = scratch("export-out").join("cs.zip");
+        cs_pack(&m);
+        let (json, folders) = export_plan(&m, &Default::default(), "pack:CS", None).unwrap();
+        assert_eq!(json["version"], "1.5");
+        assert_eq!(json["mod_ids"], serde_json::json!(["3311"]));
+        write_pack_zip(&out, &json, &folders).unwrap();
+        let zip = zip::ZipArchive::new(fs::File::open(&out).unwrap()).unwrap();
+        let entries: Vec<_> = zip.file_names().map(String::from).collect();
+        assert!(entries.iter().all(|n| !n.contains("//")), "{:?}", entries);
+        assert!(entries.contains(&"3311/addons/x.pak".to_string()));
+    }
+
+    #[test]
+    fn export_then_import_round_trips_identity() {
+        use crate::packs::read_manifest;
+        let m = scratch("round-mods");
+        let out = scratch("round-out").join("cs.zip");
+        cs_pack(&m);
+        let (json, folders) = export_plan(&m, &Default::default(), "pack:CS", Some("1.6".into())).unwrap();
+        write_pack_zip(&out, &json, &folders).unwrap();
+
+        let m2 = scratch("round-mods2");
+        let p2 = scratch("round-paks2");
+        fs::create_dir_all(&m2).unwrap();
+        import_from_archive(&out, &m2, &p2).unwrap();
+        let man = read_manifest(&m2.join("CS")).unwrap();
+        assert_eq!(man.pack_id, "CS");
+        assert_eq!(man.version, Some("1.6".to_string()));
+    }
+
+    #[test]
+    fn export_refuses_shared_nexus_ids() {
+        let m = scratch("export-collide");
+        let mut presets = std::collections::HashMap::new();
+        presets.insert("mine".to_string(), vec!["3063".to_string(), "CS/3063".to_string()]);
+        let e = export_plan(&m, &presets, "mine", None).unwrap_err();
+        assert_eq!(e, "Two mods in this preset share Nexus id 3063");
+    }
+
+    fn manifest(m: &Path, ids: &[&str]) {
+        use crate::packs::{write_manifest, PackManifest};
+        write_manifest(&m.join("CS"), &PackManifest {
+            pack_id: "CS".into(), name: "CS".into(), version: None,
+            mod_ids: ids.iter().map(|s| s.to_string()).collect(), imported_at: 0, ..Default::default() }).unwrap();
+    }
+
+    #[test]
+    fn move_into_linked_pack_is_refused() {
+        use crate::packs::{write_manifest, PackManifest, PackSource};
+        let m = scratch("mv-linked-mods");
+        put(&m, "7000/a.pak", b"a");
+        fs::create_dir_all(m.join("CS")).unwrap();
+        write_manifest(&m.join("CS"), &PackManifest {
+            pack_id: "CS".into(), name: "Casual Shitters".into(),
+            source: Some(PackSource { kind: "drive".into(), folder_id: "f".into(), resource_key: None }),
+            ..Default::default() }).unwrap();
+        let e = move_into_pack(&m, None, "7000", "CS").unwrap_err();
+        assert_eq!(e, "Casual Shitters is linked to its creator. Fork it to make changes.");
+        assert!(m.join("7000/a.pak").exists());
+        assert!(!m.join("CS/7000").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn move_into_pack_moves_and_relinks() {
+        let m = scratch("mv-in-mods");
+        let p = scratch("mv-in-paks");
+        put(&m, "7000/a.pak", b"a");
+        put(&m, "CS/3063/b.pak", b"b");
+        manifest(&m, &["3063"]);
+        enable_key(&m, &p, "7000").unwrap();
+        assert!(names(&p).iter().any(|n| n.starts_with("7000_")));
+
+        let (key, warning) = move_into_pack(&m, Some(&p), "7000", "CS").unwrap();
+        assert_eq!(warning, None);
+        assert_eq!(key, "CS/7000");
+        assert!(!m.join("7000").exists());
+        assert!(m.join("CS/7000/a.pak").exists());
+        assert_eq!(read_manifest(&m.join("CS")).unwrap().mod_ids, ["3063", "7000"]);
+        assert!(names(&p).iter().all(|n| !n.starts_with("7000_")));
+        assert!(names(&p).iter().any(|n| n.starts_with("CS.7000_")));
+    }
+
+    #[test]
+    fn move_into_pack_replaces_existing_copy() {
+        let m = scratch("mv-rep-mods");
+        let p = scratch("mv-rep-paks");
+        put(&m, "CS/3063/old.pak", b"old");
+        put(&m, "3063/new.pak", b"new");
+        manifest(&m, &["3063"]);
+        move_into_pack(&m, Some(&p), "3063", "CS").unwrap();
+        assert_eq!(names(&m.join("CS/3063")), ["new.pak"]);
+        assert_eq!(read_manifest(&m.join("CS")).unwrap().mod_ids, ["3063"]);
+    }
+
+    #[test]
+    fn move_out_round_trips() {
+        let m = scratch("mv-out-mods");
+        let p = scratch("mv-out-paks");
+        put(&m, "CS/7000/a.pak", b"a");
+        manifest(&m, &["7000", "3063"]);
+        let (key, _) = move_out_of_pack(&m, Some(&p), "CS/7000", false).unwrap();
+        assert_eq!(key, "7000");
+        assert!(m.join("7000/a.pak").exists());
+        assert!(!m.join("CS/7000").exists());
+        assert_eq!(read_manifest(&m.join("CS")).unwrap().mod_ids, ["3063"]);
+    }
+
+    #[test]
+    fn move_out_refuses_over_root_copy() {
+        let m = scratch("mv-refuse-mods");
+        let p = scratch("mv-refuse-paks");
+        put(&m, "7000/root.pak", b"r");
+        put(&m, "CS/7000/a.pak", b"a");
+        manifest(&m, &["7000"]);
+        assert_eq!(move_out_of_pack(&m, Some(&p), "CS/7000", false), Err("root-exists".to_string()));
+        assert!(m.join("7000/root.pak").exists());
+        assert!(m.join("CS/7000/a.pak").exists());
+        assert_eq!(read_manifest(&m.join("CS")).unwrap().mod_ids, ["7000"]);
+
+        move_out_of_pack(&m, Some(&p), "CS/7000", true).unwrap();
+        assert!(m.join("7000/a.pak").exists());
+        assert!(!m.join("7000/root.pak").exists());
+    }
+
+    #[test]
+    fn delete_pack_mod_drops_it_from_manifest() {
+        let m = scratch("del-pack-mod");
+        put(&m, "CS/7000/a.pak", b"a");
+        manifest(&m, &["7000", "3063"]);
+        drop_from_manifest(&m, "CS/7000").unwrap();
+        assert_eq!(read_manifest(&m.join("CS")).unwrap().mod_ids, ["3063"]);
+        drop_from_manifest(&m, "7000").unwrap();
+        assert_eq!(read_manifest(&m.join("CS")).unwrap().mod_ids, ["3063"]);
+    }
+
+    #[test]
+    fn move_into_pack_with_missing_source_deletes_nothing() {
+        let m = scratch("mv-missing-mods");
+        let p = scratch("mv-missing-paks");
+        put(&m, "CS/3063/old.pak", b"old");
+        manifest(&m, &["3063"]);
+        assert!(move_into_pack(&m, Some(&p), "3063", "CS").is_err());
+        assert!(m.join("CS/3063/old.pak").exists());
+        assert_eq!(read_manifest(&m.join("CS")).unwrap().mod_ids, ["3063"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_replace_keeps_the_old_copy() {
+        use std::os::unix::fs::PermissionsExt;
+        let m = scratch("mv-fail-mods");
+        let p = scratch("mv-fail-paks");
+        put(&m, "CS/3063/old.pak", b"old");
+        put(&m, "3063/new.pak", b"new");
+        manifest(&m, &["3063"]);
+        fs::set_permissions(m.join("CS"), fs::Permissions::from_mode(0o555)).unwrap();
+        let r = move_into_pack(&m, Some(&p), "3063", "CS");
+        fs::set_permissions(m.join("CS"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(r.is_err());
+        assert!(m.join("CS/3063/old.pak").exists());
+        assert!(m.join("3063/new.pak").exists());
+        assert_eq!(read_manifest(&m.join("CS")).unwrap().mod_ids, ["3063"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn drop_from_manifest_reports_write_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let m = scratch("drop-fail");
+        put(&m, "CS/7000/a.pak", b"a");
+        manifest(&m, &["7000"]);
+        let dir = m.join("CS");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let r = drop_from_manifest(&m, "CS/7000");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        if r.is_ok() {
+            return; // running as root, permissions are not enforced
+        }
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn scan_dir_skips_dot_folders_inside_packs() {
+        let m = scratch("scan-dot");
+        put(&m, "CS/7000/a.pak", b"a");
+        put(&m, "CS/.replaced-x/a.pak", b"a");
+        manifest(&m, &["7000"]);
+        let ids: Vec<_> = scan_dir(&m).into_iter().map(|x| x.id).collect();
+        assert_eq!(ids, ["CS/7000"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_replace_relinks_the_enabled_old_copy() {
+        use std::os::unix::fs::PermissionsExt;
+        let m = scratch("mv-relink-mods");
+        let p = scratch("mv-relink-paks");
+        put(&m, "CS/3063/old.pak", b"old");
+        put(&m, "3063/new.pak", b"new");
+        manifest(&m, &["3063"]);
+        enable_key(&m, &p, "CS/3063").unwrap();
+        fs::set_permissions(m.join("CS"), fs::Permissions::from_mode(0o555)).unwrap();
+        let r = move_into_pack(&m, Some(&p), "3063", "CS");
+        fs::set_permissions(m.join("CS"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(r.is_err());
+        assert!(names(&p).iter().any(|n| n.starts_with("CS.3063_")));
+        assert!(m.join("CS/3063/old.pak").exists());
+        assert!(flag_enabled(&m.join("CS/3063")));
+    }
+
+    #[test]
+    fn disable_all_unlinks_by_folder_and_skips_bad_folders() {
+        let m = scratch("all-off-mods");
+        let p = scratch("all-off-paks");
+        put(&m, "5543/a.pak", b"a");
+        put(&m, "5543/metadata.json", br#"{"enabled": false}"#);
+        put(&m, "notes/metadata.json", br#"{"enabled": true}"#);
+        put(&m, "3063/b.pak", b"b");
+        create_link(&m.join("5543/a.pak"), &p.join("5543_a.pak")).unwrap();
+        toggle_all_keys(&m, &p, false).unwrap();
+        assert!(names(&p).is_empty(), "{:?}", names(&p));
+
+        toggle_all_keys(&m, &p, true).unwrap();
+        assert!(entry_present(&p.join("5543_a.pak")));
+        assert!(entry_present(&p.join("3063_b.pak")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn locked_paks_folder_rolls_back_with_close_game_message() {
+        use std::os::unix::fs::PermissionsExt;
+        let (m, p, z) = (scratch("mods"), scratch("paks"), scratch("zips"));
+        upgrade_setup(&m, &p, &z);
+        let before = (tree(&m), tree(&p));
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o555)).unwrap();
+        let r = import_from_archive(&z.join("v16.zip"), &m, &p);
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(r.unwrap_err(), "Close Ready or Not and try again");
+        assert_eq!((tree(&m), tree(&p)), before);
+        assert!(no_staging_left(&m));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn partly_unlinked_swap_relinks_every_original_link() {
+        let (m, p, z) = (scratch("mods"), scratch("paks"), scratch("zips"));
+        upgrade_setup(&m, &p, &z);
+        // a folder with the key's prefix makes remove_file fail partway through the unlinks
+        fs::create_dir_all(p.join("CS.4296_zz/inner")).unwrap();
+        let before = (tree(&m), tree(&p));
+        let err = import_from_archive(&z.join("v16.zip"), &m, &p).unwrap_err();
+        assert!(err.starts_with("Failed to remove injected mod"), "{err}");
+        assert!(!err.contains("could not re-enable"), "{err}");
+        assert_eq!((tree(&m), tree(&p)), before);
+        assert!(no_staging_left(&m));
+    }
+
+    #[test]
+    fn old_pack_keys_use_the_on_disk_folder_name() {
+        let m = scratch("old-keys");
+        put(&m, "Casual-Shitters/3063/a.pak", b"a");
+        put(&m, "Casual-Shitters/4296/b.pak", b"b");
+        use crate::packs::{write_manifest, PackManifest};
+        write_manifest(&m.join("Casual-Shitters"), &PackManifest {
+            pack_id: "Casual-Shitters".into(), name: "Casual Shitters".into(), version: None,
+            mod_ids: vec!["3063".into(), "4296".into()], imported_at: 0, ..Default::default() }).unwrap();
+        assert_eq!(old_pack_keys(&m, "casual-shitters").unwrap(), ["Casual-Shitters/3063", "Casual-Shitters/4296"]);
+        assert_eq!(old_pack_keys(&m, "Casual-Shitters").unwrap(), ["Casual-Shitters/3063", "Casual-Shitters/4296"]);
+    }
+
+    #[test]
+    fn move_into_pack_keeps_a_replaced_enabled_copy_enabled() {
+        let m = scratch("mv-keep-mods");
+        let p = scratch("mv-keep-paks");
+        put(&m, "CS/3063/old.pak", b"old");
+        put(&m, "3063/new.pak", b"new");
+        put(&m, "3063/metadata.json", br#"{"enabled": false}"#);
+        manifest(&m, &["3063"]);
+        enable_key(&m, &p, "CS/3063").unwrap();
+        let (key, warning) = move_into_pack(&m, Some(&p), "3063", "CS").unwrap();
+        assert_eq!((key.as_str(), warning), ("CS/3063", None));
+        assert_eq!(names(&p), ["CS.3063_new.pak"]);
+        assert!(flag_enabled(&m.join("CS/3063")));
+    }
+
+    #[test]
+    fn move_without_game_path_creates_no_paks_folder() {
+        let m = scratch("mv-nogame-mods");
+        put(&m, "7000/a.pak", b"a");
+        put(&m, "7000/metadata.json", br#"{"enabled": true}"#);
+        put(&m, "CS/3063/b.pak", b"b");
+        manifest(&m, &["3063"]);
+        let (key, warning) = move_into_pack(&m, None, "7000", "CS").unwrap();
+        assert_eq!((key.as_str(), warning), ("CS/7000", None));
+        let (key, warning) = move_out_of_pack(&m, None, "CS/7000", false).unwrap();
+        assert_eq!((key.as_str(), warning), ("7000", None));
+        assert!(!m.join(".no-game-path").exists());
+        assert_eq!(names(&m), ["7000", "CS"]);
+        assert!(flag_enabled(&m.join("7000")));
+    }
+
+    #[test]
+    fn import_clears_update_available() {
+        let (m, p, z) = (scratch("mods"), scratch("paks"), scratch("zips"));
+        let zip = z.join("u.zip");
+        make_pack_zip(&zip, serde_json::json!({"name": "U"}), &[
+            ("3063/metadata.json", br#"{"enabled": true, "update_available": true}"#),
+            ("3063/a.pak", b"a"),
+        ]);
+        import_from_archive(&zip, &m, &p).unwrap();
+        let meta = read_json(&m.join("U/3063/metadata.json"));
+        assert_eq!((meta["enabled"].clone(), meta["update_available"].clone()), (Value::Bool(false), Value::Bool(false)));
+    }
+
+    #[test]
+    fn delete_pack_dir_unlinks_and_removes_only_that_pack() {
+        use crate::packs::{write_manifest, PackManifest};
+        let m = scratch("delpack-mods");
+        let p = scratch("delpack-paks");
+        put(&m, "CS/3063/a.pak", b"a");
+        put(&m, "CS/4296/b.pak", b"b");
+        manifest(&m, &["3063", "4296"]);
+        put(&m, "Other/3063/o.pak", b"o");
+        write_manifest(&m.join("Other"), &PackManifest {
+            pack_id: "Other".into(), name: "Other".into(), version: None,
+            mod_ids: vec!["3063".into()], imported_at: 0, ..Default::default() }).unwrap();
+        put(&m, "5543/l.pak", b"l");
+        for key in ["CS/4296", "Other/3063", "5543"] {
+            enable_key(&m, &p, key).unwrap();
+        }
+        create_link(&m.join("CS/3063/a.pak"), &p.join("CS.3063_a.pak")).unwrap();
+
+        delete_pack_dir(&m, Some(&p), "CS").unwrap();
+        assert_eq!(names(&p), ["5543_l.pak", "Other.3063_o.pak"]);
+        assert_eq!(names(&m), ["5543", "Other"]);
+        assert_eq!(fs::read(m.join("Other/3063/o.pak")).unwrap(), b"o");
+        assert_eq!(fs::read(m.join("5543/l.pak")).unwrap(), b"l");
+    }
+
+    #[test]
+    fn delete_pack_dir_refuses_invalid_ids() {
+        let m = scratch("delpack-bad");
+        let p = scratch("delpack-bad-paks");
+        put(&m, "5543/l.pak", b"l");
+        put(&m, "notes/readme.txt", b"n");
+        put(&m, "CS/3063/a.pak", b"a");
+        manifest(&m, &["3063"]);
+        let before = tree(&m);
+        for bad in ["", "..", "../CS", "CS/3063", "5543", "notes", "Missing", ".deleting-x"] {
+            assert!(delete_pack_dir(&m, Some(&p), bad).is_err(), "{bad}");
+        }
+        assert_eq!(tree(&m), before);
+    }
+
+    #[test]
+    fn delete_pack_dir_without_game_path_still_removes_the_folder() {
+        let m = scratch("delpack-nogame");
+        put(&m, "CS/3063/a.pak", b"a");
+        manifest(&m, &["3063"]);
+        delete_pack_dir(&m, None, "CS").unwrap();
+        assert!(names(&m).is_empty());
+    }
+
+    #[test]
+    fn fork_copies_and_unlocks() {
+        use crate::packs::{write_manifest, PackManifest, PackSource};
+        let m = scratch("fork-ok");
+        put(&m, "CS/3063/a.pak", b"aaa");
+        put(&m, "CS/3063/sub/x.bin", b"xyz");
+        put(&m, "CS/3063/metadata.json", br#"{"enabled": true, "name": "A"}"#);
+        put(&m, "CS/4296/b.pak", b"bb");
+        put(&m, "CS/4296/metadata.json", br#"{"enabled": true}"#);
+        fs::create_dir_all(m.join("CS")).unwrap();
+        write_manifest(&m.join("CS"), &PackManifest {
+            pack_id: "CS".into(), name: "Casual".into(), version: Some("1.2".into()),
+            mod_ids: vec!["3063".into(), "4296".into()], imported_at: 5,
+            source: Some(PackSource { kind: "drive".into(), folder_id: "f".into(), resource_key: None }),
+            local_hashes: [("3063/a.pak".to_string(), crate::packs::CachedHash { size: 3, mtime_ns: 1, sha256: "x".into() })].into(),
+            ..Default::default() }).unwrap();
+        assert!(crate::packs::ensure_pack_editable(&m, "CS").is_err());
+        let before = tree(&m.join("CS"));
+
+        let fork = fork_pack_dir(&m, "CS", "  My Fork ").unwrap();
+        assert_eq!((fork.pack_id.as_str(), fork.name.as_str()), ("My-Fork", "My Fork"));
+        assert_eq!(fork.version.as_deref(), Some("1.2"));
+        assert_eq!(fork.mod_ids, ["3063", "4296"]);
+        assert!(fork.source.is_none());
+        assert_eq!(names(&m), ["CS", "My-Fork"]);
+        for (rel, bytes) in [("3063/a.pak", &b"aaa"[..]), ("3063/sub/x.bin", b"xyz"), ("4296/b.pak", b"bb")] {
+            assert_eq!(fs::read(m.join("My-Fork").join(rel)).unwrap(), bytes);
+        }
+        for id in ["3063", "4296"] {
+            assert_eq!(read_json(&m.join("My-Fork").join(id).join("metadata.json"))["enabled"], Value::Bool(false));
+        }
+        let saved = read_manifest(&m.join("My-Fork")).unwrap();
+        assert!(saved.source.is_none() && saved.installed_hashes.is_empty() && saved.published.is_none());
+        assert!(saved.local_hashes.is_empty());
+        crate::packs::ensure_pack_editable(&m, "My-Fork").unwrap();
+        assert_eq!(tree(&m.join("CS")), before);
+        assert_eq!(read_json(&m.join("CS/3063/metadata.json"))["enabled"], Value::Bool(true));
+        assert_eq!(pack_size(&m.join("CS/3063")), 3 + 3 + 30);
+    }
+
+    #[test]
+    fn fork_name_taken() {
+        let m = scratch("fork-taken");
+        put(&m, "CS/3063/a.pak", b"a");
+        manifest(&m, &["3063"]);
+        put(&m, "Mine/1/a.pak", b"a");
+        let before = tree(&m);
+        for name in ["mine", "CS", "con"] {
+            let e = fork_pack_dir(&m, "CS", name).unwrap_err();
+            assert_eq!(e, format!("A modpack called {} already exists", name));
+        }
+        assert!(fork_pack_dir(&m, "../CS", "x").is_err());
+        assert!(fork_pack_dir(&m, "Missing", "x").is_err());
+        assert_eq!(tree(&m), before);
+    }
+
+    #[test]
+    fn fork_empty_name() {
+        let m = scratch("fork-empty");
+        put(&m, "CS/3063/a.pak", b"a");
+        manifest(&m, &["3063"]);
+        assert_eq!(fork_pack_dir(&m, "CS", "  ").unwrap_err(), "Enter a name for the fork");
+        assert_eq!(names(&m), ["CS"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fork_and_size_skip_symlinks() {
+        let m = scratch("fork-link");
+        let outside = scratch("fork-link-out");
+        put(&outside, "big.bin", b"0123456789");
+        put(&m, "CS/3063/a.pak", b"a");
+        std::os::unix::fs::symlink(outside.join("big.bin"), m.join("CS/3063/l.bin")).unwrap();
+        std::os::unix::fs::symlink(&outside, m.join("CS/3063/dir")).unwrap();
+        manifest(&m, &["3063"]);
+        assert_eq!(pack_size(&m.join("CS")), fs::metadata(m.join("CS/pack.json")).unwrap().len() + 1);
+        fork_pack_dir(&m, "CS", "F").unwrap();
+        assert_eq!(tree(&m.join("F/3063")), ["a.pak 1"]);
+    }
 }

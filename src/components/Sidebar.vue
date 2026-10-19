@@ -1,7 +1,12 @@
 <script setup lang="ts">
-import { onMounted } from 'vue';
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 import { invoke } from "@tauri-apps/api/core";
-import { store } from "../store";
+import { store, type PackManifest } from "../store";
+import {
+  applyPack, loadPacks, loadPresets, refreshMods, publishPack, copyText, folderLink, progressLine, packLabel,
+  importArchive, addPackFromLink, updatePack, verifyPack, forkPack, updateLine, canCancel, cancelPackOp
+} from "../packActions";
+import { showAlert, showConfirm, showPrompt } from "../dialogs";
 import { 
   Package, 
   Globe, 
@@ -10,9 +15,12 @@ import {
   Upload, 
   Save, 
   X,
-  CheckCircle,
+  Check,
   CircleOff,
-  Play
+  Play,
+  CloudUpload,
+  Link,
+  MoreHorizontal
 } from 'lucide-vue-next';
 
 async function loginNexus() {
@@ -24,23 +32,12 @@ async function loginNexus() {
   }
 }
 
-async function loadPresets() {
-  try {
-    store.presets = await invoke("load_presets") as Record<string, string[]>;
-    if (store.activePresetName && !store.presets[store.activePresetName]) {
-      store.activePresetName = "";
-    }
-  } catch (e) {
-    console.error("Failed to load presets:", e);
-  }
-}
-
 async function saveCurrentPreset() {
-  const name = prompt("Name this preset:");
+  const name = await showPrompt("Name this preset:");
   if (!name || !name.trim()) return;
   const enabledIds = store.mods.filter((m: any) => m.enabled).map((m: any) => m.id);
   if (enabledIds.length === 0) {
-    alert("No mods are currently enabled to save.");
+    await showAlert("No mods are currently enabled to save.");
     return;
   }
   try {
@@ -56,43 +53,126 @@ async function applyPreset(name: string) {
   if (!modIds) return;
   try {
     await invoke("apply_preset", { name, modIds });
-    const refreshed: any[] = await invoke("scan_local_mods");
-    store.mods = refreshed;
     store.activePresetName = name;
+    await refreshMods();
   } catch (e) {
     console.error("Failed to apply preset:", e);
-    alert("Failed to apply preset: " + e);
+    await showAlert("Failed to apply preset: " + e);
   }
 }
 
 async function exportPreset(name: string) {
   try {
     await invoke("export_preset", { presetName: name });
-    alert(`Successfully exported preset: ${name}`);
+    await showAlert(`Successfully exported preset: ${name}`);
   } catch (e: any) {
     if (e !== "Export cancelled") {
       console.error("Failed to export preset:", e);
-      alert("Failed to export preset: " + e);
+      await showAlert("Failed to export preset: " + e);
     }
   }
 }
 
-async function importPreset() {
+const orphanProgress = computed(() =>
+  Object.values(store.packProgress).filter((p) => !store.packs.some((pack) => pack.pack_id === p.pack_id))
+);
+
+async function onCopyLink(pack: PackManifest) {
+  if (!pack.published) return;
+  await copyText(folderLink(pack.published.folder_id));
+}
+
+function versionLabel(version: string | null) {
+  return version ? `v${version.replace(/^[vV]/, "")}` : "";
+}
+
+async function onApplyPack(pack: PackManifest) {
   try {
-    const importedName: string = await invoke("import_preset");
-    alert(`Successfully imported preset: ${importedName}`);
-    await loadPresets();
-    
-    await applyPreset(importedName);
-    
-    const refreshed: any[] = await invoke("scan_local_mods");
-    store.mods = refreshed;
+    await applyPack(pack);
+  } catch (e) {
+    console.error("Failed to apply pack:", e);
+    await showAlert("Failed to apply pack: " + e);
+  }
+}
+
+function showPack(pack: PackManifest) {
+  document.getElementById(`section-${pack.pack_id}`)?.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+async function exportPack(pack: PackManifest) {
+  const version = await showPrompt("Version for this export:", pack.version ?? "");
+  if (version === null) return;
+  try {
+    await invoke("export_preset", { presetName: `pack:${pack.pack_id}`, version: version.trim() || undefined });
+    await showAlert(`Successfully exported modpack: ${pack.name}`);
+  } catch (e: any) {
+    if (e !== "Export cancelled") {
+      console.error("Failed to export pack:", e);
+      await showAlert("Failed to export pack: " + e);
+    }
+  }
+}
+
+async function removePack(pack: PackManifest) {
+  if (store.inFlight[pack.pack_id]) return;
+  if (!(await showConfirm(`Delete ${packLabel(pack.name, pack.version)} and its ${pack.mod_ids.length} mods from disk?`, { danger: true, confirmLabel: "Delete" }))) return;
+  if (store.inFlight[pack.pack_id]) return;
+  try {
+    await invoke("delete_pack", { packId: pack.pack_id });
+    await refreshMods();
+  } catch (e) {
+    console.error("Failed to delete pack:", e);
+    await showAlert("Failed to delete pack: " + e);
+  }
+}
+
+async function importPreset() {
+  let archivePath: string | null;
+  try {
+    archivePath = await invoke("pick_preset_archive");
   } catch (e: any) {
     if (e !== "Import cancelled") {
       console.error("Failed to import preset:", e);
-      alert("Failed to import preset: " + e);
+      await showAlert("Failed to import preset: " + e);
     }
+    return;
   }
+  if (archivePath) await importArchive(archivePath);
+}
+
+const addingFromLink = ref(false);
+
+async function onAddFromLink() {
+  addingFromLink.value = true;
+  try {
+    await addPackFromLink();
+  } finally {
+    addingFromLink.value = false;
+  }
+}
+
+const openMenu = ref<string | null>(null);
+
+function toggleMenu(pack: PackManifest) {
+  openMenu.value = openMenu.value === pack.pack_id ? null : pack.pack_id;
+}
+
+function closeMenu() {
+  openMenu.value = null;
+}
+
+// Capture phase, so buttons that stop propagation still close the menu
+function onDocumentClick(e: MouseEvent) {
+  const id = openMenu.value;
+  if (id === null) return;
+  const anchor = (e.target as Element | null)?.closest?.("[data-menu-anchor]");
+  if (anchor?.getAttribute("data-menu-anchor") === id) return;
+  closeMenu();
+}
+
+function fromMenu(action: (pack: PackManifest) => Promise<void>, pack: PackManifest) {
+  closeMenu();
+  action(pack);
 }
 
 async function removePreset(name: string) {
@@ -114,25 +194,30 @@ async function bulkToggleMods(enable: boolean) {
   store.isFetchingOnline = true;
   try {
     await invoke("toggle_all_mods", { enable });
-    const refreshed: any[] = await invoke("scan_local_mods");
-    store.mods = refreshed;
+    await refreshMods();
   } catch (e: any) {
     console.error("Bulk toggle failed:", e);
-    alert("Bulk Action Failed: " + e);
+    await showAlert("Bulk Action Failed: " + e);
   } finally {
     store.isFetchingOnline = false;
   }
 }
 
 onMounted(() => {
+  document.addEventListener("click", onDocumentClick, { capture: true });
   loadPresets();
+  loadPacks().catch((e) => console.error("Failed to load packs:", e));
+});
+
+onBeforeUnmount(() => {
+  document.removeEventListener("click", onDocumentClick, { capture: true });
 });
 
 async function fetchOnlineMods() {
   if (store.onlineMods.length > 0) return;
   
   if (!store.apiKeyStore) {
-    alert("You must log into Nexus Mods to browse online mods.");
+    await showAlert("You must log into Nexus Mods to browse online mods.");
     return;
   }
 
@@ -183,7 +268,7 @@ async function launchGame() {
     await invoke("launch_game");
   } catch (e) {
     console.error("Failed to launch game:", e);
-    alert("Failed to launch game: " + e);
+    await showAlert("Failed to launch game: " + e);
   }
 }
 </script>
@@ -223,9 +308,6 @@ async function launchGame() {
       </div>
       
       <div class="bulk-actions" v-if="store.currentMode === 'Installed'">
-        <button class="bulk-btn" @click="bulkToggleMods(true)">
-          <CheckCircle :size="14" color="#22c55e" /> Enable All
-        </button>
         <button class="bulk-btn" @click="bulkToggleMods(false)">
           <CircleOff :size="14" color="#ef4444" /> Disable All
         </button>
@@ -233,6 +315,105 @@ async function launchGame() {
     </div>
 
     <div class="sidebar-section" v-if="store.currentMode === 'Installed'">
+      <h3 class="section-label">Modpacks</h3>
+      <div v-for="p in orphanProgress" :key="p.pack_id" class="pack-progress-row pack-progress-orphan">
+        <p class="pack-progress">{{ progressLine(p) }}</p>
+        <button
+          v-if="canCancel(p.pack_id)"
+          class="pack-cancel-btn"
+          :disabled="!!store.cancelling[p.pack_id]"
+          @click.stop="cancelPackOp(p.pack_id)"
+        >{{ store.cancelling[p.pack_id] ? "Cancelling..." : "Cancel" }}</button>
+      </div>
+      <div class="preset-list" v-if="store.packs.length > 0">
+        <div
+          class="pack-card"
+          v-for="pack in store.packs"
+          :key="pack.pack_id"
+          :class="{ active: store.activePresetName === `pack:${pack.pack_id}` }"
+          @click="showPack(pack)"
+          :title="`${packLabel(pack.name, pack.version)} (${pack.mod_ids.length} mods)`"
+        >
+          <div class="pack-card-top">
+            <span class="pack-card-name">{{ pack.name }}</span>
+            <span class="preset-count">{{ pack.mod_ids.length }}</span>
+          </div>
+          <div class="pack-card-bottom">
+            <span class="pack-card-version">{{ versionLabel(pack.version) }}</span>
+            <div class="pack-card-actions">
+              <button class="pack-icon-btn" @click.stop="onApplyPack(pack)" title="Apply Modpack">
+                <Check :size="13" color="#22c55e" />
+              </button>
+              <button class="pack-icon-btn" @click.stop="exportPack(pack)" title="Export Modpack to .zip">
+                <Upload :size="13" color="#f59e0b" />
+              </button>
+              <button
+                v-if="store.google.email && !pack.source"
+                class="pack-icon-btn"
+                @click.stop="publishPack(pack)"
+                :disabled="!!store.inFlight[pack.pack_id]"
+                title="Publish Modpack to Google Drive"
+              >
+                <CloudUpload :size="13" color="#3b82f6" />
+              </button>
+              <button v-if="pack.published" class="pack-icon-btn" @click.stop="onCopyLink(pack)" title="Copy share link">
+                <Link :size="13" color="#a1a1aa" />
+              </button>
+              <div v-if="pack.source" class="pack-menu-anchor" :data-menu-anchor="pack.pack_id">
+                <button
+                  class="pack-icon-btn"
+                  @click.stop="toggleMenu(pack)"
+                  :disabled="!!store.inFlight[pack.pack_id]"
+                  title="More"
+                >
+                  <MoreHorizontal :size="13" color="#a1a1aa" />
+                </button>
+                <div v-if="openMenu === pack.pack_id" class="pack-menu" @click.stop>
+                  <button class="pack-menu-item" @click="fromMenu(verifyPack, pack)">Verify files</button>
+                  <button class="pack-menu-item" @click="fromMenu(forkPack, pack)">Fork</button>
+                </div>
+              </div>
+              <button
+                class="pack-icon-btn pack-icon-delete"
+                @click.stop="removePack(pack)"
+                :disabled="!!store.inFlight[pack.pack_id]"
+                title="Delete Modpack"
+              >
+                <X :size="13" color="#ef4444" />
+              </button>
+            </div>
+          </div>
+          <span v-if="pack.published?.dirty" class="pack-dirty">Changes not uploaded</span>
+          <div v-if="store.packUpdates[pack.pack_id]?.status === 'available'" class="pack-update">
+            <span class="pack-update-text">{{ updateLine(store.packUpdates[pack.pack_id]) }}</span>
+            <button
+              class="pack-update-btn"
+              @click.stop="updatePack(pack)"
+              :disabled="!!store.inFlight[pack.pack_id]"
+            >Update</button>
+          </div>
+          <span v-else-if="store.packUpdates[pack.pack_id]?.status === 'updating'" class="pack-update-text">Being updated by its creator</span>
+          <div v-if="store.packProgress[pack.pack_id]" class="pack-progress-row">
+            <p class="pack-progress">{{ progressLine(store.packProgress[pack.pack_id]) }}</p>
+            <button
+              v-if="canCancel(pack.pack_id)"
+              class="pack-cancel-btn"
+              :disabled="!!store.cancelling[pack.pack_id]"
+              @click.stop="cancelPackOp(pack.pack_id)"
+            >{{ store.cancelling[pack.pack_id] ? "Cancelling..." : "Cancel" }}</button>
+          </div>
+        </div>
+      </div>
+      <p v-else class="preset-empty">No modpacks imported yet.</p>
+      <button
+        v-if="store.google.linksAvailable"
+        class="full-btn secondary-btn preset-save-btn add-link-btn"
+        @click="onAddFromLink"
+        :disabled="addingFromLink"
+      >
+        <Link :size="16" color="#3b82f6" /> Add from link
+      </button>
+
       <h3 class="section-label">Presets</h3>
       <div class="preset-list" v-if="Object.keys(store.presets).length > 0">
         <div class="preset-item" v-for="(ids, name) in store.presets" :key="name">
@@ -566,6 +747,211 @@ async function launchGame() {
 .preset-delete-btn:hover {
   border-color: #ef4444;
   color: #ef4444;
+  background: rgba(239, 68, 68, 0.1);
+}
+
+.pack-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border-light);
+  border-radius: 6px;
+  padding: 0.5rem 0.6rem 0.4rem 0.75rem;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  transition: border-color 0.2s, background 0.2s;
+}
+
+.pack-card:hover {
+  border-color: var(--accent-primary);
+  background: var(--bg-hover);
+}
+
+.pack-card.active {
+  border-color: #22c55e;
+  box-shadow: 0 0 15px rgba(34, 197, 94, 0.2);
+  background: rgba(34, 197, 94, 0.08);
+}
+
+.pack-card.active .preset-count {
+  color: #22c55e;
+}
+
+.pack-card-top,
+.pack-card-bottom {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.pack-card-name {
+  color: var(--text-main);
+  font-size: 0.8rem;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+.pack-card-version {
+  color: var(--text-muted);
+  font-size: 0.7rem;
+}
+
+.pack-card-actions {
+  display: flex;
+  gap: 0.25rem;
+}
+
+.pack-icon-btn {
+  background: transparent;
+  border: 1px solid transparent;
+  width: 24px;
+  height: 22px;
+  border-radius: 5px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s;
+}
+
+.pack-icon-btn:hover:not(:disabled) {
+  border-color: var(--border-light);
+  background: var(--bg-darker);
+}
+
+.pack-icon-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.pack-dirty {
+  align-self: flex-start;
+  background: rgba(245, 158, 11, 0.12);
+  color: #f59e0b;
+  border: 1px solid rgba(245, 158, 11, 0.5);
+  border-radius: 99px;
+  padding: 0.05rem 0.5rem;
+  font-size: 0.65rem;
+  font-weight: 700;
+}
+
+.pack-progress {
+  color: var(--text-muted);
+  font-size: 0.7rem;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.pack-progress-orphan {
+  margin-bottom: 0.5rem;
+}
+
+.pack-progress-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.4rem;
+}
+
+.pack-cancel-btn {
+  background: rgba(239, 68, 68, 0.12);
+  border: 1px solid rgba(239, 68, 68, 0.5);
+  color: #ef4444;
+  border-radius: 5px;
+  font-size: 0.7rem;
+  font-weight: 700;
+  padding: 0.1rem 0.5rem;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.pack-cancel-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.pack-menu-anchor {
+  position: relative;
+}
+
+.pack-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  min-width: 120px;
+  background: var(--bg-dark);
+  border: 1px solid var(--border-light);
+  border-radius: 6px;
+  padding: 0.25rem;
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.4);
+}
+
+.pack-menu-item {
+  background: transparent;
+  border: none;
+  color: var(--text-main);
+  text-align: left;
+  font-size: 0.75rem;
+  padding: 0.4rem 0.6rem;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.pack-menu-item:hover {
+  background: var(--bg-hover);
+}
+
+.pack-update {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.4rem;
+}
+
+.pack-update-text {
+  color: #3b82f6;
+  font-size: 0.7rem;
+  font-weight: 600;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.pack-update-btn {
+  background: rgba(59, 130, 246, 0.12);
+  border: 1px solid rgba(59, 130, 246, 0.5);
+  color: #3b82f6;
+  border-radius: 5px;
+  font-size: 0.7rem;
+  font-weight: 700;
+  padding: 0.1rem 0.5rem;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.pack-update-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.add-link-btn {
+  width: 100%;
+  margin-bottom: 0.75rem;
+}
+
+.add-link-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.pack-icon-delete:hover {
+  border-color: #ef4444;
   background: rgba(239, 68, 68, 0.1);
 }
 

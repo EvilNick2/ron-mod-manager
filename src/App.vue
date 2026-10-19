@@ -2,7 +2,8 @@
 import { onMounted, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { store } from "./store";
+import { store, type PackProgress, type CloseBlocked } from "./store";
+import { loadGoogleStatus, checkPackUpdates, hasVisibleOps } from "./packActions";
 
 import Sidebar from "./components/Sidebar.vue";
 import ModGrid from "./components/ModGrid.vue";
@@ -10,10 +11,21 @@ import RightPanel from "./components/RightPanel.vue";
 import SettingsModal from "./components/SettingsModal.vue";
 import InstallModal from "./components/InstallModal.vue";
 import UpdateModal from "./components/UpdateModal.vue";
+import CloseGuardModal from "./components/CloseGuardModal.vue";
+import ProgressModal from "./components/ProgressModal.vue";
+import DialogModal from "./components/DialogModal.vue";
 
 const isDragging = ref(false);
 
 onMounted(async () => {
+  // A late event for an operation that already settled must not bring its line back
+  listen<PackProgress>("pack-progress", (e) => {
+    if (store.inFlight[e.payload.pack_id]) store.packProgress[e.payload.pack_id] = e.payload;
+  });
+  listen<CloseBlocked>("close-blocked", (e) => {
+    store.closeBlocked = e.payload;
+  });
+
   try {
     const config: any = await invoke("load_config");
     
@@ -62,6 +74,13 @@ onMounted(async () => {
   }
 
   try {
+    await loadGoogleStatus();
+  } catch (e) {
+    console.error("Failed to load Google status:", e);
+  }
+  checkPackUpdates();
+
+  try {
     const update = await invoke("check_for_app_update");
     if (update) {
       store.updateInfo = update as any;
@@ -102,7 +121,7 @@ onMounted(async () => {
     <h2>Drop Mod Archive Here</h2>
   </div>
 
-  <div class="app-layout" :class="{ 'modal-open': store.isSettingsOpen || store.installingModPath || store.postInstallModId || store.isUpdateModalOpen, 'blur-enabled': store.isBlurEnabled }">
+  <div class="app-layout" :class="{ 'modal-open': store.isSettingsOpen || store.installingModPath || store.postInstallModId || store.isUpdateModalOpen || store.closeBlocked || hasVisibleOps() || store.dialogs.length > 0, 'blur-enabled': store.isBlurEnabled }">
     <Sidebar />
     <ModGrid />
     <RightPanel />
@@ -116,6 +135,13 @@ onMounted(async () => {
     <transition name="fade">
       <UpdateModal v-if="store.isUpdateModalOpen" />
     </transition>
+
+    <transition name="fade">
+      <CloseGuardModal v-if="store.closeBlocked" />
+    </transition>
+
+    <ProgressModal />
+    <DialogModal />
   </div>
 </template>
 

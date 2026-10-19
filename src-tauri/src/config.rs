@@ -174,3 +174,114 @@ pub fn get_default_storage_path(app_handle: tauri::AppHandle) -> String {
     }
     "".to_string()
 }
+
+pub fn tidy_presets_after_import(config: &mut AppConfig, pack_id: &str, superseded_ids: &[String], removed_keys: &[String]) {
+    use crate::packs::pack_identity;
+    let mut removed: Vec<String> = Vec::new();
+    let pack_prefix = format!("{}/", pack_id);
+    config.presets.retain(|name, keys| {
+        let own = pack_identity(&serde_json::json!({ "name": name })).pack_id == pack_id
+            && keys.iter().all(|k| superseded_ids.contains(k) || k.starts_with(&pack_prefix));
+        if own {
+            removed.push(name.clone());
+        }
+        !own
+    });
+    for (name, keys) in config.presets.iter_mut() {
+        let mut out: Vec<String> = Vec::with_capacity(keys.len());
+        for key in keys.drain(..) {
+            if removed_keys.contains(&key) {
+                continue;
+            }
+            let key = if superseded_ids.contains(&key) { format!("{}/{}", pack_id, key) } else { key };
+            if !out.contains(&key) {
+                out.push(key);
+            }
+        }
+        *keys = out;
+        if keys.is_empty() {
+            removed.push(name.clone());
+        }
+    }
+    config.presets.retain(|_, keys| !keys.is_empty());
+    if config.active_preset.as_ref().is_some_and(|a| removed.contains(a)) {
+        config.active_preset = None;
+    }
+}
+
+// After a pack update, drops the keys of removed mods and leaves every preset and the active one in place
+pub fn strip_keys_from_presets(config: &mut AppConfig, removed_keys: &[String]) {
+    for keys in config.presets.values_mut() {
+        keys.retain(|k| !removed_keys.contains(k));
+    }
+}
+
+pub fn rename_key_in_presets(config: &mut AppConfig, old: &str, new: &str) {
+    for keys in config.presets.values_mut() {
+        let mut out: Vec<String> = Vec::with_capacity(keys.len());
+        for key in keys.drain(..) {
+            let key = if key == old { new.to_string() } else { key };
+            if !out.contains(&key) {
+                out.push(key);
+            }
+        }
+        *keys = out;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tidy_presets_after_import_cases() {
+        let mut c = AppConfig::default();
+        c.presets.insert("Casual Shitters v1.5".into(), vec!["3063".into(), "3151".into()]);
+        c.presets.insert("Mine".into(), vec!["3063".into(), "5543".into(), "Casual-Shitters/4296".into()]);
+        c.presets.insert("Only Removed".into(), vec!["Casual-Shitters/4296".into()]);
+        c.active_preset = Some("Only Removed".into());
+        tidy_presets_after_import(&mut c, "Casual-Shitters", &["3063".into(), "3151".into()], &["Casual-Shitters/4296".into()]);
+        assert!(!c.presets.contains_key("Casual Shitters v1.5"));
+        assert_eq!(c.presets["Mine"], ["Casual-Shitters/3063", "5543"]);
+        assert!(!c.presets.contains_key("Only Removed"));
+        assert_eq!(c.active_preset, None);
+    }
+
+    #[test]
+    fn strip_keys_keeps_an_active_own_named_preset() {
+        let mut c = AppConfig::default();
+        c.presets.insert("Casual Shitters".into(), vec!["Casual-Shitters/3063".into(), "Casual-Shitters/3311".into()]);
+        c.presets.insert("Mine".into(), vec!["5543".into(), "Casual-Shitters/3063".into()]);
+        c.active_preset = Some("Casual Shitters".into());
+        strip_keys_from_presets(&mut c, &["Casual-Shitters/3063".into()]);
+        assert_eq!(c.presets["Casual Shitters"], ["Casual-Shitters/3311"]);
+        assert_eq!(c.presets["Mine"], ["5543"]);
+        assert_eq!(c.active_preset.as_deref(), Some("Casual Shitters"));
+    }
+
+    #[test]
+    fn rename_key_in_presets_rewrites_every_preset() {
+        let mut c = AppConfig::default();
+        c.presets.insert("A".into(), vec!["1".into(), "7000".into(), "2".into()]);
+        c.presets.insert("B".into(), vec!["7000".into(), "CS/7000".into()]);
+        c.presets.insert("C".into(), vec!["5".into()]);
+        c.active_preset = Some("A".into());
+        rename_key_in_presets(&mut c, "7000", "CS/7000");
+        assert_eq!(c.presets["A"], ["1", "CS/7000", "2"]);
+        assert_eq!(c.presets["B"], ["CS/7000"]);
+        assert_eq!(c.presets["C"], ["5"]);
+        assert_eq!(c.active_preset.as_deref(), Some("A"));
+    }
+
+    #[test]
+    fn tidy_keeps_an_own_named_preset_with_other_mods() {
+        let mut c = AppConfig::default();
+        c.presets.insert("Casual Shitters v1.4".into(), vec!["3063".into(), "Casual-Shitters/4296".into()]);
+        c.presets.insert("Casual Shitters".into(), vec!["3063".into(), "5543".into()]);
+        c.active_preset = Some("Casual Shitters".into());
+        tidy_presets_after_import(&mut c, "Casual-Shitters", &["3063".into()], &[]);
+        assert!(!c.presets.contains_key("Casual Shitters v1.4"));
+        assert_eq!(c.presets["Casual Shitters"], ["Casual-Shitters/3063", "5543"]);
+        assert_eq!(c.active_preset.as_deref(), Some("Casual Shitters"));
+    }
+}

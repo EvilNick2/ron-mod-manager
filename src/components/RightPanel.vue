@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import { store } from "../store";
+import { refreshMods, isLinked } from "../packActions";
+import { showAlert, showConfirm } from "../dialogs";
 import { invoke } from "@tauri-apps/api/core";
 import { ref, computed } from "vue";
 import { ExternalLink, Download, PackageSearch, X, Plus, Puzzle, Trash2 } from 'lucide-vue-next';
@@ -14,19 +16,12 @@ async function toggleActiveMod() {
   errorMsg.value = "";
   isToggling.value = true;
   
+  const id = store.selectedMod.id;
   const newState = !store.selectedMod.enabled;
   
   try {
-    await invoke("toggle_mod", {
-      modId: store.selectedMod.id,
-      enable: newState
-    });
-    
-    store.selectedMod.enabled = newState;
-    
-    const target = store.mods.find(m => m.id === store.selectedMod.id);
-    if (target) target.enabled = newState;
-    
+    await invoke("toggle_mod", { modId: id, enable: newState });
+    await reselect(id);
   } catch (e: any) {
     errorMsg.value = "Error: " + e;
   } finally {
@@ -35,9 +30,9 @@ async function toggleActiveMod() {
 }
 
 async function downloadOnlineMod() {
-  if (!store.selectedMod) return;
+  if (!store.selectedMod || store.selectedMod.nexus_mod_id == null) return;
   
-  const url = `https://www.nexusmods.com/readyornot/mods/${store.selectedMod.id}?tab=files`;
+  const url = `https://www.nexusmods.com/readyornot/mods/${store.selectedMod.nexus_mod_id}?tab=files`;
   
   try {
     await invoke("open_browser_url", { url });
@@ -53,9 +48,7 @@ async function pickAddonFile() {
     const file: string | null = await invoke("pick_mod_archive");
     if (file) {
       await invoke("install_addon", { modId: store.selectedMod.id, archivePath: file });
-      store.mods = await invoke("scan_local_mods");
-      const updated = store.mods.find((m: any) => m.id === store.selectedMod.id);
-      if (updated) store.selectedMod = updated;
+      await refreshMods();
     }
   } catch (e: any) {
     errorMsg.value = "Failed to add addon: " + e;
@@ -66,9 +59,7 @@ async function toggleAddon(filename: string, enable: boolean) {
   if (!store.selectedMod) return;
   try {
     await invoke("toggle_addon", { modId: store.selectedMod.id, filename, enable });
-    store.mods = await invoke("scan_local_mods");
-    const updated = store.mods.find((m: any) => m.id === store.selectedMod.id);
-    if (updated) store.selectedMod = updated;
+    await refreshMods();
   } catch (e: any) {
     errorMsg.value = "Addon toggle failed: " + e;
   }
@@ -76,14 +67,80 @@ async function toggleAddon(filename: string, enable: boolean) {
 
 async function deleteAddon(filename: string) {
   if (!store.selectedMod) return;
-  if (!confirm(`Remove addon "${filename}"?`)) return;
+  if (!(await showConfirm(`Remove addon "${filename}"?`, { danger: true, confirmLabel: "Remove" }))) return;
   try {
     await invoke("remove_addon", { modId: store.selectedMod.id, filename });
-    store.mods = await invoke("scan_local_mods");
-    const updated = store.mods.find((m: any) => m.id === store.selectedMod.id);
-    if (updated) store.selectedMod = updated;
+    await refreshMods();
   } catch (e: any) {
     errorMsg.value = "Failed to remove addon: " + e;
+  }
+}
+
+const locked = computed(() => !!store.selectedMod?.pack && isLinked(store.selectedMod.pack.pack_id));
+
+const editablePacks = computed(() => store.packs.filter((p) => !p.source));
+
+const alsoIn = computed(() => {
+  const sel = store.selectedMod;
+  if (!sel || sel.is_online || sel.nexus_mod_id == null) return [];
+  return store.mods.filter((m: any) => m.nexus_mod_id === sel.nexus_mod_id && m.id !== sel.id);
+});
+
+async function reselect(newKey: string) {
+  await refreshMods();
+  store.selectedMod = store.mods.find((m: any) => m.id === newKey) ?? null;
+}
+
+async function handleMoveError(e: any): Promise<boolean> {
+  const msg = String(e);
+  const match = msg.match(/^Moved to (\S+)/);
+  if (!match) return false;
+  await reselect(match[1]);
+  await showAlert(msg);
+  return true;
+}
+
+async function addToPack(event: Event) {
+  const select = event.target as HTMLSelectElement;
+  const packId = select.value;
+  select.value = "";
+  const sel = store.selectedMod;
+  if (!sel || !packId) return;
+  errorMsg.value = "";
+  const pack = store.packs.find((p) => p.pack_id === packId);
+  const existing = store.mods.find((m: any) =>
+    m.pack?.pack_id === packId && sel.nexus_mod_id != null && m.nexus_mod_id === sel.nexus_mod_id);
+  if (existing && !(await showConfirm(`Replaces ${existing.version} in ${pack?.name ?? packId} with ${sel.version}?`))) return;
+  try {
+    const newKey: string = await invoke("move_to_pack", { key: sel.id, packId });
+    await reselect(newKey);
+  } catch (e: any) {
+    if (!(await handleMoveError(e))) errorMsg.value = "Failed to add to modpack: " + e;
+  }
+}
+
+async function removeFromPack() {
+  const sel = store.selectedMod;
+  if (!sel) return;
+  errorMsg.value = "";
+  try {
+    let newKey: string;
+    try {
+      newKey = await invoke("remove_from_pack", { key: sel.id, replaceRoot: false });
+    } catch (e: any) {
+      if (String(e) !== "root-exists") throw e;
+      if (await showConfirm("A hand installed copy already exists. Replace it with this one?", { confirmLabel: "Replace", cancelLabel: "No" })) {
+        newKey = await invoke("remove_from_pack", { key: sel.id, replaceRoot: true });
+      } else {
+        if (!(await showConfirm("Delete this pack copy instead?", { danger: true, confirmLabel: "Delete" }))) return;
+        await invoke("delete_mod", { modId: sel.id });
+        await refreshMods();
+        return;
+      }
+    }
+    await reselect(newKey);
+  } catch (e: any) {
+    if (!(await handleMoveError(e))) errorMsg.value = "Failed to remove from modpack: " + e;
   }
 }
 
@@ -107,7 +164,7 @@ const cleanDescription = computed(() => {
   <aside class="right-panel" v-if="store.selectedMod">
     <div class="panel-header">
       <h2>{{ store.selectedMod.name }}</h2>
-      <a href="#" class="external-link" title="View on Nexus Mods" @click.prevent="invoke('open_browser_url', { url: `https://www.nexusmods.com/readyornot/mods/${store.selectedMod.id}` })">
+      <a v-if="store.selectedMod.nexus_mod_id != null" href="#" class="external-link" title="View on Nexus Mods" @click.prevent="invoke('open_browser_url', { url: `https://www.nexusmods.com/readyornot/mods/${store.selectedMod.nexus_mod_id}` })">
         <ExternalLink :size="18" color="#3b82f6" />
       </a>
     </div>
@@ -134,6 +191,17 @@ const cleanDescription = computed(() => {
         <span class="detail-value">{{ store.selectedMod.version }}</span>
       </div>
       
+      <div class="detail-row" v-if="store.selectedMod.pack">
+        <span class="detail-label">Modpack</span>
+        <span class="detail-value">{{ store.selectedMod.pack.name }}<template v-if="store.selectedMod.pack.version"> {{ store.selectedMod.pack.version }}</template></span>
+      </div>
+      <div class="detail-row" v-if="alsoIn.length">
+        <span class="detail-label">Also in</span>
+        <span class="detail-value">
+          <a v-for="m in alsoIn" :key="m.id" href="#" class="also-in-link" @click.prevent="store.selectedMod = m">{{ m.pack ? m.pack.name : 'Hand installed' }}</a>
+        </span>
+      </div>
+
       <template v-if="store.selectedMod.is_online">
         <div class="detail-row">
           <span class="detail-label">Downloads</span>
@@ -183,6 +251,22 @@ const cleanDescription = computed(() => {
         </button>
       </div>
 
+      <select
+        v-if="!store.selectedMod.is_online && !store.selectedMod.pack && editablePacks.length"
+        class="pack-select"
+        @change="addToPack"
+      >
+        <option value="">Add to modpack</option>
+        <option v-for="p in editablePacks" :key="p.pack_id" :value="p.pack_id">{{ p.name }}</option>
+      </select>
+      <button
+        v-if="!store.selectedMod.is_online && store.selectedMod.pack && !locked"
+        class="pack-btn"
+        @click="removeFromPack"
+      >
+        Remove from modpack
+      </button>
+
       <div v-if="!store.selectedMod.is_online" class="addons-section">
         <div class="addons-header" @click="isAddonsExpanded = !isAddonsExpanded">
           <Puzzle :size="16" color="#f59e0b" />
@@ -195,8 +279,12 @@ const cleanDescription = computed(() => {
           <div v-if="!store.selectedMod.addons?.length" class="no-addons">
             No addons installed
           </div>
-          <div v-for="addon in store.selectedMod.addons" :key="addon.filename" class="addon-row" @contextmenu.prevent="toggleAddon(addon.filename, !addon.enabled)">
+          <div v-for="addon in store.selectedMod.addons" :key="addon.filename" class="addon-row" @contextmenu.prevent="!locked && toggleAddon(addon.filename, !addon.enabled)">
+            <span v-if="locked" class="addon-toggle addon-locked" :class="{ 'addon-enabled': addon.enabled }">
+              <span class="addon-dot"></span>
+            </span>
             <button 
+              v-else
               class="addon-toggle" 
               :class="{ 'addon-enabled': addon.enabled }"
               @click="toggleAddon(addon.filename, !addon.enabled)"
@@ -205,11 +293,11 @@ const cleanDescription = computed(() => {
               <span class="addon-dot"></span>
             </button>
             <span class="addon-name">{{ addon.filename.replace('.pak', '') }}</span>
-            <button class="addon-delete" @click="deleteAddon(addon.filename)" title="Remove addon">
+            <button v-if="!locked" class="addon-delete" @click="deleteAddon(addon.filename)" title="Remove addon">
               <Trash2 :size="14" color="#ef4444" />
             </button>
           </div>
-          <button class="add-addon-btn" @click="pickAddonFile">
+          <button v-if="!locked" class="add-addon-btn" @click="pickAddonFile">
             <Plus :size="14" color="#22c55e" /> Add Addon
           </button>
         </div>
@@ -389,6 +477,33 @@ const cleanDescription = computed(() => {
   margin-top: 0.5rem;
 }
 
+.also-in-link {
+  display: block;
+  color: var(--accent-primary);
+  text-align: right;
+  text-decoration: none;
+}
+
+.also-in-link:hover {
+  text-decoration: underline;
+}
+
+.pack-select, .pack-btn {
+  width: 100%;
+  background: var(--bg-card);
+  border: 1px solid var(--border-light);
+  color: var(--text-main);
+  padding: 0.6rem;
+  border-radius: 8px;
+  font-size: 0.9rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.pack-btn:hover {
+  background: var(--bg-hover);
+}
+
 /* Lightbox Modal Styles */
 .lightbox-overlay {
   position: fixed;
@@ -515,6 +630,10 @@ const cleanDescription = computed(() => {
   padding: 0.2rem;
   display: flex;
   align-items: center;
+}
+
+.addon-locked {
+  cursor: default;
 }
 
 .addon-dot {

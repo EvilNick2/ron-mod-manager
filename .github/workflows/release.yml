@@ -1,18 +1,13 @@
 name: Release and Update
 
 on:
-  workflow_dispatch:
   push:
-    tags:
-      - "v*"
-    branches:
-      - main
-    paths:
-      - package.json
-      - src-tauri/tauri.conf.json
+    branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: write
+  pull-requests: write
   pages: write
   id-token: write
 
@@ -21,67 +16,54 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  release-please:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    outputs:
+      released: ${{ steps.release.outputs.releases_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - name: Run release-please
+        id: release
+        uses: googleapis/release-please-action@v4
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
   determine-version:
+    needs: release-please
+    # A merged release PR builds its new tag. A manual run rebuilds the version main currently holds.
+    if: |
+      always() &&
+      (needs.release-please.outputs.released == 'true' ||
+       github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     outputs:
       should_release: ${{ steps.check.outputs.should_release }}
-      release_version: ${{ steps.check.outputs.release_version }}
+      release_tag: ${{ steps.check.outputs.release_tag }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Check for version bump
+      - name: Read release tag
         id: check
+        env:
+          RELEASED_TAG: ${{ needs.release-please.outputs.tag_name }}
         run: |
-          new_pkg_version=$(jq -r '.version' package.json)
-          new_tauri_version=$(jq -r '.version' src-tauri/tauri.conf.json)
-
-          if [[ "$new_pkg_version" != "$new_tauri_version" ]]; then
+          pkg_version=$(jq -r '.version' package.json)
+          tauri_version=$(jq -r '.version' src-tauri/tauri.conf.json)
+          if [[ "$pkg_version" != "$tauri_version" ]]; then
             echo "package.json and tauri.conf.json version fields diverged; cannot determine release version." >&2
             exit 1
           fi
-
-          if [[ "${GITHUB_EVENT_NAME}" != "push" ]]; then
-            echo "should_release=true" >> "$GITHUB_OUTPUT"
-            echo "release_version=$new_tauri_version" >> "$GITHUB_OUTPUT"
-            echo "Manual trigger detected; releasing current version $new_tauri_version."
-            exit 0
-          fi
-
-          changed_files=$(git diff --name-only HEAD^..HEAD -- package.json src-tauri/tauri.conf.json || true)
-          if [[ -z "$changed_files" ]]; then
-            echo "No version files changed; skipping release."
-            echo "should_release=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          old_pkg_version=$(git show HEAD^:package.json 2>/dev/null | jq -r '.version' 2>/dev/null || "")
-          old_tauri_version=$(git show HEAD^:src-tauri/tauri.conf.json 2>/dev/null | jq -r '.version' 2>/dev/null || "")
-
-          pkg_bumped=$([[ "$new_pkg_version" != "$old_pkg_version" ]] && echo true || echo false)
-          tauri_bumped=$([[ "$new_tauri_version" != "$old_tauri_version" ]] && echo true || echo false)
-
-          if [[ "$pkg_bumped" != true && "$tauri_bumped" != true ]]; then
-            echo "Version fields unchanged; skipping release."
-            echo "should_release=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          if [[ "$pkg_bumped" == true && "$tauri_bumped" == true && "$new_pkg_version" != "$new_tauri_version" ]]; then
-            echo "package.json and tauri.conf.json version fields diverged; cannot determine release version." >&2
-            exit 1
-          fi
-
-          release_version=$([[ "$tauri_bumped" == true ]] && echo "$new_tauri_version" || echo "$new_pkg_version")
+          tag="${RELEASED_TAG:-v$tauri_version}"
           echo "should_release=true" >> "$GITHUB_OUTPUT"
-          echo "release_version=$release_version" >> "$GITHUB_OUTPUT"
-          echo "Detected version bump to $release_version."
+          echo "release_tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Releasing $tag."
 
   build-and-release:
     needs: determine-version
-    if: needs.determine-version.outputs.should_release == 'true'
+    if: always() && needs.determine-version.outputs.should_release == 'true'
     outputs:
       release_tag: ${{ steps.release_tag.outputs.value }}
     strategy:
@@ -115,33 +97,10 @@ jobs:
           cache-on-failure: true
           workspaces: ./src-tauri
 
-      - name: Create version tag
-        if: github.event_name == 'push' && matrix.platform == 'ubuntu-latest'
-        env:
-          RELEASE_VERSION: ${{ needs.determine-version.outputs.release_version }}
-        run: |
-          if git rev-parse -q --verify "refs/tags/v${RELEASE_VERSION}" >/dev/null; then
-            echo "Tag v${RELEASE_VERSION} already exists; skipping creation."
-            exit 0
-          fi
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag "v${RELEASE_VERSION}"
-          git push origin "v${RELEASE_VERSION}"
-
       - name: Set release tag
         id: release_tag
         shell: bash
-        run: |
-          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
-            echo "value=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
-          elif [[ -n "${{ needs.determine-version.outputs.release_version }}" ]]; then
-            echo "value=v${{ needs.determine-version.outputs.release_version }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "Unable to determine release tag." >&2
-            exit 1
-          fi
+        run: echo "value=${{ needs.determine-version.outputs.release_tag }}" >> "$GITHUB_OUTPUT"
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
@@ -157,17 +116,13 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
         with:
           tagName: ${{ steps.release_tag.outputs.value }}
+          # release-please already created the release with its changelog, the build adds the assets
           releaseName: "RoN Mod Manager v__VERSION__"
-          releaseBody: |-
-            Added option to launch game from mod manager
-            RAR files now successfully extract without getting corrupted
-            RAR files can now be dropped into the window to prompt import
-            Added styling to scrollbar
-            Mods will now check for updates on app launch and mod refresh
-            Added app taskbar icon
-            Searching the online tab now explicitly queries mods containing that string
           includeUpdaterJson: true
           releaseDraft: false
           prerelease: false
@@ -175,9 +130,10 @@ jobs:
   publish-aur:
     name: Publish to AUR
     needs: build-and-release
+    if: always() && needs.build-and-release.result == 'success'
     runs-on: ubuntu-latest
     env:
-      RELEASE_TAG: ${{ needs.build-and-release.outputs.release_tag || 'v1.2.62' }}
+      RELEASE_TAG: ${{ needs.build-and-release.outputs.release_tag }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -237,6 +193,7 @@ jobs:
     needs:
       - build-and-release
       - determine-version
+    if: always() && needs.build-and-release.result == 'success'
     runs-on: ubuntu-latest
     environment:
       name: github-pages
@@ -247,7 +204,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p updater
-          tag="${{ needs.build-and-release.outputs.release_tag || github.ref_name }}"
+          tag="${{ needs.build-and-release.outputs.release_tag }}"
           echo "Downloading latest.json from release tag: $tag"
           gh release download "$tag" \
             -R "${{ github.repository }}" \
@@ -267,7 +224,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          tag="${{ needs.build-and-release.outputs.release_tag || github.ref_name }}"
+          tag="${{ needs.build-and-release.outputs.release_tag }}"
           echo "Cleaning assets for release tag: $tag"
 
           release_json=$(gh api "repos/${{ github.repository }}/releases/tags/$tag")
