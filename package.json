@@ -13,7 +13,9 @@
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-clipboard-manager": "^2.5.0",
     "@tauri-apps/plugin-opener": "^2",
+    "dompurify": "^3.4.16",
     "lucide-vue-next": "^1.0.0",
+    "marked": "^18.0.14",
     "vue": "^3.5.13"
   },
   "devDependencies": {

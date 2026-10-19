@@ -2,6 +2,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { X, Download, ExternalLink, RefreshCw } from "lucide-vue-next";
 import { computed, onMounted, ref } from "vue";
+import { marked } from "marked";
+import DOMPurify from "dompurify";
 import { store } from "../store";
 
 type ReleaseEntry = {
@@ -58,6 +60,22 @@ const newerReleaseHistory = computed(() => {
 });
 
 
+// The version heading repeats the card header and commit links mean nothing to players
+function renderNotes(body: string): string {
+  const cleaned = body
+    .replace(/^#{1,3} \[?\d+\.\d+\.\d+.*$/m, "")
+    .replace(/ \(\[[0-9a-f]{7,40}\]\([^)]*\)\)/g, "");
+  return DOMPurify.sanitize(marked.parse(cleaned, { async: false, gfm: true, breaks: true }));
+}
+
+// Links in the notes open in the system browser, not inside the app window
+function onNotesClick(event: MouseEvent) {
+  const link = (event.target as HTMLElement).closest("a");
+  if (!link) return;
+  event.preventDefault();
+  void openExternalUrl(link.href);
+}
+
 async function loadReleaseHistory() {
   historyLoading.value = true;
   historyError.value = "";
@@ -72,7 +90,7 @@ async function loadReleaseHistory() {
     releaseHistory.value = (Array.isArray(payload) ? payload : []).map((entry: any) => ({
       version: (entry.tag_name || entry.name || "unknown").replace(/^v/, ""),
       publishedAt: entry.published_at || "",
-      notes: entry.body || "No release notes were provided.",
+      notes: renderNotes(entry.body || "No release notes were provided."),
       url: entry.html_url || ""
     }));
   } catch (e) {
@@ -153,7 +171,7 @@ function closeModal() {
               </span>
             </div>
 
-            <p class="release-history-item__notes">{{ release.notes }}</p>
+            <div class="release-history-item__notes" v-html="release.notes" @click="onNotesClick"></div>
 
             <button class="release-link" @click="openExternalUrl(release.url)" :disabled="!release.url">
               <ExternalLink :size="14" />
@@ -319,9 +337,41 @@ function closeModal() {
 }
 
 .release-history-item__notes {
-  margin: 0;
-  white-space: pre-line;
   font-size: 13px;
+  line-height: 1.5;
+}
+
+.release-history-item__notes :deep(h2),
+.release-history-item__notes :deep(h3) {
+  margin: 0.75rem 0 0.25rem;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text-main);
+}
+
+.release-history-item__notes :deep(h2:first-child),
+.release-history-item__notes :deep(h3:first-child) {
+  margin-top: 0;
+}
+
+.release-history-item__notes :deep(ul) {
+  margin: 0;
+  padding-left: 1.25rem;
+}
+
+.release-history-item__notes :deep(p) {
+  margin: 0 0 0.5rem;
+}
+
+.release-history-item__notes :deep(a) {
+  color: var(--accent-primary);
+}
+
+.release-history-item__notes :deep(code) {
+  font-size: 12px;
+  background: var(--bg-card);
+  padding: 0 4px;
+  border-radius: 4px;
 }
 
 .status-pill {
