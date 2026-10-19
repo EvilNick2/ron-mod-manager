@@ -1,7 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use serde::{Serialize, Deserialize};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
+use crate::drive::Progress;
 use serde_json::Value;
 use crate::packs::{ensure_editable, ensure_pack_editable, mark_dirty, mark_pack_dirty, link_prefix, read_manifest, write_manifest, PackManifest, resolve_for_delete, resolve_key, parse_key, KeyKind, PackRef};
 use crate::subscribe::{OpGuard, OpKind};
@@ -1185,7 +1186,15 @@ pub async fn import_preset(app_handle: tauri::AppHandle, archive_path: String) -
     let mods_dir = get_mods_dir(&app_handle)?;
     // without a game path nothing can be linked, so a Paks folder that does not exist is enough
     let paks_dir = get_paks_dir(&app_handle).unwrap_or_else(|_| mods_dir.join(".no-game-path"));
-    let summary = import_from_archive(Path::new(&archive_path), &mods_dir, &paks_dir)?;
+    let handle = app_handle.clone();
+    let summary = tauri::async_runtime::spawn_blocking(move || {
+        let mut emit = |p: Progress| {
+            let _ = handle.emit("pack-progress", p);
+        };
+        import_from_archive(Path::new(&archive_path), &mods_dir, &paks_dir, &mut emit)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
 
     let mut config = crate::config::load_config(app_handle.clone())?;
     crate::config::tidy_presets_after_import(&mut config, &summary.pack.pack_id, &summary.superseded_ids, &summary.removed_keys);
@@ -1413,28 +1422,83 @@ pub(crate) fn clear_enabled_flag(mod_dir: &Path) -> Result<(), String> {
     fs::write(&path, json).map_err(|e| format!("Failed to write {}: {}", path.display(), e))
 }
 
-fn stage_pack(zip: &mut zip::ZipArchive<fs::File>, archive: &PackArchive, staged: &Path) -> Result<(), String> {
-    fs::create_dir_all(staged).map_err(|e| format!("Failed to create staging folder: {}", e))?;
+// The archive entries stage_pack extracts, as (index, path inside the archive)
+fn pack_entries(zip: &mut zip::ZipArchive<fs::File>) -> Result<Vec<(usize, PathBuf)>, String> {
+    let mut entries = Vec::new();
     for i in 0..zip.len() {
-        let mut file = zip.by_index(i).map_err(|e| format!("Invalid zip archive: {}", e))?;
+        let file = zip.by_index(i).map_err(|e| format!("Invalid zip archive: {}", e))?;
         if file.name() == "preset.json" {
             continue;
         }
         let rel = file.enclosed_name().ok_or_else(|| format!("Invalid preset archive: unsafe path {:?}", file.name()))?;
-        if archive_folder(&rel, file.is_dir())?.is_none() {
-            continue;
+        if archive_folder(&rel, file.is_dir())?.is_some() {
+            entries.push((i, rel));
         }
+    }
+    Ok(entries)
+}
+
+fn stage_pack(zip: &mut zip::ZipArchive<fs::File>, archive: &PackArchive, staged: &Path, emit: &mut dyn FnMut(Progress)) -> Result<(), String> {
+    fs::create_dir_all(staged).map_err(|e| format!("Failed to create staging folder: {}", e))?;
+    let entries = pack_entries(zip)?;
+    let mut files = Vec::new();
+    let mut overall_total = 0u64;
+    for (i, rel) in entries {
+        let file = zip.by_index(i).map_err(|e| format!("Invalid zip archive: {}", e))?;
         let out = staged.join(&rel);
         if file.is_dir() {
             fs::create_dir_all(&out).map_err(|e| format!("Failed to create {}: {}", out.display(), e))?;
         } else {
-            if let Some(parent) = out.parent() {
-                fs::create_dir_all(parent).map_err(|e| format!("Failed to create {}: {}", parent.display(), e))?;
-            }
-            let mut outfile = fs::File::create(&out).map_err(|e| format!("Failed to create {}: {}", out.display(), e))?;
-            std::io::copy(&mut file, &mut outfile).map_err(|e| format!("Failed to extract {}: {}", out.display(), e))?;
+            overall_total += file.size();
+            files.push((i, out));
         }
     }
+
+    let total = files.len();
+    let mut overall_done = 0u64;
+    let mut buf = vec![0u8; 1024 * 1024];
+    for (done, (i, out)) in files.iter().enumerate() {
+        let mut file = zip.by_index(*i).map_err(|e| format!("Invalid zip archive: {}", e))?;
+        let size = file.size();
+        let progress = |bytes_done: u64, overall_done: u64| Progress {
+            pack_id: archive.pack.pack_id.clone(),
+            stage: "extracting".to_string(),
+            done,
+            total,
+            file: out.file_name().map(|n| n.to_string_lossy().to_string()),
+            bytes_done,
+            bytes_total: size,
+            overall_done: 0,
+            overall_total: 0,
+        }.overall(overall_done, overall_total);
+        emit(progress(0, overall_done));
+        if let Some(parent) = out.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("Failed to create {}: {}", parent.display(), e))?;
+        }
+        let mut outfile = fs::File::create(out).map_err(|e| format!("Failed to create {}: {}", out.display(), e))?;
+        let mut bytes_done = 0u64;
+        loop {
+            let n = std::io::Read::read(&mut file, &mut buf).map_err(|e| format!("Failed to extract {}: {}", out.display(), e))?;
+            if n == 0 {
+                break;
+            }
+            std::io::Write::write_all(&mut outfile, &buf[..n]).map_err(|e| format!("Failed to extract {}: {}", out.display(), e))?;
+            bytes_done += n as u64;
+            overall_done += n as u64;
+            emit(progress(bytes_done, overall_done));
+        }
+    }
+    emit(Progress {
+        pack_id: archive.pack.pack_id.clone(),
+        stage: "installing".to_string(),
+        done: total,
+        total,
+        file: None,
+        bytes_done: 0,
+        bytes_total: 0,
+        overall_done: 0,
+        overall_total: 0,
+    });
 
     let mut mod_ids = Vec::new();
     for (id, _) in &archive.folders {
@@ -1534,7 +1598,7 @@ pub(crate) fn swap_pack(mods_dir: &Path, paks_dir: &Path, staging: &Path, staged
     Ok(())
 }
 
-fn import_from_archive(archive: &Path, mods_dir: &Path, paks_dir: &Path) -> Result<ImportSummary, String> {
+fn import_from_archive(archive: &Path, mods_dir: &Path, paks_dir: &Path, emit: &mut dyn FnMut(Progress)) -> Result<ImportSummary, String> {
     let mut zip = open_zip(archive)?;
     let archive = read_pack_archive(&mut zip)?;
     let plan = plan_import(&archive, mods_dir)?;
@@ -1543,7 +1607,7 @@ fn import_from_archive(archive: &Path, mods_dir: &Path, paks_dir: &Path) -> Resu
 
     let staging = mods_dir.join(format!(".import-{}", uuid::Uuid::new_v4()));
     let staged = staging.join(&pack_id);
-    if let Err(e) = stage_pack(&mut zip, &archive, &staged) {
+    if let Err(e) = stage_pack(&mut zip, &archive, &staged, emit) {
         return Err(abandon_staging(&staging, e));
     }
 
@@ -2099,7 +2163,7 @@ mod tests {
     fn upgrade_setup(m: &Path, p: &Path, z: &Path) {
         use crate::packs::{write_manifest, PackManifest};
         cs_v15_zip(&z.join("v15.zip"));
-        import_from_archive(&z.join("v15.zip"), m, p).unwrap();
+        import_from_archive(&z.join("v15.zip"), m, p, &mut |_| {}).unwrap();
         enable_key(m, p, "CS/3063").unwrap();
         enable_key(m, p, "CS/4296").unwrap();
         put(m, "Other/3063/other.pak", b"o");
@@ -2116,7 +2180,7 @@ mod tests {
         use crate::subscribe::{OpGuard, OpKind};
         let (m, p, z) = (scratch("busy-mods"), scratch("busy-paks"), scratch("busy-zips"));
         cs_v15_zip(&z.join("v15.zip"));
-        import_from_archive(&z.join("v15.zip"), &m, &p).unwrap();
+        import_from_archive(&z.join("v15.zip"), &m, &p, &mut |_| {}).unwrap();
         cs_v16_zip(&z.join("v16.zip"));
         let before = tree(&m);
         {
@@ -2124,12 +2188,12 @@ mod tests {
             let busy = "CS is busy, try again when it finishes";
             assert_eq!(delete_pack_dir(&m, Some(&p), "CS").unwrap_err(), busy);
             assert_eq!(fork_pack_dir(&m, "CS", "Mine").unwrap_err(), busy);
-            let err = import_from_archive(&z.join("v16.zip"), &m, &p).unwrap_err();
+            let err = import_from_archive(&z.join("v16.zip"), &m, &p, &mut |_| {}).unwrap_err();
             assert_eq!(err, busy);
             assert_eq!(tree(&m), before);
             assert!(no_staging_left(&m));
         }
-        import_from_archive(&z.join("v16.zip"), &m, &p).unwrap();
+        import_from_archive(&z.join("v16.zip"), &m, &p, &mut |_| {}).unwrap();
         fork_pack_dir(&m, "CS", "Mine").unwrap();
         delete_pack_dir(&m, Some(&p), "CS").unwrap();
     }
@@ -2165,7 +2229,7 @@ mod tests {
             ("3151/metadata.json", br#"{"version": "1", "enabled": true}"#),
             ("3151/a.pak", b"packed"),
         ]);
-        let s = import_from_archive(&zip, &m, &p).unwrap();
+        let s = import_from_archive(&zip, &m, &p, &mut |_| {}).unwrap();
         assert!(m.join("CS/3063").is_dir());
         assert!(m.join("CS/3151").is_dir());
         assert!(!m.join("3063").exists());
@@ -2189,7 +2253,7 @@ mod tests {
         let mut man = read_manifest(&m.join("CS")).unwrap();
         man.published = Some(Published { folder_id: "F".into(), dirty: false });
         write_manifest(&m.join("CS"), &man).unwrap();
-        import_from_archive(&z.join("v16.zip"), &m, &p).unwrap();
+        import_from_archive(&z.join("v16.zip"), &m, &p, &mut |_| {}).unwrap();
         let after = read_manifest(&m.join("CS")).unwrap();
         assert_eq!(after.published, Some(Published { folder_id: "F".into(), dirty: true }));
     }
@@ -2203,7 +2267,7 @@ mod tests {
         man.source = Some(PackSource { kind: "drive".into(), folder_id: "F".into(), resource_key: None });
         man.installed_hashes.insert("3063".into(), InstalledMod::default());
         write_manifest(&m.join("CS"), &man).unwrap();
-        import_from_archive(&z.join("v16.zip"), &m, &p).unwrap();
+        import_from_archive(&z.join("v16.zip"), &m, &p, &mut |_| {}).unwrap();
         let after = read_manifest(&m.join("CS")).unwrap();
         assert!(after.source.is_none());
         assert!(after.installed_hashes.is_empty());
@@ -2219,7 +2283,7 @@ mod tests {
         man.published = Some(Published { folder_id: "F".into(), dirty: false });
         man.local_hashes.insert("3063/a.pak".into(), CachedHash { size: 1, mtime_ns: 1, sha256: "x".into() });
         write_manifest(&m.join("CS"), &man).unwrap();
-        import_from_archive(&z.join("v16.zip"), &m, &p).unwrap();
+        import_from_archive(&z.join("v16.zip"), &m, &p, &mut |_| {}).unwrap();
         assert!(read_manifest(&m.join("CS")).unwrap().local_hashes.is_empty());
     }
 
@@ -2227,7 +2291,7 @@ mod tests {
     fn upgrade_replaces_only_this_pack() {
         let (m, p, z) = (scratch("mods"), scratch("paks"), scratch("zips"));
         upgrade_setup(&m, &p, &z);
-        let s = import_from_archive(&z.join("v16.zip"), &m, &p).unwrap();
+        let s = import_from_archive(&z.join("v16.zip"), &m, &p, &mut |_| {}).unwrap();
         assert!(!m.join("CS/4296").exists());
         let paks: Vec<_> = names(&m.join("CS/3063")).into_iter().filter(|n| n.ends_with(".pak")).collect();
         assert_eq!(paks, ["new.pak"]);
@@ -2252,7 +2316,7 @@ mod tests {
         let cut = z.join("cut.zip");
         fs::write(&cut, &bytes[..bytes.len() / 2]).unwrap();
         let before = (tree(&m), tree(&p));
-        assert!(import_from_archive(&cut, &m, &p).is_err());
+        assert!(import_from_archive(&cut, &m, &p, &mut |_| {}).is_err());
         assert_eq!((tree(&m), tree(&p)), before);
         assert!(no_staging_left(&m));
     }
@@ -2263,9 +2327,9 @@ mod tests {
         upgrade_setup(&m, &p, &z);
         put(&m, "7000/c.pak", b"loose");
         let zip = z.join("v16.zip");
-        import_from_archive(&zip, &m, &p).unwrap();
+        import_from_archive(&zip, &m, &p, &mut |_| {}).unwrap();
         let count = names(&m).len();
-        let again = import_from_archive(&zip, &m, &p).unwrap();
+        let again = import_from_archive(&zip, &m, &p, &mut |_| {}).unwrap();
         assert!(again.removed_keys.is_empty() && again.superseded_ids.is_empty());
         assert_eq!((again.added, again.changed), (0, 0));
         let v = inspect_archive(&zip, &m).unwrap();
@@ -2283,7 +2347,7 @@ mod tests {
         upgrade_setup(&m, &p, &z);
         put(&m, "CS/4296/sub/locked.pak", b"x");
         fs::set_permissions(m.join("CS/4296/sub"), fs::Permissions::from_mode(0o500)).unwrap();
-        let s = import_from_archive(&z.join("v16.zip"), &m, &p);
+        let s = import_from_archive(&z.join("v16.zip"), &m, &p, &mut |_| {});
         let staging: Vec<_> = names(&m).into_iter().filter(|n| n.starts_with(".import-")).collect();
         for n in &staging {
             let sub = m.join(n).join("old-CS/4296/sub");
@@ -2309,7 +2373,7 @@ mod tests {
         make_pack_zip(&zip, serde_json::json!({"name": "N", "mod_ids": ["1", "2", "3"]}), &[
             ("2/a.pak", b"a"), ("3/a.pak", b"a"), ("4/a.pak", b"a"),
         ]);
-        import_from_archive(&zip, &m, &p).unwrap();
+        import_from_archive(&zip, &m, &p, &mut |_| {}).unwrap();
         assert_eq!(read_json(&m.join("N/pack.json"))["mod_ids"], serde_json::json!(["2", "3", "4"]));
     }
 
@@ -2318,7 +2382,7 @@ mod tests {
         let (m, p, z) = (scratch("mods"), scratch("paks"), scratch("zips"));
         put(&m, "notes/readme.txt", b"keep");
         cs_v15_zip(&z.join("v15.zip"));
-        import_from_archive(&z.join("v15.zip"), &m, &p).unwrap();
+        import_from_archive(&z.join("v15.zip"), &m, &p, &mut |_| {}).unwrap();
         assert_eq!(fs::read(m.join("notes/readme.txt")).unwrap(), b"keep");
         assert_eq!(names(&m), ["CS", "notes"]);
     }
@@ -2345,14 +2409,14 @@ mod tests {
         let (m, p, z) = (scratch("mods"), scratch("paks"), scratch("zips"));
         let bad = z.join("bad.zip");
         make_pack_zip(&bad, serde_json::json!({"name": "CS"}), &[("3063/a.pak", b"a"), ("Stuff/a.pak", b"a")]);
-        let err = import_from_archive(&bad, &m, &p).unwrap_err();
+        let err = import_from_archive(&bad, &m, &p, &mut |_| {}).unwrap_err();
         assert!(err.contains("Stuff"), "{err}");
         make_pack_zip(&bad, serde_json::json!({"name": "CS"}), &[("3063/a.pak", b"a"), ("3063/../Stuff/a.pak", b"a")]);
-        assert!(import_from_archive(&bad, &m, &p).is_err());
+        assert!(import_from_archive(&bad, &m, &p, &mut |_| {}).is_err());
         assert!(inspect_archive(&bad, &m).is_err());
         put(&m, "CS/readme.txt", b"mine");
         cs_v15_zip(&z.join("v15.zip"));
-        assert!(import_from_archive(&z.join("v15.zip"), &m, &p).is_err());
+        assert!(import_from_archive(&z.join("v15.zip"), &m, &p, &mut |_| {}).is_err());
         assert_eq!(fs::read(m.join("CS/readme.txt")).unwrap(), b"mine");
         assert_eq!(names(&m), ["CS"]);
     }
@@ -2366,7 +2430,7 @@ mod tests {
         let before = (tree(&m), tree(&p));
         // moving a folder to a new parent needs write access to it, to update its ".." entry
         fs::set_permissions(m.join("CS"), fs::Permissions::from_mode(0o500)).unwrap();
-        let r = import_from_archive(&z.join("v16.zip"), &m, &p);
+        let r = import_from_archive(&z.join("v16.zip"), &m, &p, &mut |_| {});
         fs::set_permissions(m.join("CS"), fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(r.unwrap_err(), "Close Ready or Not and try again");
         assert_eq!((tree(&m), tree(&p)), before);
@@ -2435,7 +2499,7 @@ mod tests {
         let m2 = scratch("round-mods2");
         let p2 = scratch("round-paks2");
         fs::create_dir_all(&m2).unwrap();
-        import_from_archive(&out, &m2, &p2).unwrap();
+        import_from_archive(&out, &m2, &p2, &mut |_| {}).unwrap();
         let man = read_manifest(&m2.join("CS")).unwrap();
         assert_eq!(man.pack_id, "CS");
         assert_eq!(man.version, Some("1.6".to_string()));
@@ -2647,7 +2711,7 @@ mod tests {
         upgrade_setup(&m, &p, &z);
         let before = (tree(&m), tree(&p));
         fs::set_permissions(&p, fs::Permissions::from_mode(0o555)).unwrap();
-        let r = import_from_archive(&z.join("v16.zip"), &m, &p);
+        let r = import_from_archive(&z.join("v16.zip"), &m, &p, &mut |_| {});
         fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(r.unwrap_err(), "Close Ready or Not and try again");
         assert_eq!((tree(&m), tree(&p)), before);
@@ -2662,7 +2726,7 @@ mod tests {
         // a folder with the key's prefix makes remove_file fail partway through the unlinks
         fs::create_dir_all(p.join("CS.4296_zz/inner")).unwrap();
         let before = (tree(&m), tree(&p));
-        let err = import_from_archive(&z.join("v16.zip"), &m, &p).unwrap_err();
+        let err = import_from_archive(&z.join("v16.zip"), &m, &p, &mut |_| {}).unwrap_err();
         assert!(err.starts_with("Failed to remove injected mod"), "{err}");
         assert!(!err.contains("could not re-enable"), "{err}");
         assert_eq!((tree(&m), tree(&p)), before);
@@ -2721,9 +2785,26 @@ mod tests {
             ("3063/metadata.json", br#"{"enabled": true, "update_available": true}"#),
             ("3063/a.pak", b"a"),
         ]);
-        import_from_archive(&zip, &m, &p).unwrap();
+        import_from_archive(&zip, &m, &p, &mut |_| {}).unwrap();
         let meta = read_json(&m.join("U/3063/metadata.json"));
         assert_eq!((meta["enabled"].clone(), meta["update_available"].clone()), (Value::Bool(false), Value::Bool(false)));
+    }
+
+    #[test]
+    fn import_reports_extract_progress() {
+        let (m, p, z) = (scratch("mods"), scratch("paks"), scratch("zips"));
+        let zip = z.join("prog.zip");
+        make_pack_zip(&zip, serde_json::json!({"name": "P"}), &[
+            ("3063/a.pak", b"aaa"),
+            ("4296/b.pak", b"bbbbb"),
+        ]);
+        let mut events = Vec::new();
+        import_from_archive(&zip, &m, &p, &mut |e| events.push(e)).unwrap();
+        let extracting: Vec<_> = events.iter().filter(|e| e.stage == "extracting").collect();
+        assert!(extracting.iter().all(|e| e.total == 2 && e.overall_total == 8));
+        let last = extracting.last().unwrap();
+        assert_eq!((last.done, last.overall_done), (1, 8));
+        assert_eq!(events.last().unwrap().stage, "installing");
     }
 
     #[test]
