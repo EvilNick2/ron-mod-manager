@@ -119,6 +119,36 @@ export function endOp(packId: string): void {
   delete store.packProgress[packId];
   delete store.opNames[packId];
   delete store.progressHidden[packId];
+  delete store.cancelling[packId];
+}
+
+// The error a download op rejects with when the player cancels it, matching drive::CANCELLED
+export const CANCELLED = "Cancelled";
+
+export function opName(packId: string): string {
+  return store.packs.find((p) => p.pack_id === packId)?.name ?? store.opNames[packId] ?? packId;
+}
+
+// Only downloads can be cancelled, and only while they are still downloading
+export function canCancel(packId: string): boolean {
+  return !!store.inFlight[packId] && store.packProgress[packId]?.stage === "downloading";
+}
+
+export async function cancelPackOp(packId: string): Promise<void> {
+  if (store.cancelling[packId] || !canCancel(packId)) return;
+  const confirmed = await showConfirm(`Cancel downloading ${opName(packId)}? Nothing will be changed.`, {
+    confirmLabel: "Cancel download",
+    cancelLabel: "Keep downloading",
+    danger: true,
+  });
+  if (!confirmed || store.cancelling[packId] || !canCancel(packId)) return;
+  store.cancelling[packId] = true;
+  try {
+    await invoke("cancel_pack_op", { packId });
+  } catch (e) {
+    console.error("Failed to cancel:", e);
+    delete store.cancelling[packId];
+  }
 }
 
 // Rounds ties to even like Rust's {:.N}. A tie is exact only when x * 2^(digits+1) is an odd integer.
@@ -352,7 +382,7 @@ export async function addPackFromLink(): Promise<void> {
     if (imported.label) {
       console.error("Add from link follow-up failed:", e);
       await showAlert(`${imported.label} was imported, but the next step failed: ${e}`);
-    } else {
+    } else if (e !== CANCELLED) {
       console.error("Failed to add the modpack:", e);
       await showAlert("Failed to add the modpack: " + e);
     }
@@ -367,8 +397,10 @@ async function runPackUpdate(pack: PackManifest, run: () => Promise<UpdateSummar
   try {
     summary = await run();
   } catch (e) {
-    console.error(failure, e);
-    failed = { error: e };
+    if (e !== CANCELLED) {
+      console.error(failure, e);
+      failed = { error: e };
+    }
   }
   endOp(pack.pack_id);
   if (failed !== null) await showAlert(failure + failed.error);

@@ -1480,8 +1480,15 @@ mod tests {
         fn read(&self, file_id: &str) -> Result<Vec<u8>, String> {
             self.inner.read(file_id)
         }
-        fn download(&self, file_id: &str, dest: &Path, expected_size: u64, on_bytes: &mut dyn FnMut(u64)) -> Result<String, String> {
-            self.inner.download(file_id, dest, expected_size, on_bytes)
+        fn download(
+            &self,
+            file_id: &str,
+            dest: &Path,
+            expected_size: u64,
+            cancel: &dyn Fn() -> bool,
+            on_bytes: &mut dyn FnMut(u64),
+        ) -> Result<String, String> {
+            self.inner.download(file_id, dest, expected_size, cancel, on_bytes)
         }
         fn find_folder(&self, parent: Option<&str>, name: &str) -> Result<Option<String>, String> {
             if self.find_fails {

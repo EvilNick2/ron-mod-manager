@@ -13,6 +13,7 @@ use crate::hashing;
 
 pub const FOLDER_MIME: &str = "application/vnd.google-apps.folder";
 pub const SIZE_MISMATCH: &str = "The download did not match its expected size";
+pub const CANCELLED: &str = "Cancelled";
 
 const FILES_URL: &str = "https://www.googleapis.com/drive/v3/files";
 const UPLOAD_URL: &str = "https://www.googleapis.com/upload/drive/v3/files";
@@ -86,7 +87,15 @@ pub trait DriveApi {
     fn list(&self, folder_id: &str) -> Result<Vec<RemoteFile>, String>;
     fn read(&self, file_id: &str) -> Result<Vec<u8>, String>;
     /// Fails with SIZE_MISMATCH, leaving no file, when the content is not exactly expected_size bytes
-    fn download(&self, file_id: &str, dest: &Path, expected_size: u64, on_bytes: &mut dyn FnMut(u64)) -> Result<String, String>;
+    /// Stops with CANCELLED and removes the partial file once `cancel` returns true
+    fn download(
+        &self,
+        file_id: &str,
+        dest: &Path,
+        expected_size: u64,
+        cancel: &dyn Fn() -> bool,
+        on_bytes: &mut dyn FnMut(u64),
+    ) -> Result<String, String>;
     fn find_folder(&self, parent: Option<&str>, name: &str) -> Result<Option<String>, String>;
     fn create_folder(&self, parent: Option<&str>, name: &str) -> Result<String, String>;
     fn share_anyone(&self, file_id: &str) -> Result<(), String>;
@@ -189,10 +198,14 @@ impl HttpDrive {
     /// Sends the request built by `build`, retrying rate limits and server errors.
     /// Statuses in `accept` are returned as-is along with every 2xx.
     fn send(&self, accept: &[u16], build: impl Fn() -> RequestBuilder) -> Result<Response, String> {
+        self.send_until(accept, &|| false, build)
+    }
+
+    fn send_until(&self, accept: &[u16], cancel: &dyn Fn() -> bool, build: impl Fn() -> RequestBuilder) -> Result<Response, String> {
         let mut last = String::new();
         for attempt in 0..MAX_ATTEMPTS {
-            if attempt > 0 {
-                std::thread::sleep(Duration::from_secs(1 << (attempt - 1)));
+            if cancel() || (attempt > 0 && !nap(Duration::from_secs(1 << (attempt - 1)), cancel)) {
+                return Err(CANCELLED.to_string());
             }
             let resp = match self.prepare(build())?.send() {
                 Ok(r) => r,
@@ -331,6 +344,20 @@ impl HttpDrive {
     }
 }
 
+// Sleeps in short steps so a cancel is seen quickly. False when cancelled.
+fn nap(total: Duration, cancel: &dyn Fn() -> bool) -> bool {
+    let step = Duration::from_millis(100);
+    let mut slept = Duration::ZERO;
+    while slept < total {
+        if cancel() {
+            return false;
+        }
+        std::thread::sleep(step.min(total - slept));
+        slept += step;
+    }
+    !cancel()
+}
+
 fn next_offset(resp: &Response) -> u64 {
     resp.headers()
         .get(reqwest::header::RANGE)
@@ -380,9 +407,16 @@ impl DriveApi for HttpDrive {
         resp.bytes().map(|b| b.to_vec()).map_err(|e| format!("Could not read from Google Drive: {}", e))
     }
 
-    fn download(&self, file_id: &str, dest: &Path, expected_size: u64, on_bytes: &mut dyn FnMut(u64)) -> Result<String, String> {
+    fn download(
+        &self,
+        file_id: &str,
+        dest: &Path,
+        expected_size: u64,
+        cancel: &dyn Fn() -> bool,
+        on_bytes: &mut dyn FnMut(u64),
+    ) -> Result<String, String> {
         let url = format!("{}/{}", FILES_URL, file_id);
-        let mut resp = self.send(&[], || self.client.get(&url).query(&[("alt", "media")]))?;
+        let mut resp = self.send_until(&[], cancel, || self.client.get(&url).query(&[("alt", "media")]))?;
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent).map_err(|e| format!("Could not create {}: {}", parent.display(), e))?;
         }
@@ -393,6 +427,9 @@ impl DriveApi for HttpDrive {
             let mut failures = 0usize;
             let mut buf = vec![0u8; 256 * 1024];
             loop {
+                if cancel() {
+                    return Err(CANCELLED.to_string());
+                }
                 match resp.read(&mut buf) {
                     Ok(0) if written != expected_size => return Err(SIZE_MISMATCH.to_string()),
                     Ok(0) => return Ok(hashing::hex(&hasher.finalize())),
@@ -408,8 +445,10 @@ impl DriveApi for HttpDrive {
                         if failures >= MAX_ATTEMPTS {
                             return Err(format!("Download from Google Drive failed: {}", e));
                         }
-                        std::thread::sleep(Duration::from_secs(1 << (failures - 1).min(3)));
-                        resp = self.send(&[], || {
+                        if !nap(Duration::from_secs(1 << (failures - 1).min(3)), cancel) {
+                            return Err(CANCELLED.to_string());
+                        }
+                        resp = self.send_until(&[], cancel, || {
                             let rb = self.client.get(&url).query(&[("alt", "media")]);
                             if written > 0 {
                                 rb.header("Range", format!("bytes={}-", written))
@@ -524,6 +563,7 @@ pub mod fake {
         downloads: Cell<usize>,
         lists: Cell<usize>,
         finds: Cell<usize>,
+        cancel_hook: RefCell<Option<(usize, Box<dyn Fn()>)>>,
     }
 
     impl FakeDrive {
@@ -537,6 +577,7 @@ pub mod fake {
                 downloads: Cell::new(0),
                 lists: Cell::new(0),
                 finds: Cell::new(0),
+                cancel_hook: RefCell::new(None),
             }
         }
 
@@ -548,6 +589,12 @@ pub mod fake {
         /// Fails the (n+1)th upload from now once, then disarms
         pub fn fail_uploads_after(&self, n: usize) {
             self.fail_after.set(Some(self.uploads.get() + n));
+        }
+
+        /// Runs `hook` once, as the download call after the next n downloads starts and before
+        /// it checks its cancel callback, so a hook that requests a cancel stops that download
+        pub fn cancel_after(&self, n: usize, hook: impl Fn() + 'static) {
+            *self.cancel_hook.borrow_mut() = Some((self.downloads.get() + n, Box::new(hook)));
         }
 
         /// Counts successful upload calls only, create_bytes and update_bytes are manifest writes
@@ -683,7 +730,24 @@ pub mod fake {
             self.stored(file_id)
         }
 
-        fn download(&self, file_id: &str, dest: &Path, expected_size: u64, on_bytes: &mut dyn FnMut(u64)) -> Result<String, String> {
+        fn download(
+            &self,
+            file_id: &str,
+            dest: &Path,
+            expected_size: u64,
+            cancel: &dyn Fn() -> bool,
+            on_bytes: &mut dyn FnMut(u64),
+        ) -> Result<String, String> {
+            let due = matches!(&*self.cancel_hook.borrow(), Some((at, _)) if *at == self.downloads.get());
+            if due {
+                if let Some((_, hook)) = self.cancel_hook.borrow_mut().take() {
+                    hook();
+                }
+            }
+            if cancel() {
+                let _ = fs::remove_file(dest);
+                return Err(CANCELLED.to_string());
+            }
             let bytes = self.stored(file_id)?;
             self.downloads.set(self.downloads.get() + 1);
             if bytes.len() as u64 != expected_size {
@@ -853,7 +917,7 @@ mod tests {
         assert_eq!(drive.file_bytes(&folder, "Mod/a.bin"), Some(b"hello".to_vec()));
 
         let dest = dir.join("out.bin");
-        let sha = drive.download(&id, &dest, 5, &mut |_| {}).unwrap();
+        let sha = drive.download(&id, &dest, 5, &|| false, &mut |_| {}).unwrap();
         assert_eq!(sha, listed[0].sha256.clone().unwrap());
         assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
         assert_eq!(drive.downloads(), 1);
@@ -878,9 +942,9 @@ mod tests {
         let id = drive.create_bytes(&folder, "a", b"data").unwrap();
         drive.corrupt(&id);
         let reported = drive.list(&folder).unwrap()[0].sha256.clone().unwrap();
-        let got = drive.download(&id, &dir.join("a"), 4, &mut |_| {}).unwrap();
-        assert_eq!(drive.download(&id, &dir.join("b"), 3, &mut |_| {}).unwrap_err(), SIZE_MISMATCH);
-        assert_eq!(drive.download(&id, &dir.join("b"), 5, &mut |_| {}).unwrap_err(), SIZE_MISMATCH);
+        let got = drive.download(&id, &dir.join("a"), 4, &|| false, &mut |_| {}).unwrap();
+        assert_eq!(drive.download(&id, &dir.join("b"), 3, &|| false, &mut |_| {}).unwrap_err(), SIZE_MISMATCH);
+        assert_eq!(drive.download(&id, &dir.join("b"), 5, &|| false, &mut |_| {}).unwrap_err(), SIZE_MISMATCH);
         assert!(!dir.join("b").exists());
         assert_ne!(got, reported);
         let _ = std::fs::remove_dir_all(&dir);
@@ -908,6 +972,23 @@ mod tests {
         assert!(!drive.is_shared(&folder));
         drive.share_anyone(&folder).unwrap();
         assert!(drive.is_shared(&folder));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fake_download_honours_cancel() {
+        let drive = FakeDrive::new();
+        let dir = scratch("drive-cancel");
+        let folder = drive.create_folder(None, "P").unwrap();
+        let id = drive.create_bytes(&folder, "a", b"data").unwrap();
+        let dest = dir.join("a");
+        assert_eq!(drive.download(&id, &dest, 4, &|| true, &mut |_| {}).unwrap_err(), CANCELLED);
+        assert!(!dest.exists());
+        let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+        let seen = fired.clone();
+        drive.cancel_after(0, move || seen.set(true));
+        drive.download(&id, &dest, 4, &|| false, &mut |_| {}).unwrap();
+        assert!(fired.get());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -49,6 +49,7 @@ pub fn run() {
             subscribe::update_linked_pack,
             subscribe::verify_linked_pack,
             subscribe::redownload_mods,
+            subscribe::cancel_pack_op,
             config::save_preset,
             config::delete_preset,
             config::load_presets,

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed } from "vue";
 import { store } from "../store";
-import { hasVisibleOps, progressAmount, progressLine, progressPercent } from "../packActions";
+import { cancelPackOp, canCancel, hasVisibleOps, opName, progressAmount, progressLine, progressPercent } from "../packActions";
 
 const ops = computed(() => Object.keys(store.inFlight)
   .filter((id) => !store.progressHidden[id])
@@ -9,7 +9,7 @@ const ops = computed(() => Object.keys(store.inFlight)
     const p = store.packProgress[id];
     return {
       key: id,
-      name: store.packs.find((pack) => pack.pack_id === id)?.name ?? store.opNames[id] ?? id,
+      name: opName(id),
       line: p ? progressLine(p) : "Starting...",
       percent: p ? progressPercent(p) : 0,
       amount: p ? progressAmount(p) : "",
@@ -30,7 +30,15 @@ function hide() {
           <p class="op-name">{{ op.name }}</p>
           <p class="op-line">{{ op.line }}</p>
           <div class="op-track"><div class="op-fill" :style="{ width: op.percent + '%' }"></div></div>
-          <p v-if="op.amount" class="op-amount">{{ op.amount }}</p>
+          <div v-if="op.amount || canCancel(op.key)" class="op-foot">
+            <button
+              v-if="canCancel(op.key)"
+              class="op-cancel"
+              :disabled="!!store.cancelling[op.key]"
+              @click="cancelPackOp(op.key)"
+            >{{ store.cancelling[op.key] ? "Cancelling..." : "Cancel" }}</button>
+            <p v-if="op.amount" class="op-amount">{{ op.amount }}</p>
+          </div>
         </div>
         <div class="modal-actions">
           <button class="secondary-btn" @click="hide">Hide</button>
@@ -41,11 +49,34 @@ function hide() {
 </template>
 
 <style scoped>
+.op-foot {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-top: 0.4rem;
+}
+
 .op-amount {
-  margin: 0.4rem 0 0;
+  margin: 0 0 0 auto;
   color: var(--text-muted);
   font-size: 0.8rem;
   text-align: right;
+}
+
+.op-cancel {
+  background: rgba(239, 68, 68, 0.12);
+  border: 1px solid rgba(239, 68, 68, 0.5);
+  color: #ef4444;
+  border-radius: 6px;
+  font-size: 0.8rem;
+  font-weight: 700;
+  padding: 0.2rem 0.75rem;
+  cursor: pointer;
+}
+
+.op-cancel:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 .modal-overlay {

@@ -106,6 +106,7 @@ export const store = reactive({
   inFlight: {} as Record<string, true>,
   opNames: {} as Record<string, string>,
   progressHidden: {} as Record<string, true>,
+  cancelling: {} as Record<string, true>,
   dialogs: [] as DialogRequest[],
   packUpdates: {} as Record<string, UpdateCheck>,
   closeBlocked: null as CloseBlocked | null

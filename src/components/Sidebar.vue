@@ -4,7 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { store, type PackManifest } from "../store";
 import {
   applyPack, loadPacks, loadPresets, refreshMods, publishPack, copyText, folderLink, progressLine, packLabel,
-  importArchive, addPackFromLink, updatePack, verifyPack, forkPack, updateLine
+  importArchive, addPackFromLink, updatePack, verifyPack, forkPack, updateLine, canCancel, cancelPackOp
 } from "../packActions";
 import { showAlert, showConfirm, showPrompt } from "../dialogs";
 import { 
@@ -314,7 +314,15 @@ async function launchGame() {
 
     <div class="sidebar-section" v-if="store.currentMode === 'Installed'">
       <h3 class="section-label">Modpacks</h3>
-      <p v-for="p in orphanProgress" :key="p.pack_id" class="pack-progress pack-progress-orphan">{{ progressLine(p) }}</p>
+      <div v-for="p in orphanProgress" :key="p.pack_id" class="pack-progress-row pack-progress-orphan">
+        <p class="pack-progress">{{ progressLine(p) }}</p>
+        <button
+          v-if="canCancel(p.pack_id)"
+          class="pack-cancel-btn"
+          :disabled="!!store.cancelling[p.pack_id]"
+          @click.stop="cancelPackOp(p.pack_id)"
+        >{{ store.cancelling[p.pack_id] ? "Cancelling..." : "Cancel" }}</button>
+      </div>
       <div class="preset-list" v-if="store.packs.length > 0">
         <div
           class="pack-card"
@@ -378,7 +386,15 @@ async function launchGame() {
             >Update</button>
           </div>
           <span v-else-if="store.packUpdates[pack.pack_id]?.status === 'updating'" class="pack-update-text">Being updated by its creator</span>
-          <p v-if="store.packProgress[pack.pack_id]" class="pack-progress">{{ progressLine(store.packProgress[pack.pack_id]) }}</p>
+          <div v-if="store.packProgress[pack.pack_id]" class="pack-progress-row">
+            <p class="pack-progress">{{ progressLine(store.packProgress[pack.pack_id]) }}</p>
+            <button
+              v-if="canCancel(pack.pack_id)"
+              class="pack-cancel-btn"
+              :disabled="!!store.cancelling[pack.pack_id]"
+              @click.stop="cancelPackOp(pack.pack_id)"
+            >{{ store.cancelling[pack.pack_id] ? "Cancelling..." : "Cancel" }}</button>
+          </div>
         </div>
       </div>
       <p v-else class="preset-empty">No modpacks imported yet.</p>
@@ -825,6 +841,30 @@ async function launchGame() {
 
 .pack-progress-orphan {
   margin-bottom: 0.5rem;
+}
+
+.pack-progress-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.4rem;
+}
+
+.pack-cancel-btn {
+  background: rgba(239, 68, 68, 0.12);
+  border: 1px solid rgba(239, 68, 68, 0.5);
+  color: #ef4444;
+  border-radius: 5px;
+  font-size: 0.7rem;
+  font-weight: 700;
+  padding: 0.1rem 0.5rem;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.pack-cancel-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
 }
 
 .pack-menu-anchor {

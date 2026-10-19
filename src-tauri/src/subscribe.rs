@@ -1,12 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use serde_json::Value;
 use tauri::Emitter;
 
-use crate::drive::{DriveApi, HttpDrive, Progress, SIZE_MISMATCH};
+use crate::drive::{DriveApi, HttpDrive, Progress, CANCELLED, SIZE_MISMATCH};
 use crate::hashing;
 use crate::packs::{self, InstalledMod, PackManifest, PackRef, PackSource};
 use crate::publish::{progress_event, RemoteFileEntry, RemoteManifest, RemoteMod, Throttle, FORMAT, MANIFEST_NAME};
@@ -216,18 +218,76 @@ pub fn inspect_link(drive: &dyn DriveApi, link: &DriveLink, mods_dir: &Path) -> 
     })
 }
 
+// Cancel flags of the downloads running now, keyed by pack folder
+static RUNNING: Mutex<BTreeMap<PathBuf, Arc<AtomicBool>>> = Mutex::new(BTreeMap::new());
+
+fn running() -> std::sync::MutexGuard<'static, BTreeMap<PathBuf, Arc<AtomicBool>>> {
+    RUNNING.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Marks a pack's op as running with a fresh cancel flag until dropped, so an error or a panic still clears it
+pub(crate) struct OpGuard {
+    pack_dir: PathBuf,
+    flag: Arc<AtomicBool>,
+}
+
+impl OpGuard {
+    /// None while another op for the pack is running
+    pub(crate) fn begin(pack_dir: &Path) -> Option<OpGuard> {
+        let mut ops = running();
+        if ops.contains_key(pack_dir) {
+            return None;
+        }
+        let flag = Arc::new(AtomicBool::new(false));
+        ops.insert(pack_dir.to_path_buf(), flag.clone());
+        Some(OpGuard { pack_dir: pack_dir.to_path_buf(), flag })
+    }
+
+    fn begin_named(pack_dir: &Path, name: &str) -> Result<OpGuard, String> {
+        OpGuard::begin(pack_dir).ok_or_else(|| format!("{} is busy, try again when it finishes", name))
+    }
+
+    pub(crate) fn cancelled(&self) -> bool {
+        self.flag.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for OpGuard {
+    fn drop(&mut self) {
+        running().remove(&self.pack_dir);
+    }
+}
+
+/// Asks the op running for a pack to stop. False when none is running.
+pub(crate) fn request_cancel(pack_dir: &Path) -> bool {
+    match running().get(pack_dir) {
+        Some(flag) => {
+            flag.store(true, Ordering::Relaxed);
+            true
+        }
+        None => false,
+    }
+}
+
+#[tauri::command]
+pub fn cancel_pack_op(app_handle: tauri::AppHandle, pack_id: String) -> Result<(), String> {
+    request_cancel(&vfs::get_mods_dir(&app_handle)?.join(&pack_id));
+    Ok(())
+}
+
 fn stage_remote(
     drive: &dyn DriveApi,
     remote: &RemotePack,
     mod_ids: Vec<String>,
     staged: &Path,
+    cancel: &dyn Fn() -> bool,
     progress: &mut dyn FnMut(Progress),
 ) -> Result<(), String> {
     let manifest = &remote.manifest;
     fs::create_dir_all(staged).map_err(|e| format!("Failed to create staging folder: {}", e))?;
     let total = manifest.mods.iter().map(|m| m.files.len()).sum();
     let bytes_total = manifest.mods.iter().flat_map(|m| &m.files).fold(0u64, |sum, f| sum.saturating_add(f.size));
-    let mut fetch = Fetch { drive, manifest, done: 0, total, bytes_done: 0, bytes_total, throttle: Throttle::new(), progress };
+    let mut fetch = Fetch { drive, manifest, done: 0, total, bytes_done: 0, bytes_total, throttle: Throttle::new(), cancel, progress };
     for m in &manifest.mods {
         let mod_dir = staged.join(&m.id);
         fs::create_dir_all(&mod_dir).map_err(|e| format!("Failed to create {}: {}", mod_dir.display(), e))?;
@@ -251,11 +311,16 @@ struct Fetch<'a> {
     bytes_done: u64,
     bytes_total: u64,
     throttle: Throttle,
+    cancel: &'a dyn Fn() -> bool,
     progress: &'a mut dyn FnMut(Progress),
 }
 
 impl Fetch<'_> {
     fn file(&mut self, f: &RemoteFileEntry, mod_dir: &Path, staged: &Path) -> Result<(), String> {
+        let cancel = self.cancel;
+        if cancel() {
+            return Err(CANCELLED.to_string());
+        }
         let dest = mod_dir.join(safe_rel_path(&f.path)?);
         if !dest.starts_with(staged) {
             return Err(format!("Invalid file path in pack: {}", f.path));
@@ -265,7 +330,7 @@ impl Fetch<'_> {
         let corrupted = || format!("A download from {} was corrupted ({}). Nothing was changed.", self.manifest.name, f.path);
         let mut got = 0u64;
         let (throttle, progress) = (&mut self.throttle, &mut *self.progress);
-        let downloaded = self.drive.download(&f.file_id, &dest, f.size, &mut |n| {
+        let downloaded = self.drive.download(&f.file_id, &dest, f.size, cancel, &mut |n| {
             got += n;
             if throttle.ready() {
                 let event = progress_event(pack_id, "downloading", done, total, Some(&f.path), (got, f.size));
@@ -338,10 +403,11 @@ pub fn add_from_link(
     check_target(mods_dir, &remote.manifest.pack_id)?;
     let archive = pack_archive(&remote.manifest);
     let plan = vfs::plan_import(&archive, mods_dir)?;
+    let op = OpGuard::begin_named(&mods_dir.join(&remote.manifest.pack_id), &remote.manifest.name)?;
     let staging = mods_dir.join(format!(".import-{}", uuid::Uuid::new_v4()));
     let staged = staging.join(&archive.pack.pack_id);
     let mod_ids = archive.folders.iter().map(|(id, _)| id.clone()).collect();
-    if let Err(e) = stage_remote(drive, &remote, mod_ids, &staged, progress) {
+    if let Err(e) = stage_remote(drive, &remote, mod_ids, &staged, &|| op.cancelled(), progress) {
         return Err(vfs::abandon_staging(&staging, e));
     }
     vfs::finish_import(&archive, plan, mods_dir, paks_dir, &staging)
@@ -565,6 +631,7 @@ fn download_changes(
     manifest: &RemoteManifest,
     plans: &[(&RemoteMod, Stage)],
     staged: &Path,
+    cancel: &dyn Fn() -> bool,
     progress: &mut dyn FnMut(Progress),
 ) -> Result<usize, String> {
     fs::create_dir_all(staged).map_err(|e| format!("Failed to create staging folder: {}", e))?;
@@ -574,7 +641,7 @@ fn download_changes(
     });
     let total = downloads().map(|(_, d)| d.len()).sum();
     let bytes_total = downloads().flat_map(|(_, d)| d.iter()).fold(0u64, |sum, f| sum.saturating_add(f.size));
-    let mut fetch = Fetch { drive, manifest, done: 0, total, bytes_done: 0, bytes_total, throttle: Throttle::new(), progress };
+    let mut fetch = Fetch { drive, manifest, done: 0, total, bytes_done: 0, bytes_total, throttle: Throttle::new(), cancel, progress };
     for (m, download) in downloads() {
         let mod_dir = staged.join(&m.id);
         fs::create_dir_all(&mod_dir).map_err(|e| format!("Failed to create {}: {}", mod_dir.display(), e))?;
@@ -649,6 +716,7 @@ pub fn update_pack(
     progress: &mut dyn FnMut(Progress),
 ) -> Result<UpdateSummary, String> {
     let (pack_dir, local, link) = linked_pack(mods_dir, pack_id)?;
+    let op = OpGuard::begin_named(&pack_dir, &local.name)?;
     let remote = fetch_remote(drive, &link)?;
     let manifest = &remote.manifest;
     if manifest.pack_id != pack_id {
@@ -670,10 +738,11 @@ pub fn update_pack(
         .map(|id| format!("{}/{}", pack_id, id))
         .collect();
 
-    // Everything is downloaded before any installed file moves, so a failed download leaves the pack untouched
+    // Everything is downloaded before any installed file moves, so a failed or cancelled download
+    // leaves the pack untouched. Past this point a cancel is ignored.
     let staging = mods_dir.join(format!(".import-{}", uuid::Uuid::new_v4()));
     let staged = staging.join(pack_id);
-    let downloaded = match download_changes(drive, manifest, &plans, &staged, progress) {
+    let downloaded = match download_changes(drive, manifest, &plans, &staged, &|| op.cancelled(), progress) {
         Ok(n) => n,
         Err(e) => return Err(vfs::abandon_staging(&staging, e)),
     };
@@ -857,11 +926,16 @@ mod tests {
 
     // Publishes the pack layout and a ready manifest straight into the fake
     fn remote_fixture(fake: &FakeDrive, mods: &[FixtureMod]) -> Remote {
-        let folder = fake.create_folder(None, PACK).unwrap();
+        remote_fixture_as(fake, mods, PACK)
+    }
+
+    // Cancel tests use their own pack id, since the cancel flags are shared across test threads
+    fn remote_fixture_as(fake: &FakeDrive, mods: &[FixtureMod], pack_id: &str) -> Remote {
+        let folder = fake.create_folder(None, pack_id).unwrap();
         let out = mods.iter().map(|m| fixture_mod(fake, &folder, m)).collect();
         let manifest = RemoteManifest {
             format: FORMAT,
-            pack_id: PACK.into(),
+            pack_id: pack_id.into(),
             name: NAME.into(),
             version: "1.0".into(),
             status: "ready".into(),
@@ -1648,5 +1722,128 @@ mod tests {
         let downloads = fake.downloads();
         assert_eq!(noop(PACK), "Casual Shitters is not linked to a Drive folder");
         assert_eq!(fake.downloads(), downloads);
+    }
+
+    #[test]
+    fn cancel_add_from_link_changes_nothing() {
+        const ID: &str = "Cancel-Add";
+        let fake = FakeDrive::new();
+        let remote = remote_fixture_as(&fake, &base_mods(), ID);
+        let mods = scratch("sub-cancel-add");
+        fs::create_dir_all(mods.join("5543")).unwrap();
+        fs::write(mods.join("5543/a.pak"), b"a").unwrap();
+        let before = listing(&mods);
+        let key = mods.join(ID);
+        fake.cancel_after(1, move || {
+            request_cancel(&key);
+        });
+        let err = add(&fake, &remote, &mods, &mods.join("paks")).unwrap_err();
+        assert_eq!(err, crate::drive::CANCELLED);
+        assert_eq!(fake.downloads(), 1);
+        assert_eq!(listing(&mods), before);
+        assert!(no_staging(&mods));
+        assert!(!request_cancel(&mods.join(ID)));
+    }
+
+    #[test]
+    fn cancel_update_keeps_old_pack() {
+        const ID: &str = "Cancel-Update";
+        let fake = FakeDrive::new();
+        let remote = remote_fixture_as(&fake, &base_mods(), ID);
+        let (mods, paks) = (scratch("sub-cancel-update"), scratch("sub-cancel-update-paks"));
+        add(&fake, &remote, &mods, &paks).unwrap();
+        crate::vfs::enable_key(&mods, &paks, &format!("{}/3063", ID)).unwrap();
+        let pack_dir = mods.join(ID);
+        let before = snapshot(&pack_dir);
+        let pack_json = fs::read(pack_dir.join("pack.json")).unwrap();
+        let links_before = links(&paks, "");
+        assert!(!links_before.is_empty());
+
+        let (mut next, _) = bump(&fake, &remote);
+        next.mods.push(fixture_mod(&fake, &remote.folder, &new_mod()));
+        set_remote(&fake, &remote, &next);
+        let downloads = fake.downloads();
+        let key = pack_dir.clone();
+        fake.cancel_after(1, move || {
+            request_cancel(&key);
+        });
+        let err = update_pack(&fake, &mods, &paks, ID, true, &[], &mut |_| {}).unwrap_err();
+        assert_eq!(err, crate::drive::CANCELLED);
+        assert_eq!(fake.downloads() - downloads, 1);
+        assert_eq!(snapshot(&pack_dir), before);
+        assert_eq!(fs::read(pack_dir.join("pack.json")).unwrap(), pack_json);
+        assert_eq!(links(&paks, ""), links_before);
+        assert!(no_staging(&mods));
+
+        let forced = vec!["3063".to_string()];
+        let key = pack_dir.clone();
+        fake.cancel_after(0, move || {
+            request_cancel(&key);
+        });
+        let err = update_pack(&fake, &mods, &paks, ID, true, &forced, &mut |_| {}).unwrap_err();
+        assert_eq!(err, crate::drive::CANCELLED);
+        assert_eq!(snapshot(&pack_dir), before);
+        assert!(no_staging(&mods));
+    }
+
+    #[test]
+    fn cancel_flag_cleared_after_op() {
+        const ID: &str = "Cancel-Flag";
+        {
+            let guard = OpGuard::begin(Path::new("Cancel-Guard")).unwrap();
+            assert!(!guard.cancelled());
+            assert!(request_cancel(Path::new("Cancel-Guard")));
+            assert!(guard.cancelled());
+        }
+        assert!(!request_cancel(Path::new("Cancel-Guard")));
+        assert!(!OpGuard::begin(Path::new("Cancel-Guard")).unwrap().cancelled());
+
+        let fake = FakeDrive::new();
+        let remote = remote_fixture_as(&fake, &base_mods(), ID);
+        let (mods, paks) = (scratch("sub-cancel-flag"), scratch("sub-cancel-flag-paks"));
+        let key = mods.join(ID);
+        assert!(!request_cancel(&key));
+        add(&fake, &remote, &mods, &paks).unwrap();
+        assert!(!request_cancel(&key));
+
+        bump(&fake, &remote);
+        let hook_key = key.clone();
+        fake.cancel_after(0, move || {
+            request_cancel(&hook_key);
+        });
+        let err = update_pack(&fake, &mods, &paks, ID, false, &[], &mut |_| {}).unwrap_err();
+        assert_eq!(err, crate::drive::CANCELLED);
+        assert!(!request_cancel(&key));
+
+        let summary = update_pack(&fake, &mods, &paks, ID, false, &[], &mut |_| {}).unwrap();
+        assert_eq!(summary.pack.version.as_deref(), Some("1.1"));
+        assert!(no_staging(&mods));
+    }
+
+    #[test]
+    fn second_op_on_a_pack_is_refused() {
+        const ID: &str = "Busy-Pack";
+        let fake = FakeDrive::new();
+        let remote = remote_fixture_as(&fake, &base_mods(), ID);
+        let (mods, paks) = (scratch("sub-busy"), scratch("sub-busy-paks"));
+        add(&fake, &remote, &mods, &paks).unwrap();
+        bump(&fake, &remote);
+        let before = listing(&mods);
+        let busy = format!("{} is busy, try again when it finishes", NAME);
+        {
+            let held = OpGuard::begin(&mods.join(ID)).unwrap();
+            assert!(OpGuard::begin(&mods.join(ID)).is_none());
+            let downloads = fake.downloads();
+            assert_eq!(add(&fake, &remote, &mods, &paks).unwrap_err(), busy);
+            assert_eq!(update_pack(&fake, &mods, &paks, ID, false, &[], &mut |_| {}).unwrap_err(), busy);
+            let forced = vec!["3063".to_string()];
+            assert_eq!(update_pack(&fake, &mods, &paks, ID, false, &forced, &mut |_| {}).unwrap_err(), busy);
+            assert_eq!(fake.downloads(), downloads);
+            assert_eq!(listing(&mods), before);
+            assert!(!held.cancelled());
+        }
+        assert!(OpGuard::begin(&mods.join(ID)).is_some());
+        let summary = update_pack(&fake, &mods, &paks, ID, false, &[], &mut |_| {}).unwrap();
+        assert_eq!(summary.pack.version.as_deref(), Some("1.1"));
     }
 }
