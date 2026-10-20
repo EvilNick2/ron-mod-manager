@@ -196,6 +196,10 @@ export function progressLine(p: PackProgress): string {
       return `Uploading ${count}${file}`;
     case "downloading":
       return `Downloading ${count}${file}`;
+    case "extracting":
+      return `Extracting ${count}${file}`;
+    case "installing":
+      return "Installing";
     default:
       return `Working ${count}`;
   }
@@ -319,7 +323,14 @@ export async function importArchive(archivePath: string): Promise<void> {
       return;
     }
 
-    const summary = await invoke("import_preset", { archivePath }) as ImportSummary;
+    const packId = preview.pack.pack_id;
+    beginOp(packId, preview.pack.name);
+    let summary: ImportSummary;
+    try {
+      summary = await invoke("import_preset", { archivePath }) as ImportSummary;
+    } finally {
+      endOp(packId);
+    }
     await finishImport(summary, imported);
   } catch (e: any) {
     if (imported.label) {
