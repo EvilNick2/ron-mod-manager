@@ -31,15 +31,21 @@ pub struct ModInfo {
 
 const STAGING_PREFIXES: [&str; 3] = [".import-", ".fork-", ".deleting-"];
 
-/// Staging folders a closed or crashed app left behind. List them at startup, before any op.
+/// Holds a folder per pack of downloads kept for a retry after a failed add or update
+pub(crate) const DOWNLOAD_CACHE: &str = ".download-cache";
+const CACHE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+
+fn plain_dirs(dir: &Path) -> impl Iterator<Item = fs::DirEntry> {
+    fs::read_dir(dir).into_iter().flatten().filter_map(Result::ok).filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+}
+
+/// Staging folders a closed or crashed app left behind, and download caches no retry used for a week.
+/// List them at startup, before any op.
 pub(crate) fn leftover_staging(mods_dir: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = fs::read_dir(mods_dir) else { return Vec::new() };
-    entries
-        .filter_map(Result::ok)
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-        .filter(|e| STAGING_PREFIXES.iter().any(|p| e.file_name().to_string_lossy().starts_with(p)))
-        .map(|e| e.path())
-        .collect()
+    let staging = plain_dirs(mods_dir).filter(|e| STAGING_PREFIXES.iter().any(|p| e.file_name().to_string_lossy().starts_with(p)));
+    let stale = plain_dirs(&mods_dir.join(DOWNLOAD_CACHE))
+        .filter(|e| e.metadata().and_then(|m| m.modified()).is_ok_and(|t| t.elapsed().is_ok_and(|age| age > CACHE_MAX_AGE)));
+    staging.chain(stale).map(|e| e.path()).collect()
 }
 
 pub(crate) fn remove_staging(paths: &[PathBuf]) {
@@ -1470,6 +1476,7 @@ fn stage_pack(zip: &mut zip::ZipArchive<fs::File>, archive: &PackArchive, staged
             bytes_total: size,
             overall_done: 0,
             overall_total: 0,
+            wait_secs: 0,
         }.overall(overall_done, overall_total);
         emit(progress(0, overall_done));
         if let Some(parent) = out.parent() {
@@ -1498,6 +1505,7 @@ fn stage_pack(zip: &mut zip::ZipArchive<fs::File>, archive: &PackArchive, staged
         bytes_total: 0,
         overall_done: 0,
         overall_total: 0,
+        wait_secs: 0,
     });
 
     let mut mod_ids = Vec::new();
@@ -2211,6 +2219,18 @@ mod tests {
         assert_eq!(names(&m), vec![".import-file", ".other", "3151", "CS"]);
         assert!(m.join("CS/3063").is_dir() && m.join(".other/x").is_dir());
         sweep_staging(&m.join("missing"));
+    }
+
+    #[test]
+    fn sweep_staging_removes_only_week_old_download_caches() {
+        let m = scratch("sweep-cache");
+        let cache = m.join(DOWNLOAD_CACHE);
+        put(&cache, "Old/aa", b"a");
+        put(&cache, "New/bb", b"b");
+        let old = std::time::SystemTime::now() - CACHE_MAX_AGE - std::time::Duration::from_secs(60);
+        fs::File::open(cache.join("Old")).unwrap().set_modified(old).unwrap();
+        sweep_staging(&m);
+        assert_eq!(names(&cache), vec!["New"]);
     }
 
     #[test]

@@ -73,6 +73,8 @@ pub struct Progress {
     /// Bytes across the whole stage, zero when the stage does not move bytes
     pub overall_done: u64,
     pub overall_total: u64,
+    /// Seconds left before a download blocked by Google is retried
+    pub wait_secs: u64,
 }
 
 impl Progress {
@@ -369,7 +371,7 @@ impl HttpDrive {
 }
 
 // Sleeps in short steps so a cancel is seen quickly. False when cancelled.
-fn nap(total: Duration, cancel: &dyn Fn() -> bool) -> bool {
+pub(crate) fn nap(total: Duration, cancel: &dyn Fn() -> bool) -> bool {
     let step = Duration::from_millis(100);
     let mut slept = Duration::ZERO;
     while slept < total {
@@ -588,6 +590,7 @@ pub mod fake {
         lists: Cell<usize>,
         finds: Cell<usize>,
         cancel_hook: RefCell<Option<(usize, Box<dyn Fn()>)>>,
+        blocked: Cell<usize>,
     }
 
     impl FakeDrive {
@@ -602,7 +605,13 @@ pub mod fake {
                 lists: Cell::new(0),
                 finds: Cell::new(0),
                 cancel_hook: RefCell::new(None),
+                blocked: Cell::new(0),
             }
+        }
+
+        /// The next n download calls fail as if Google blocked them
+        pub fn block_downloads(&self, n: usize) {
+            self.blocked.set(n);
         }
 
         /// usage is added to the bytes stored in the fake
@@ -771,6 +780,10 @@ pub mod fake {
             if cancel() {
                 let _ = fs::remove_file(dest);
                 return Err(CANCELLED.to_string());
+            }
+            if self.blocked.get() > 0 {
+                self.blocked.set(self.blocked.get() - 1);
+                return Err(BLOCKED.to_string());
             }
             let bytes = self.stored(file_id)?;
             self.downloads.set(self.downloads.get() + 1);

@@ -129,9 +129,10 @@ export function opName(packId: string): string {
   return store.packs.find((p) => p.pack_id === packId)?.name ?? store.opNames[packId] ?? packId;
 }
 
-// Only downloads can be cancelled, and only while they are still downloading
+// Only downloads can be cancelled, and only while they are still downloading or waiting to retry
 export function canCancel(packId: string): boolean {
-  return !!store.inFlight[packId] && store.packProgress[packId]?.stage === "downloading";
+  const stage = store.packProgress[packId]?.stage;
+  return !!store.inFlight[packId] && (stage === "downloading" || stage === "waiting");
 }
 
 export async function cancelPackOp(packId: string): Promise<void> {
@@ -196,6 +197,8 @@ export function progressLine(p: PackProgress): string {
       return `Uploading ${count}${file}`;
     case "downloading":
       return `Downloading ${count}${file}`;
+    case "waiting":
+      return `Google paused downloads, retrying in ${p.wait_secs}s`;
     case "extracting":
       return `Extracting ${count}${file}`;
     case "installing":

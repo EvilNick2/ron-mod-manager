@@ -3,12 +3,13 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::Value;
 use tauri::Emitter;
 
-use crate::drive::{DriveApi, HttpDrive, Progress, CANCELLED, SIZE_MISMATCH};
+use crate::drive::{nap, DriveApi, HttpDrive, Progress, BLOCKED, CANCELLED, SIZE_MISMATCH};
 use crate::hashing;
 use crate::packs::{self, InstalledMod, PackManifest, PackRef, PackSource};
 use crate::publish::{progress_event, RemoteFileEntry, RemoteManifest, RemoteMod, Throttle, FORMAT, MANIFEST_NAME};
@@ -313,6 +314,7 @@ fn stage_remote(
     remote: &RemotePack,
     mod_ids: Vec<String>,
     staged: &Path,
+    cache: &Path,
     cancel: &dyn Fn() -> bool,
     progress: &mut dyn FnMut(Progress),
 ) -> Result<(), String> {
@@ -320,7 +322,7 @@ fn stage_remote(
     fs::create_dir_all(staged).map_err(|e| format!("Failed to create staging folder: {}", e))?;
     let total = manifest.mods.iter().map(|m| m.files.len()).sum();
     let bytes_total = manifest.mods.iter().flat_map(|m| &m.files).fold(0u64, |sum, f| sum.saturating_add(f.size));
-    let mut fetch = Fetch { drive, manifest, done: 0, total, bytes_done: 0, bytes_total, throttle: Throttle::new(), cancel, progress };
+    let mut fetch = Fetch { drive, manifest, cache, done: 0, total, bytes_done: 0, bytes_total, throttle: Throttle::new(), cancel, progress };
     for m in &manifest.mods {
         let mod_dir = staged.join(&m.id);
         fs::create_dir_all(&mod_dir).map_err(|e| format!("Failed to create {}: {}", mod_dir.display(), e))?;
@@ -335,10 +337,56 @@ fn stage_remote(
     write_staged_manifest(remote, mod_ids, staged)
 }
 
+const HASH_MISMATCH: &str = "The download did not match its expected hash";
+
+// Downloads that passed their hash check are kept here by hash until the pack installs,
+// so a failed attempt carries on from where it stopped
+fn cache_dir(mods_dir: &Path, pack_id: &str) -> PathBuf {
+    mods_dir.join(vfs::DOWNLOAD_CACHE).join(pack_id)
+}
+
+// Deletes a pack's cache once it installs or the player cancels, and the cache folder when it is empty
+fn drop_cache(cache: &Path) {
+    let _ = fs::remove_dir_all(cache);
+    if let Some(parent) = cache.parent() {
+        let _ = fs::remove_dir(parent);
+    }
+}
+
+// True when the cached copy is whole. A damaged copy is deleted so it is downloaded again.
+fn reuse_cached(cached: &Path, size: u64, sha: &str) -> bool {
+    if !is_plain(cached, false) {
+        return false;
+    }
+    let whole = fs::metadata(cached).is_ok_and(|m| m.len() == size) && hashing::sha256_file(cached).is_ok_and(|h| h == sha);
+    if !whole {
+        let _ = fs::remove_file(cached);
+    }
+    whole
+}
+
+// Hard links the cached file into staging so it takes no extra space, copying where links fail
+fn place_cached(cached: &Path, dest: &Path) -> Result<(), String> {
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("Failed to create {}: {}", parent.display(), e))?;
+    }
+    if fs::hard_link(cached, dest).is_ok() {
+        return Ok(());
+    }
+    fs::copy(cached, dest).map(|_| ()).map_err(|e| format!("Failed to copy {} to {}: {}", cached.display(), dest.display(), e))
+}
+
+// Seconds to wait before each retry of a file Google blocked as automated traffic
+#[cfg(not(test))]
+const BLOCKED_WAITS: [u64; 4] = [30, 60, 120, 240];
+#[cfg(test)]
+const BLOCKED_WAITS: [u64; 4] = [0, 0, 0, 0];
+
 // Downloads files into staging with their hashes checked, and reports progress for the pack
 struct Fetch<'a> {
     drive: &'a dyn DriveApi,
     manifest: &'a RemoteManifest,
+    cache: &'a Path,
     done: usize,
     total: usize,
     bytes_done: u64,
@@ -358,30 +406,61 @@ impl Fetch<'_> {
         if !dest.starts_with(staged) {
             return Err(format!("Invalid file path in pack: {}", f.path));
         }
+        let manifest = self.manifest;
+        let corrupted = || format!("A download from {} was corrupted ({}). Nothing was changed.", manifest.name, f.path);
+        let sha = f.sha256.to_ascii_lowercase();
+        if sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(format!("Invalid file hash in pack: {}", f.path));
+        }
+        let cached = self.cache.join(&sha);
+        if !reuse_cached(&cached, f.size, &sha) {
+            fs::create_dir_all(self.cache).map_err(|e| format!("Failed to create {}: {}", self.cache.display(), e))?;
+            let part = self.cache.join(format!("{}.part", sha));
+            if let Err(e) = self.download(f, &part) {
+                let _ = fs::remove_file(&part);
+                return Err(if e == SIZE_MISMATCH || e == HASH_MISMATCH { corrupted() } else { e });
+            }
+            fs::rename(&part, &cached).map_err(|e| format!("Failed to move {}: {}", part.display(), e))?;
+        }
+        place_cached(&cached, &dest)?;
+        self.done += 1;
+        self.bytes_done = self.bytes_done.saturating_add(f.size);
+        let event = progress_event(&self.manifest.pack_id, "downloading", self.done, self.total, Some(&f.path), (f.size, f.size));
+        (self.progress)(event.overall(self.bytes_done, self.bytes_total));
+        Ok(())
+    }
+
+    // Downloads one file to dest and checks its hash, waiting out blocks from Google
+    fn download(&mut self, f: &RemoteFileEntry, dest: &Path) -> Result<(), String> {
+        let cancel = self.cancel;
         let (pack_id, done, total) = (self.manifest.pack_id.as_str(), self.done, self.total);
         let (before, bytes_total) = (self.bytes_done, self.bytes_total);
-        let corrupted = || format!("A download from {} was corrupted ({}). Nothing was changed.", self.manifest.name, f.path);
-        let mut got = 0u64;
-        let (throttle, progress) = (&mut self.throttle, &mut *self.progress);
-        let downloaded = self.drive.download(&f.file_id, &dest, f.size, cancel, &mut |n| {
-            got += n;
-            if throttle.ready() {
-                let event = progress_event(pack_id, "downloading", done, total, Some(&f.path), (got, f.size));
-                progress(event.overall(before + got.min(f.size), bytes_total));
+        let mut waits = BLOCKED_WAITS.iter();
+        let downloaded = loop {
+            let mut got = 0u64;
+            let (throttle, progress) = (&mut self.throttle, &mut *self.progress);
+            let result = self.drive.download(&f.file_id, dest, f.size, cancel, &mut |n| {
+                got += n;
+                if throttle.ready() {
+                    let event = progress_event(pack_id, "downloading", done, total, Some(&f.path), (got, f.size));
+                    progress(event.overall(before + got.min(f.size), bytes_total));
+                }
+            });
+            match (&result, waits.next()) {
+                (Err(e), Some(&secs)) if e == BLOCKED => {
+                    for left in (1..=secs).rev() {
+                        let mut event = progress_event(pack_id, "waiting", done, total, Some(&f.path), (0, f.size));
+                        event.wait_secs = left;
+                        (self.progress)(event.overall(before, bytes_total));
+                        if !nap(Duration::from_secs(1), cancel) {
+                            return Err(CANCELLED.to_string());
+                        }
+                    }
+                }
+                _ => break result,
             }
-        });
-        let sha = match downloaded {
-            Err(e) if e == SIZE_MISMATCH => return Err(corrupted()),
-            other => other?,
         };
-        if !sha.eq_ignore_ascii_case(&f.sha256) {
-            return Err(corrupted());
-        }
-        self.done += 1;
-        self.bytes_done = before.saturating_add(f.size);
-        let event = progress_event(pack_id, "downloading", self.done, total, Some(&f.path), (f.size, f.size));
-        (self.progress)(event.overall(self.bytes_done, bytes_total));
-        Ok(())
+        if downloaded?.eq_ignore_ascii_case(&f.sha256) { Ok(()) } else { Err(HASH_MISMATCH.to_string()) }
     }
 }
 
@@ -440,10 +519,16 @@ pub fn add_from_link(
     let staging = mods_dir.join(format!(".import-{}", uuid::Uuid::new_v4()));
     let staged = staging.join(&archive.pack.pack_id);
     let mod_ids = archive.folders.iter().map(|(id, _)| id.clone()).collect();
-    if let Err(e) = stage_remote(drive, &remote, mod_ids, &staged, &|| op.cancelled(), progress) {
+    let cache = cache_dir(mods_dir, &archive.pack.pack_id);
+    if let Err(e) = stage_remote(drive, &remote, mod_ids, &staged, &cache, &|| op.cancelled(), progress) {
+        if e == CANCELLED {
+            drop_cache(&cache);
+        }
         return Err(vfs::abandon_staging(&staging, e));
     }
-    vfs::finish_import(&archive, plan, mods_dir, paks_dir, &staging)
+    let summary = vfs::finish_import(&archive, plan, mods_dir, paks_dir, &staging)?;
+    drop_cache(&cache);
+    Ok(summary)
 }
 
 #[derive(Serialize, Debug)]
@@ -664,6 +749,7 @@ fn download_changes(
     manifest: &RemoteManifest,
     plans: &[(&RemoteMod, Stage)],
     staged: &Path,
+    cache: &Path,
     cancel: &dyn Fn() -> bool,
     progress: &mut dyn FnMut(Progress),
 ) -> Result<usize, String> {
@@ -674,7 +760,7 @@ fn download_changes(
     });
     let total = downloads().map(|(_, d)| d.len()).sum();
     let bytes_total = downloads().flat_map(|(_, d)| d.iter()).fold(0u64, |sum, f| sum.saturating_add(f.size));
-    let mut fetch = Fetch { drive, manifest, done: 0, total, bytes_done: 0, bytes_total, throttle: Throttle::new(), cancel, progress };
+    let mut fetch = Fetch { drive, manifest, cache, done: 0, total, bytes_done: 0, bytes_total, throttle: Throttle::new(), cancel, progress };
     for (m, download) in downloads() {
         let mod_dir = staged.join(&m.id);
         fs::create_dir_all(&mod_dir).map_err(|e| format!("Failed to create {}: {}", mod_dir.display(), e))?;
@@ -775,9 +861,15 @@ pub fn update_pack(
     // leaves the pack untouched. Past this point a cancel is ignored.
     let staging = mods_dir.join(format!(".import-{}", uuid::Uuid::new_v4()));
     let staged = staging.join(pack_id);
-    let downloaded = match download_changes(drive, manifest, &plans, &staged, &|| op.cancelled(), progress) {
+    let cache = cache_dir(mods_dir, pack_id);
+    let downloaded = match download_changes(drive, manifest, &plans, &staged, &cache, &|| op.cancelled(), progress) {
         Ok(n) => n,
-        Err(e) => return Err(vfs::abandon_staging(&staging, e)),
+        Err(e) => {
+            if e == CANCELLED {
+                drop_cache(&cache);
+            }
+            return Err(vfs::abandon_staging(&staging, e));
+        }
     };
     let mut moves = Moves::default();
     if let Err(e) = assemble(&mut moves, &remote, &plans, &pack_dir, &staged, &flags, active) {
@@ -828,6 +920,7 @@ pub fn update_pack(
         }
     }
 
+    drop_cache(&cache);
     Ok(UpdateSummary {
         pack: PackRef { pack_id: pack_id.to_string(), name: manifest.name.clone(), version: Some(manifest.version.clone()) },
         downloaded,
@@ -1026,10 +1119,12 @@ mod tests {
         DriveLink { folder_id: remote.folder.clone(), resource_key: None }
     }
 
+    // Leaves out the download cache, which the cache tests check on their own
     fn listing(dir: &Path) -> Vec<String> {
         let mut out: Vec<String> = walkdir::WalkDir::new(dir)
             .into_iter()
             .map(|e| e.unwrap().path().strip_prefix(dir).unwrap().display().to_string())
+            .filter(|p| !p.starts_with(vfs::DOWNLOAD_CACHE))
             .collect();
         out.sort();
         out
@@ -1758,6 +1853,61 @@ mod tests {
     }
 
     #[test]
+    fn add_from_link_waits_out_a_block() {
+        let fake = FakeDrive::new();
+        let remote = remote_fixture(&fake, &base_mods());
+        let mods = scratch("sub-blocked");
+        fake.block_downloads(BLOCKED_WAITS.len());
+        let mut events: Vec<Progress> = Vec::new();
+        add_from_link(&fake, &link(&remote), &mods, &mods.join("paks"), &mut |p| events.push(p)).unwrap();
+        assert_eq!(fake.downloads(), 5);
+        assert!(mods.join(PACK).join("3063").join(A_PAK).is_file());
+    }
+
+    #[test]
+    fn add_from_link_gives_up_when_the_block_outlasts_the_waits() {
+        let fake = FakeDrive::new();
+        let remote = remote_fixture(&fake, &base_mods());
+        let mods = scratch("sub-blocked-long");
+        fake.block_downloads(BLOCKED_WAITS.len() + 1);
+        let err = add_from_link(&fake, &link(&remote), &mods, &mods.join("paks"), &mut |_| {}).unwrap_err();
+        assert_eq!(err, BLOCKED);
+        assert!(no_staging(&mods));
+    }
+
+    #[test]
+    fn failed_add_resumes_from_the_cache() {
+        let fake = FakeDrive::new();
+        let remote = remote_fixture(&fake, &base_mods());
+        let mods = scratch("sub-resume");
+        let last = remote.manifest.mods.last().unwrap().files.last().unwrap().file_id.clone();
+        fake.corrupt(&last);
+        add(&fake, &remote, &mods, &mods.join("paks")).unwrap_err();
+        assert_eq!(fake.downloads(), 5);
+        assert_eq!(fs::read_dir(cache_dir(&mods, PACK)).unwrap().count(), 4);
+
+        fake.corrupt(&last);
+        add(&fake, &remote, &mods, &mods.join("paks")).unwrap();
+        assert_eq!(fake.downloads(), 6);
+        assert_eq!(fs::read(mods.join(PACK).join("3063").join(A_PAK)).unwrap(), b"vests-v1");
+        assert!(!mods.join(vfs::DOWNLOAD_CACHE).exists());
+    }
+
+    #[test]
+    fn damaged_cache_entry_is_downloaded_again() {
+        let fake = FakeDrive::new();
+        let remote = remote_fixture(&fake, &base_mods());
+        let mods = scratch("sub-bad-cache");
+        let f = remote.manifest.mods.iter().flat_map(|m| &m.files).find(|f| f.path == A_PAK).unwrap();
+        let cache = cache_dir(&mods, PACK);
+        fs::create_dir_all(&cache).unwrap();
+        fs::write(cache.join(f.sha256.to_ascii_lowercase()), b"vests-XX").unwrap();
+        add(&fake, &remote, &mods, &mods.join("paks")).unwrap();
+        assert_eq!(fake.downloads(), 5);
+        assert_eq!(fs::read(mods.join(PACK).join("3063").join(A_PAK)).unwrap(), b"vests-v1");
+    }
+
+    #[test]
     fn cancel_add_from_link_changes_nothing() {
         const ID: &str = "Cancel-Add";
         let fake = FakeDrive::new();
@@ -1774,6 +1924,7 @@ mod tests {
         assert_eq!(err, crate::drive::CANCELLED);
         assert_eq!(fake.downloads(), 1);
         assert_eq!(listing(&mods), before);
+        assert!(!mods.join(vfs::DOWNLOAD_CACHE).exists());
         assert!(no_staging(&mods));
         assert!(!request_cancel(&mods.join(ID)));
     }

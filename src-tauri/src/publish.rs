@@ -132,6 +132,7 @@ pub(crate) fn progress_event(pack_id: &str, stage: &str, done: usize, total: usi
         bytes_total: bytes.1,
         overall_done: 0,
         overall_total: 0,
+        wait_secs: 0,
     }
 }
 
