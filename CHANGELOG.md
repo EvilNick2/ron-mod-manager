@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.5.0](https://github.com/EvilNick2/ron-mod-manager/compare/v0.4.1...v0.5.0) (2026-10-24)
+
+
+### Features
+
+* **packs:** keep verified downloads so a failed add or update resumes ([b8522bc](https://github.com/EvilNick2/ron-mod-manager/commit/b8522bcf58a4ff190ecdf764affc6eadb48b5ab4))
+* **packs:** show progress when importing a modpack zip ([e65d563](https://github.com/EvilNick2/ron-mod-manager/commit/e65d563dc4b7c6ab654711e7b2a86619f127f329))
+
+
+### Bug Fixes
+
+* **drive:** wait and retry when Google blocks pack downloads ([eea2363](https://github.com/EvilNick2/ron-mod-manager/commit/eea23635fa2f3d6a414033ab1453cb9b0abf4bc0))
+* **linux:** keep webkit's gpu renderer on nvidia wayland ([b533f5f](https://github.com/EvilNick2/ron-mod-manager/commit/b533f5f162fbedc080bf9b7765ea83917569f942))
+
 ## [0.4.1](https://github.com/EvilNick2/ron-mod-manager/compare/v0.4.0...v0.4.1) (2026-10-19)
 
 
