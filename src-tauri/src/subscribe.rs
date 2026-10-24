@@ -3,12 +3,13 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::Value;
 use tauri::Emitter;
 
-use crate::drive::{DriveApi, HttpDrive, Progress, CANCELLED, SIZE_MISMATCH};
+use crate::drive::{nap, DriveApi, HttpDrive, Progress, BLOCKED, CANCELLED, SIZE_MISMATCH};
 use crate::hashing;
 use crate::packs::{self, InstalledMod, PackManifest, PackRef, PackSource};
 use crate::publish::{progress_event, RemoteFileEntry, RemoteManifest, RemoteMod, Throttle, FORMAT, MANIFEST_NAME};
@@ -335,6 +336,12 @@ fn stage_remote(
     write_staged_manifest(remote, mod_ids, staged)
 }
 
+// Seconds to wait before each retry of a file Google blocked as automated traffic
+#[cfg(not(test))]
+const BLOCKED_WAITS: [u64; 4] = [30, 60, 120, 240];
+#[cfg(test)]
+const BLOCKED_WAITS: [u64; 4] = [0, 0, 0, 0];
+
 // Downloads files into staging with their hashes checked, and reports progress for the pack
 struct Fetch<'a> {
     drive: &'a dyn DriveApi,
@@ -361,15 +368,31 @@ impl Fetch<'_> {
         let (pack_id, done, total) = (self.manifest.pack_id.as_str(), self.done, self.total);
         let (before, bytes_total) = (self.bytes_done, self.bytes_total);
         let corrupted = || format!("A download from {} was corrupted ({}). Nothing was changed.", self.manifest.name, f.path);
-        let mut got = 0u64;
-        let (throttle, progress) = (&mut self.throttle, &mut *self.progress);
-        let downloaded = self.drive.download(&f.file_id, &dest, f.size, cancel, &mut |n| {
-            got += n;
-            if throttle.ready() {
-                let event = progress_event(pack_id, "downloading", done, total, Some(&f.path), (got, f.size));
-                progress(event.overall(before + got.min(f.size), bytes_total));
+        let mut waits = BLOCKED_WAITS.iter();
+        let downloaded = loop {
+            let mut got = 0u64;
+            let (throttle, progress) = (&mut self.throttle, &mut *self.progress);
+            let result = self.drive.download(&f.file_id, &dest, f.size, cancel, &mut |n| {
+                got += n;
+                if throttle.ready() {
+                    let event = progress_event(pack_id, "downloading", done, total, Some(&f.path), (got, f.size));
+                    progress(event.overall(before + got.min(f.size), bytes_total));
+                }
+            });
+            match (&result, waits.next()) {
+                (Err(e), Some(&secs)) if e == BLOCKED => {
+                    for left in (1..=secs).rev() {
+                        let mut event = progress_event(pack_id, "waiting", done, total, Some(&f.path), (0, f.size));
+                        event.wait_secs = left;
+                        (self.progress)(event.overall(before, bytes_total));
+                        if !nap(Duration::from_secs(1), cancel) {
+                            return Err(CANCELLED.to_string());
+                        }
+                    }
+                }
+                _ => break result,
             }
-        });
+        };
         let sha = match downloaded {
             Err(e) if e == SIZE_MISMATCH => return Err(corrupted()),
             other => other?,
@@ -1755,6 +1778,29 @@ mod tests {
         let downloads = fake.downloads();
         assert_eq!(noop(PACK), "Casual Shitters is not linked to a Drive folder");
         assert_eq!(fake.downloads(), downloads);
+    }
+
+    #[test]
+    fn add_from_link_waits_out_a_block() {
+        let fake = FakeDrive::new();
+        let remote = remote_fixture(&fake, &base_mods());
+        let mods = scratch("sub-blocked");
+        fake.block_downloads(BLOCKED_WAITS.len());
+        let mut events: Vec<Progress> = Vec::new();
+        add_from_link(&fake, &link(&remote), &mods, &mods.join("paks"), &mut |p| events.push(p)).unwrap();
+        assert_eq!(fake.downloads(), 5);
+        assert!(mods.join(PACK).join("3063").join(A_PAK).is_file());
+    }
+
+    #[test]
+    fn add_from_link_gives_up_when_the_block_outlasts_the_waits() {
+        let fake = FakeDrive::new();
+        let remote = remote_fixture(&fake, &base_mods());
+        let mods = scratch("sub-blocked-long");
+        fake.block_downloads(BLOCKED_WAITS.len() + 1);
+        let err = add_from_link(&fake, &link(&remote), &mods, &mods.join("paks"), &mut |_| {}).unwrap_err();
+        assert_eq!(err, BLOCKED);
+        assert!(no_staging(&mods));
     }
 
     #[test]

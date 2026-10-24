@@ -27,6 +27,7 @@ export interface PackProgress {
   bytes_total: number;
   overall_done: number;
   overall_total: number;
+  wait_secs: number;
 }
 
 export interface ModRef {

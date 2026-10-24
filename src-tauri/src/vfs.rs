@@ -1470,6 +1470,7 @@ fn stage_pack(zip: &mut zip::ZipArchive<fs::File>, archive: &PackArchive, staged
             bytes_total: size,
             overall_done: 0,
             overall_total: 0,
+            wait_secs: 0,
         }.overall(overall_done, overall_total);
         emit(progress(0, overall_done));
         if let Some(parent) = out.parent() {
@@ -1498,6 +1499,7 @@ fn stage_pack(zip: &mut zip::ZipArchive<fs::File>, archive: &PackArchive, staged
         bytes_total: 0,
         overall_done: 0,
         overall_total: 0,
+        wait_secs: 0,
     });
 
     let mut mod_ids = Vec::new();
