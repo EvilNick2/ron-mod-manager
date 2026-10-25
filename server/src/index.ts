@@ -1,4 +1,3 @@
-import { requireUser } from "./auth";
 import type { Env } from "./env";
 import { HttpError, fail, json } from "./http";
 import {
@@ -7,6 +6,7 @@ import {
   invitePage,
   showInvite,
 } from "./invites";
+import { getBlob, getManifest, me } from "./packs";
 import {
   beginPublish,
   cancelPublish,
@@ -25,16 +25,15 @@ const routes: Record<string, Handler> = {
   "POST /auth/token": (req, env) => authToken(req, env),
   "POST /auth/logout": (req, env) => authLogout(req, env),
   "POST /invites/uploader": (req, env) => createUploaderInvite(req, env),
-  "GET /me": async (req, env) => {
-    const user = await requireUser(req, env);
-    return json({ ...user, packs: [] });
-  },
+  "GET /me": (req, env) => me(req, env),
 };
 
 type CodeHandler = (req: Request, env: Env, code: string) => Promise<Response> | Response;
 
 const dynamicRoutes: { method: string; pattern: RegExp; handler: CodeHandler }[] = [
   { method: "GET", pattern: /^\/invites\/([^/]+)$/, handler: showInvite },
+  { method: "GET", pattern: /^\/packs\/([^/]+)\/manifest$/, handler: getManifest },
+  { method: "GET", pattern: /^\/blobs\/([^/]+)$/, handler: getBlob },
   { method: "POST", pattern: /^\/invites\/([^/]+)\/accept$/, handler: acceptInviteRoute },
   { method: "POST", pattern: /^\/packs\/([^/]+)\/publish\/begin$/, handler: beginPublish },
   { method: "POST", pattern: /^\/publishes\/([^/]+)\/urls$/, handler: publishUrls },
