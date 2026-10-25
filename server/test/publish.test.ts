@@ -347,3 +347,40 @@ it("a wrong size for an open reservation is refused and the object survives", as
   const c = await post(`/publishes/${pb.publish_id}/commit`, { manifest: manifest("pack-b", blobs) }, b);
   expect(c.status).toBe(200);
 });
+
+it("commit fails cleanly when the publish vanishes before its batch", async () => {
+  const token = await signIn("u1");
+  const blobs = [{ sha256: hash("a"), size: 5 }];
+  const { publish_id } = await started("pack-a", blobs, token);
+  await put(hash("a"), 5);
+  await post(`/publishes/${publish_id}/verify`, { blobs: [hash("a")] }, token);
+
+  const real = env.DB;
+  const wrapped = new Proxy(real, {
+    get(target, prop) {
+      if (prop === "batch") {
+        return async (stmts: D1PreparedStatement[]) => {
+          await real.prepare("delete from publishes where id = ?").bind(publish_id).run();
+          return real.batch(stmts);
+        };
+      }
+      const v = Reflect.get(target, prop, target);
+      return typeof v === "function" ? v.bind(target) : v;
+    },
+  });
+  (env as unknown as Record<string, unknown>).DB = wrapped;
+  let res: Response;
+  try {
+    res = await post(`/publishes/${publish_id}/commit`, { manifest: manifest("pack-a", blobs) }, token);
+  } finally {
+    (env as unknown as Record<string, unknown>).DB = real;
+  }
+  expect(res.status).toBe(404);
+  expect(((await res.json()) as { error: string }).error).toBe("publish_gone");
+  for (const t of ["blobs", "pack_blobs"]) {
+    const n = await env.DB.prepare(`select count(*) as n from ${t}`).first<{ n: number }>();
+    expect(n!.n).toBe(0);
+  }
+  const pack = await env.DB.prepare("select manifest from packs where id = 'pack-a'").first<{ manifest: string | null }>();
+  expect(pack!.manifest).toBeNull();
+});

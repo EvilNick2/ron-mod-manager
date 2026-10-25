@@ -8,7 +8,7 @@ export interface User {
 }
 
 export const DAY = 86400;
-const IDLE_EXPIRY = 90 * DAY;
+export const IDLE_EXPIRY = 90 * DAY;
 
 export const nowSeconds = () => Math.floor(Date.now() / 1000);
 

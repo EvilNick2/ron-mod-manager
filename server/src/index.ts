@@ -1,3 +1,5 @@
+import { nowSeconds } from "./auth";
+import { cleanup } from "./cleanup";
 import type { Env } from "./env";
 import { HttpError, fail, json } from "./http";
 import {
@@ -83,5 +85,8 @@ export default {
       console.error(err);
       return fail(500, "internal", "Internal error");
     }
+  },
+  async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
+    await cleanup(env, nowSeconds());
   },
 } satisfies ExportedHandler<Env>;

@@ -270,23 +270,30 @@ export async function commitPublish(req: Request, env: Env, pid: string): Promis
     published_at: publishedAt,
   });
   const rows = JSON.stringify([...known].map(([h, size]) => ({ h, s: size })));
+  const live = "exists (select 1 from publishes where id = ?)";
   const stmts = [
     env.DB.prepare(
       `insert or ignore into blobs (sha256, size)
-       select json_extract(value, '$.h'), json_extract(value, '$.s') from json_each(?)`,
-    ).bind(rows),
-    env.DB.prepare("delete from pack_blobs where pack_id = ?").bind(publish.pack_id),
+       select json_extract(value, '$.h'), json_extract(value, '$.s') from json_each(?)
+       where ${live}`,
+    ).bind(rows, publish.id),
+    env.DB.prepare(`delete from pack_blobs where pack_id = ? and ${live}`).bind(
+      publish.pack_id,
+      publish.id,
+    ),
     env.DB.prepare(
       `insert into pack_blobs (pack_id, sha256)
-       select ?, json_extract(value, '$.h') from json_each(?)`,
-    ).bind(publish.pack_id, rows),
+       select ?, json_extract(value, '$.h') from json_each(?) where ${live}`,
+    ).bind(publish.pack_id, rows, publish.id),
     env.DB.prepare(
-      "update packs set manifest = ?, name = ?, version = ?, published_at = ? where id = ? and uploader_id = ?",
-    ).bind(stored, publish.name, publish.version, publishedAt, publish.pack_id, user.id),
+      `update packs set manifest = ?, name = ?, version = ?, published_at = ?
+       where id = ? and uploader_id = ? and ${live}`,
+    ).bind(stored, publish.name, publish.version, publishedAt, publish.pack_id, user.id, publish.id),
     env.DB.prepare("delete from publish_blobs where publish_id = ?").bind(publish.id),
     env.DB.prepare("delete from publishes where id = ?").bind(publish.id),
   ];
-  await env.DB.batch(stmts);
+  const results = await env.DB.batch(stmts);
+  if (results[results.length - 1].meta.changes !== 1) throw gone();
   return json({ ok: true });
 }
 
