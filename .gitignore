@@ -177,3 +177,5 @@ Cargo.lock
 test-config
 .idea
 .vscode
+# Pack server
+server/.wrangler/

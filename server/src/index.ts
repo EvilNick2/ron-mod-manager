@@ -1,0 +1,23 @@
+import type { Env } from "./env";
+import { HttpError, fail, json } from "./http";
+
+type Handler = (req: Request, env: Env, url: URL) => Promise<Response> | Response;
+
+const routes: Record<string, Handler> = {
+  "GET /health": () => json({ ok: true }),
+};
+
+export default {
+  async fetch(req: Request, env: Env): Promise<Response> {
+    const url = new URL(req.url);
+    const handler = routes[`${req.method} ${url.pathname}`];
+    if (!handler) return fail(404, "not_found", "No such route");
+    try {
+      return await handler(req, env, url);
+    } catch (err) {
+      if (err instanceof HttpError) return fail(err.status, err.code, err.message);
+      console.error(err);
+      return fail(500, "internal", "Internal error");
+    }
+  },
+} satisfies ExportedHandler<Env>;
