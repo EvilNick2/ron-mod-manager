@@ -6,6 +6,16 @@ import {
   invitePage,
   showInvite,
 } from "./invites";
+import {
+  leavePack,
+  listUsers,
+  listViewers,
+  packInvite,
+  removePack,
+  removeUser,
+  removeViewer,
+  resetPackInvite,
+} from "./manage";
 import { getBlob, getManifest, me } from "./packs";
 import {
   beginPublish,
@@ -26,9 +36,10 @@ const routes: Record<string, Handler> = {
   "POST /auth/logout": (req, env) => authLogout(req, env),
   "POST /invites/uploader": (req, env) => createUploaderInvite(req, env),
   "GET /me": (req, env) => me(req, env),
+  "GET /admin/users": (req, env) => listUsers(req, env),
 };
 
-type CodeHandler = (req: Request, env: Env, code: string) => Promise<Response> | Response;
+type CodeHandler = (req: Request, env: Env, ...params: string[]) => Promise<Response> | Response;
 
 const dynamicRoutes: { method: string; pattern: RegExp; handler: CodeHandler }[] = [
   { method: "GET", pattern: /^\/invites\/([^/]+)$/, handler: showInvite },
@@ -41,6 +52,13 @@ const dynamicRoutes: { method: string; pattern: RegExp; handler: CodeHandler }[]
   { method: "POST", pattern: /^\/publishes\/([^/]+)\/commit$/, handler: commitPublish },
   { method: "DELETE", pattern: /^\/publishes\/([^/]+)$/, handler: cancelPublish },
   { method: "GET", pattern: /^\/i\/([^/]+)$/, handler: (_req, env, code) => invitePage(env, code) },
+  { method: "POST", pattern: /^\/packs\/([^/]+)\/invite$/, handler: packInvite },
+  { method: "POST", pattern: /^\/packs\/([^/]+)\/invite\/reset$/, handler: resetPackInvite },
+  { method: "GET", pattern: /^\/packs\/([^/]+)\/viewers$/, handler: listViewers },
+  { method: "DELETE", pattern: /^\/packs\/([^/]+)\/viewers\/([^/]+)$/, handler: removeViewer },
+  { method: "DELETE", pattern: /^\/packs\/([^/]+)\/membership$/, handler: leavePack },
+  { method: "DELETE", pattern: /^\/packs\/([^/]+)$/, handler: removePack },
+  { method: "DELETE", pattern: /^\/admin\/users\/([^/]+)$/, handler: removeUser },
 ];
 
 export default {
@@ -51,7 +69,10 @@ export default {
     if (!handler) {
       for (const r of dynamicRoutes) {
         const m = r.method === req.method ? r.pattern.exec(url.pathname) : null;
-        if (m) dynamic = { run: () => r.handler(req, env, m[1]) };
+        if (m) {
+          dynamic = { run: () => r.handler(req, env, ...m.slice(1)) };
+          break;
+        }
       }
     }
     if (!handler && !dynamic) return fail(404, "not_found", "No such route");
