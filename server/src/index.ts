@@ -1,3 +1,4 @@
+import { requireUser } from "./auth";
 import type { Env } from "./env";
 import { HttpError, fail, json } from "./http";
 
@@ -5,6 +6,10 @@ type Handler = (req: Request, env: Env, url: URL) => Promise<Response> | Respons
 
 const routes: Record<string, Handler> = {
   "GET /health": () => json({ ok: true }),
+  "GET /me": async (req, env) => {
+    const user = await requireUser(req, env);
+    return json({ ...user, packs: [] });
+  },
 };
 
 export default {
@@ -15,7 +20,7 @@ export default {
     try {
       return await handler(req, env, url);
     } catch (err) {
-      if (err instanceof HttpError) return fail(err.status, err.code, err.message);
+      if (err instanceof HttpError) return fail(err.status, err.code, err.message, err.headers);
       console.error(err);
       return fail(500, "internal", "Internal error");
     }
