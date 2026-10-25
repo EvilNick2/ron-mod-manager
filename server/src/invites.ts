@@ -1,5 +1,5 @@
 import { DAY, nowSeconds, randomToken, requireUser, type User } from "./auth";
-import type { Env } from "./env";
+import { numberVar, type Env } from "./env";
 import { HttpError, json } from "./http";
 
 interface InviteRow {
@@ -61,7 +61,7 @@ async function requireRoom(env: Env, user: User): Promise<void> {
     .bind(user.id)
     .first();
   if (viewing) return;
-  if ((await peopleCount(env)) >= Number(env.MAX_USERS)) {
+  if ((await peopleCount(env)) >= numberVar(env, "MAX_USERS")) {
     throw new HttpError(403, "server_full", "This server has no room for more people");
   }
 }

@@ -7,6 +7,13 @@ import {
   invitePage,
   showInvite,
 } from "./invites";
+import {
+  beginPublish,
+  cancelPublish,
+  commitPublish,
+  publishUrls,
+  verifyPublish,
+} from "./publish";
 import { authCallback, authLogout, authStart, authToken } from "./signin";
 
 type Handler = (req: Request, env: Env, url: URL) => Promise<Response> | Response;
@@ -29,6 +36,11 @@ type CodeHandler = (req: Request, env: Env, code: string) => Promise<Response> |
 const dynamicRoutes: { method: string; pattern: RegExp; handler: CodeHandler }[] = [
   { method: "GET", pattern: /^\/invites\/([^/]+)$/, handler: showInvite },
   { method: "POST", pattern: /^\/invites\/([^/]+)\/accept$/, handler: acceptInviteRoute },
+  { method: "POST", pattern: /^\/packs\/([^/]+)\/publish\/begin$/, handler: beginPublish },
+  { method: "POST", pattern: /^\/publishes\/([^/]+)\/urls$/, handler: publishUrls },
+  { method: "POST", pattern: /^\/publishes\/([^/]+)\/verify$/, handler: verifyPublish },
+  { method: "POST", pattern: /^\/publishes\/([^/]+)\/commit$/, handler: commitPublish },
+  { method: "DELETE", pattern: /^\/publishes\/([^/]+)$/, handler: cancelPublish },
   { method: "GET", pattern: /^\/i\/([^/]+)$/, handler: (_req, env, code) => invitePage(env, code) },
 ];
 

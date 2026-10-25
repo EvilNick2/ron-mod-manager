@@ -9,6 +9,7 @@ export default defineConfig(async () => {
       cloudflareTest({
         wrangler: { configPath: "./wrangler.jsonc" },
         miniflare: {
+          r2Buckets: ["EXTRA_BUCKET"],
           bindings: {
             TEST_MIGRATIONS: migrations,
             DISCORD_CLIENT_SECRET: "test-discord-secret",
