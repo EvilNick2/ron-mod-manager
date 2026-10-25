@@ -7,10 +7,10 @@ export interface User {
   role: "owner" | "uploader" | null;
 }
 
-const DAY = 86400;
+export const DAY = 86400;
 const IDLE_EXPIRY = 90 * DAY;
 
-const nowSeconds = () => Math.floor(Date.now() / 1000);
+export const nowSeconds = () => Math.floor(Date.now() / 1000);
 
 export function randomToken(): string {
   const bytes = crypto.getRandomValues(new Uint8Array(32));

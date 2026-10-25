@@ -1,11 +1,16 @@
 import { requireUser } from "./auth";
 import type { Env } from "./env";
 import { HttpError, fail, json } from "./http";
+import { authCallback, authLogout, authStart, authToken } from "./signin";
 
 type Handler = (req: Request, env: Env, url: URL) => Promise<Response> | Response;
 
 const routes: Record<string, Handler> = {
   "GET /health": () => json({ ok: true }),
+  "GET /auth/start": (_req, env, url) => authStart(env, url),
+  "GET /auth/callback": (_req, env, url) => authCallback(env, url),
+  "POST /auth/token": (req, env) => authToken(req, env),
+  "POST /auth/logout": (req, env) => authLogout(req, env),
   "GET /me": async (req, env) => {
     const user = await requireUser(req, env);
     return json({ ...user, packs: [] });
