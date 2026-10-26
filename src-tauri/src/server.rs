@@ -48,9 +48,32 @@ impl fmt::Display for ServerError {
     }
 }
 
+/// The host of `base`, with its port when that is not the scheme's default
+fn host_of(base: &str) -> String {
+    let Ok(url) = reqwest::Url::parse(base) else { return base.to_string() };
+    match (url.host_str(), url.port()) {
+        (Some(host), Some(port)) => format!("{}:{}", host, port),
+        (Some(host), None) => host.to_string(),
+        (None, _) => base.to_string(),
+    }
+}
+
+/// One URL path segment, with everything but unreserved characters percent-encoded
+fn seg(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{:02X}", b));
+        }
+    }
+    out
+}
+
 pub fn describe(code: &str, message: &str, base: &str) -> String {
-    let host = base.trim_start_matches("https://");
-    let host = if host.is_empty() { "the pack server" } else { host };
+    let host = host_of(base);
+    let host = if host.is_empty() { "the pack server" } else { host.as_str() };
     match code {
         "signed_out" => format!("Signed out of {}. Sign in again in Settings.", host),
         "unavailable" => "The pack server is not answering. Its daily limit may be reached, try again after 00:00 UTC.".into(),
@@ -228,8 +251,9 @@ pub trait PackServer: Send + Sync {
     fn upload_urls(&self, publish_id: &str, hashes: &[String]) -> Result<BTreeMap<String, String>, ServerError>;
     fn put_blob(&self, url: &str, src: &Path, size: u64, sha256: &str, on_bytes: &mut dyn FnMut(u64)) -> Result<(), ServerError>;
     fn verify(&self, publish_id: &str, hashes: &[String]) -> Result<Verified, ServerError>;
-    /// `history` is oldest first and only seeds a pack that has no versions yet
-    fn commit(&self, publish_id: &str, manifest: &RemoteManifest, notes: &str, history: &[VersionEntry]) -> Result<(), ServerError>;
+    /// `history` is oldest first and only seeds a pack that has no versions yet. Gives the time the
+    /// server stored, None from a server too old to send it.
+    fn commit(&self, publish_id: &str, manifest: &RemoteManifest, notes: &str, history: &[VersionEntry]) -> Result<Option<u64>, ServerError>;
     /// Newest first
     fn changelog(&self, pack_id: &str) -> Result<Vec<VersionEntry>, ServerError>;
     fn cancel(&self, publish_id: &str) -> Result<(), ServerError>;
@@ -449,15 +473,15 @@ impl PackServer for HttpServer {
     }
 
     fn invite_info(&self, code: &str) -> Result<InviteInfo, ServerError> {
-        self.get(&format!("/invites/{}", code))
+        self.get(&format!("/invites/{}", seg(code)))
     }
 
     fn accept_invite(&self, code: &str) -> Result<Accepted, ServerError> {
-        self.post(&format!("/invites/{}/accept", code), json!({}))
+        self.post(&format!("/invites/{}/accept", seg(code)), json!({}))
     }
 
     fn manifest(&self, pack_id: &str) -> Result<RemoteManifest, ServerError> {
-        self.get(&format!("/packs/{}/manifest", pack_id))
+        self.get(&format!("/packs/{}/manifest", seg(pack_id)))
     }
 
     fn download(
@@ -468,7 +492,7 @@ impl PackServer for HttpServer {
         cancel: &dyn Fn() -> bool,
         on_bytes: &mut dyn FnMut(u64),
     ) -> Result<String, ServerError> {
-        let path = format!("/blobs/{}", sha256);
+        let path = format!("/blobs/{}", seg(sha256));
         let mut resp = self.get_blob(&path, 0, cancel)?;
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent).map_err(|e| io_error(format!("Could not create {}: {}", parent.display(), e)))?;
@@ -532,7 +556,7 @@ impl PackServer for HttpServer {
     fn begin(&self, pack_id: &str, name: &str, version: &str, blobs: &[(String, u64)]) -> Result<Begun, ServerError> {
         let blobs: Vec<_> = blobs.iter().map(|(sha256, size)| json!({ "sha256": sha256, "size": size })).collect();
         self.post(
-            &format!("/packs/{}/publish/begin", pack_id),
+            &format!("/packs/{}/publish/begin", seg(pack_id)),
             json!({ "name": name, "version": version, "blobs": blobs }),
         )
     }
@@ -542,7 +566,7 @@ impl PackServer for HttpServer {
         struct Urls {
             urls: BTreeMap<String, String>,
         }
-        let got: Urls = self.post(&format!("/publishes/{}/urls", publish_id), json!({ "blobs": hashes }))?;
+        let got: Urls = self.post(&format!("/publishes/{}/urls", seg(publish_id)), json!({ "blobs": hashes }))?;
         Ok(got.urls)
     }
 
@@ -577,15 +601,20 @@ impl PackServer for HttpServer {
     }
 
     fn verify(&self, publish_id: &str, hashes: &[String]) -> Result<Verified, ServerError> {
-        self.post(&format!("/publishes/{}/verify", publish_id), json!({ "blobs": hashes }))
+        self.post(&format!("/publishes/{}/verify", seg(publish_id)), json!({ "blobs": hashes }))
     }
 
-    fn commit(&self, publish_id: &str, manifest: &RemoteManifest, notes: &str, history: &[VersionEntry]) -> Result<(), ServerError> {
-        let _: serde_json::Value = self.post(
-            &format!("/publishes/{}/commit", publish_id),
+    fn commit(&self, publish_id: &str, manifest: &RemoteManifest, notes: &str, history: &[VersionEntry]) -> Result<Option<u64>, ServerError> {
+        #[derive(Deserialize)]
+        struct Committed {
+            #[serde(default)]
+            published_at: Option<u64>,
+        }
+        let got: Committed = self.post(
+            &format!("/publishes/{}/commit", seg(publish_id)),
             json!({ "manifest": manifest, "notes": notes, "history": history }),
         )?;
-        Ok(())
+        Ok(got.published_at)
     }
 
     fn changelog(&self, pack_id: &str) -> Result<Vec<VersionEntry>, ServerError> {
@@ -593,36 +622,36 @@ impl PackServer for HttpServer {
         struct Changelog {
             versions: Vec<VersionEntry>,
         }
-        let got: Changelog = self.get(&format!("/packs/{}/changelog", pack_id))?;
+        let got: Changelog = self.get(&format!("/packs/{}/changelog", seg(pack_id)))?;
         Ok(got.versions)
     }
 
     fn cancel(&self, publish_id: &str) -> Result<(), ServerError> {
-        self.delete(&format!("/publishes/{}", publish_id)).map(|_| ())
+        self.delete(&format!("/publishes/{}", seg(publish_id))).map(|_| ())
     }
 
     fn pack_invite(&self, pack_id: &str) -> Result<Link, ServerError> {
-        self.post(&format!("/packs/{}/invite", pack_id), json!({}))
+        self.post(&format!("/packs/{}/invite", seg(pack_id)), json!({}))
     }
 
     fn reset_invite(&self, pack_id: &str) -> Result<Link, ServerError> {
-        self.post(&format!("/packs/{}/invite/reset", pack_id), json!({}))
+        self.post(&format!("/packs/{}/invite/reset", seg(pack_id)), json!({}))
     }
 
     fn viewers(&self, pack_id: &str) -> Result<Vec<Viewer>, ServerError> {
-        self.get(&format!("/packs/{}/viewers", pack_id))
+        self.get(&format!("/packs/{}/viewers", seg(pack_id)))
     }
 
     fn remove_viewer(&self, pack_id: &str, user_id: &str) -> Result<RemovedViewer, ServerError> {
-        self.call(self.request(Method::DELETE, &format!("/packs/{}/viewers/{}", pack_id, user_id)))
+        self.call(self.request(Method::DELETE, &format!("/packs/{}/viewers/{}", seg(pack_id), seg(user_id))))
     }
 
     fn leave(&self, pack_id: &str) -> Result<(), ServerError> {
-        self.delete(&format!("/packs/{}/membership", pack_id)).map(|_| ())
+        self.delete(&format!("/packs/{}/membership", seg(pack_id))).map(|_| ())
     }
 
     fn delete_pack(&self, pack_id: &str) -> Result<(), ServerError> {
-        self.delete(&format!("/packs/{}", pack_id)).map(|_| ())
+        self.delete(&format!("/packs/{}", seg(pack_id))).map(|_| ())
     }
 
     fn uploader_invite(&self) -> Result<Link, ServerError> {
@@ -634,7 +663,7 @@ impl PackServer for HttpServer {
     }
 
     fn remove_user(&self, user_id: &str) -> Result<(), ServerError> {
-        self.delete(&format!("/admin/users/{}", user_id)).map(|_| ())
+        self.delete(&format!("/admin/users/{}", seg(user_id))).map(|_| ())
     }
 }
 
@@ -653,6 +682,8 @@ pub mod fake {
     const MAX_HISTORY: usize = 99;
     const MAX_HISTORY_BYTES: usize = 1000000;
     const KEEP_VERSIONS: usize = 100;
+    const MAX_VERSION: usize = 200;
+    const URL_LIFETIME: u64 = 300;
 
     struct Pack {
         uploader: String,
@@ -695,13 +726,17 @@ pub mod fake {
         /// The blobs table, what a commit made known
         stored: BTreeSet<String>,
         next: u64,
+        /// Seconds, moved by advance_clock and by one on each commit
         clock: u64,
+        max_users: Option<usize>,
         expired: bool,
         daily_cap: usize,
         rate_limited: usize,
         changelog_fails: usize,
         corrupt: BTreeSet<String>,
         replace: Option<(usize, RemoteManifest)>,
+        manifest_answers: BTreeMap<String, RemoteManifest>,
+        omit_published_at: bool,
         cancel_hook: Option<(usize, Box<dyn Fn() + Send>)>,
         fail_puts_at: Option<usize>,
         expire_commit: bool,
@@ -789,8 +824,26 @@ pub mod fake {
         fn live_invite(&self, code: &str) -> Result<&Invite, ServerError> {
             self.invites
                 .iter()
-                .find(|i| i.code == code && !i.used)
+                .find(|i| i.code == code && !i.used && i.expires_at > self.clock)
                 .ok_or_else(|| err("invite_gone", "This invite is no longer valid"))
+        }
+
+        /// People counted against the server's limit, as the server's peopleCount
+        fn people(&self) -> usize {
+            self.users
+                .values()
+                .filter(|u| u.role.is_some() || self.packs.values().any(|p| p.viewers.contains(&u.id)))
+                .count()
+        }
+
+        fn require_room(&self, user: &str) -> Result<(), ServerError> {
+            if self.role(user).is_some() || self.packs.values().any(|p| p.viewers.contains(user)) {
+                return Ok(());
+            }
+            if self.max_users.is_some_and(|max| self.people() >= max) {
+                return Err(err("server_full", "This server has no room for more people"));
+            }
+            Ok(())
         }
 
         fn drop_pack(&mut self, pack_id: &str) {
@@ -800,7 +853,7 @@ pub mod fake {
         }
 
         /// The commit statements, shared with the seeding knobs
-        fn record(&mut self, pack_id: &str, manifest: &RemoteManifest, name: &str, version: &str, notes: &str, history: &[VersionEntry]) {
+        fn record(&mut self, pack_id: &str, manifest: &RemoteManifest, name: &str, version: &str, notes: &str, history: &[VersionEntry]) -> u64 {
             self.clock += 1;
             let at = self.clock;
             let hashes: BTreeSet<String> =
@@ -821,6 +874,7 @@ pub mod fake {
             pack.versions.push(VersionEntry { version: version.to_string(), published_at: at, notes: notes.to_string() });
             let extra = pack.versions.len().saturating_sub(KEEP_VERSIONS);
             pack.versions.drain(..extra);
+            at
         }
     }
 
@@ -892,6 +946,16 @@ pub mod fake {
             self.lock().packs.contains_key(pack_id)
         }
 
+        /// Moves the server clock, so invites and upload URLs expire
+        pub fn advance_clock(&self, secs: u64) {
+            self.lock().clock += secs;
+        }
+
+        /// Accepting an invite answers server_full once this many people are on the server
+        pub fn set_max_users(&self, n: usize) {
+            self.lock().max_users = Some(n);
+        }
+
         /// Every call answers signed_out from now on
         pub fn expire_session(&self) {
             self.lock().expired = true;
@@ -915,6 +979,16 @@ pub mod fake {
         /// The next download of `sha256` arrives with its first byte flipped, as a transfer that went bad
         pub fn corrupt_next(&self, sha256: &str) {
             self.lock().corrupt.insert(sha256.to_string());
+        }
+
+        /// Commits answer without published_at from now on, as a server from before that field
+        pub fn omit_published_at(&self) {
+            self.lock().omit_published_at = true;
+        }
+
+        /// The next manifest call for `pack_id` answers `manifest` as it is, as a server that sends the wrong pack
+        pub fn answer_manifest_with(&self, pack_id: &str, manifest: RemoteManifest) {
+            self.lock().manifest_answers.insert(pack_id.to_string(), manifest);
         }
 
         /// Once n more downloads have finished, commits `manifest` as the pack's new version, so blobs
@@ -1058,6 +1132,12 @@ pub mod fake {
                 let invite = st.live_invite(code)?;
                 (invite.kind.clone(), invite.pack_id.clone())
             };
+            if let Some(id) = &pack_id {
+                if !st.packs.contains_key(id) {
+                    return Err(err("invite_gone", "This invite is no longer valid"));
+                }
+            }
+            st.require_room(&self.user)?;
             let role = st.role(&self.user);
             match pack_id {
                 None => {
@@ -1080,9 +1160,12 @@ pub mod fake {
         }
 
         fn manifest(&self, pack_id: &str) -> Result<RemoteManifest, ServerError> {
-            let st = self.gate()?;
+            let mut st = self.gate()?;
             if !st.visible(pack_id, &self.user) {
                 return Err(pack_gone());
+            }
+            if let Some(answer) = st.manifest_answers.remove(pack_id) {
+                return Ok(answer);
             }
             Ok(st.packs[pack_id].manifest.clone().expect("visible packs have a manifest"))
         }
@@ -1209,7 +1292,9 @@ pub mod fake {
             if hashes.iter().any(|h| st.stored.contains(h)) {
                 return Err(err("already_stored", "A blob is already stored, verify it instead"));
             }
-            Ok(hashes.iter().map(|h| (h.clone(), format!("fake://{}/{}", publish_id, h))).collect())
+            // Like a presigned URL, it names the blob, its size and its expiry, not the publish
+            let expires = st.clock + URL_LIFETIME;
+            Ok(hashes.iter().map(|h| (h.clone(), format!("fake://blobs/{}?size={}&expires={}", h, publish.blobs[h], expires))).collect())
         }
 
         fn put_blob(&self, url: &str, src: &Path, size: u64, sha256: &str, on_bytes: &mut dyn FnMut(u64)) -> Result<(), ServerError> {
@@ -1219,11 +1304,14 @@ pub mod fake {
                 st.fail_puts_at = None;
                 return Err(unavailable("Could not upload to the pack server: connection reset"));
             }
-            let target = url.strip_prefix("fake://").and_then(|rest| rest.split_once('/'));
-            let declared = target.and_then(|(pid, sha)| st.publishes.get(pid).and_then(|p| p.blobs.get(sha).map(|s| (sha, *s))));
-            let (sha, declared_size) = match declared {
-                Some(d) => d,
-                None => return Err(upload_refused(403, "<Error><Code>AccessDenied</Code></Error>")),
+            let signed = url.strip_prefix("fake://blobs/").and_then(|rest| {
+                let (sha, query) = rest.split_once("?size=")?;
+                let (size, expires) = query.split_once("&expires=")?;
+                Some((sha, size.parse::<u64>().ok()?, expires.parse::<u64>().ok()?))
+            });
+            let (sha, declared_size) = match signed {
+                Some((sha, size, expires)) if st.clock < expires => (sha, size),
+                _ => return Err(upload_refused(403, "<Error><Code>AccessDenied</Code></Error>")),
             };
             if declared_size != size || bytes.len() as u64 != size {
                 return Err(upload_refused(400, "<Error><Code>IncompleteBody</Code></Error>"));
@@ -1270,7 +1358,7 @@ pub mod fake {
             Ok(out)
         }
 
-        fn commit(&self, publish_id: &str, manifest: &RemoteManifest, notes: &str, history: &[VersionEntry]) -> Result<(), ServerError> {
+        fn commit(&self, publish_id: &str, manifest: &RemoteManifest, notes: &str, history: &[VersionEntry]) -> Result<Option<u64>, ServerError> {
             let mut st = self.gate()?;
             st.uploader(&self.user)?;
             st.own_publish(publish_id, &self.user)?;
@@ -1285,7 +1373,8 @@ pub mod fake {
                 }
             }
             let history_bytes = serde_json::to_vec(history).map(|v| v.len()).unwrap_or(usize::MAX);
-            if notes.encode_utf16().count() > MAX_NOTES || history.len() > MAX_HISTORY || history_bytes > MAX_HISTORY_BYTES {
+            let long_version = history.iter().any(|e| e.version.encode_utf16().count() > MAX_VERSION);
+            if notes.encode_utf16().count() > MAX_NOTES || history.len() > MAX_HISTORY || history_bytes > MAX_HISTORY_BYTES || long_version {
                 return Err(err("bad_changelog", "The changelog is too large"));
             }
             let publish = &st.publishes[publish_id];
@@ -1306,8 +1395,8 @@ pub mod fake {
                 return Err(err("pack_taken", "Another uploader owns this pack id"));
             }
             let publish = st.publishes.remove(publish_id).expect("checked above");
-            st.record(&publish.pack_id, manifest, &publish.name, &publish.version, notes, history);
-            Ok(())
+            let at = st.record(&publish.pack_id, manifest, &publish.name, &publish.version, notes, history);
+            Ok(if st.omit_published_at { None } else { Some(at) })
         }
 
         fn changelog(&self, pack_id: &str) -> Result<Vec<VersionEntry>, ServerError> {
@@ -1336,7 +1425,7 @@ pub mod fake {
             let live = st
                 .invites
                 .iter()
-                .filter(|i| i.kind == "viewer" && i.pack_id.as_deref() == Some(pack_id) && !i.used)
+                .filter(|i| i.kind == "viewer" && i.pack_id.as_deref() == Some(pack_id) && !i.used && i.expires_at > st.clock)
                 .max_by_key(|i| i.expires_at)
                 .map(|i| (i.code.clone(), i.expires_at));
             Ok(match live {
@@ -1572,6 +1661,99 @@ mod tests {
     }
 
     #[test]
+    fn describe_names_host_and_port_from_the_parsed_base() {
+        let out = |base: &str| describe("signed_out", "", base);
+        assert_eq!(out("http://127.0.0.1:8787"), "Signed out of 127.0.0.1:8787. Sign in again in Settings.");
+        assert_eq!(out("https://packs.test:8443"), "Signed out of packs.test:8443. Sign in again in Settings.");
+        assert_eq!(out("https://packs.test:443"), "Signed out of packs.test. Sign in again in Settings.");
+        assert_eq!(out(""), "Signed out of the pack server. Sign in again in Settings.");
+    }
+
+    #[test]
+    fn path_segments_are_percent_encoded() {
+        let (base, req) = stub(reply("200 OK\r\nContent-Type: application/json", r#"{"versions":[]}"#));
+        HttpServer::new(&base, None).changelog("a b/c?d#e%").unwrap();
+        assert!(req.join().unwrap().starts_with("GET /packs/a%20b%2Fc%3Fd%23e%25/changelog "));
+
+        let (base, req) = stub(reply("200 OK\r\nContent-Type: application/json", r#"{"invite_reset":false}"#));
+        HttpServer::new(&base, None).remove_viewer("p-1", "u/1").unwrap();
+        assert!(req.join().unwrap().starts_with("DELETE /packs/p-1/viewers/u%2F1 "));
+    }
+
+    #[test]
+    fn commit_reads_published_at_when_the_server_sends_it() {
+        let m = manifest("pack-a", "1.0", &[]);
+        let (base, req) = stub(reply("200 OK\r\nContent-Type: application/json", r#"{"ok":true,"published_at":1234}"#));
+        assert_eq!(HttpServer::new(&base, None).commit("pub/1", &m, "", &[]).unwrap(), Some(1234));
+        assert!(req.join().unwrap().starts_with("POST /publishes/pub%2F1/commit "));
+
+        let (base, req) = stub(reply("200 OK\r\nContent-Type: application/json", r#"{"ok":true}"#));
+        assert_eq!(HttpServer::new(&base, None).commit("p", &m, "", &[]).unwrap(), None);
+        req.join().unwrap();
+    }
+
+    /// Answers one connection per reply in turn and hands back each raw request head
+    fn stub_seq(replies: Vec<&'static [u8]>) -> (String, JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let mut heads = Vec::new();
+            for reply in replies {
+                let (mut sock, _) = listener.accept().unwrap();
+                let mut got = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !String::from_utf8_lossy(&got).contains("\r\n\r\n") {
+                    let n = sock.read(&mut buf).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    got.extend_from_slice(&buf[..n]);
+                }
+                sock.write_all(reply).unwrap();
+                heads.push(String::from_utf8_lossy(&got).to_ascii_lowercase());
+            }
+            heads
+        });
+        (base, handle)
+    }
+
+    #[test]
+    fn http_download_resumes_after_a_dropped_connection() {
+        let dir = scratch("server-resume");
+        // The first answer promises ten bytes and the connection closes after five
+        let (base, req) = stub_seq(vec![
+            b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nhello",
+            reply("206 Partial Content\r\nContent-Range: bytes 5-9/10", "world"),
+        ]);
+        let dest = dir.join("blob.part");
+        let mut seen = 0;
+        let sha = HttpServer::new(&base, None).download("ab", &dest, 10, &|| false, &mut |n| seen += n).unwrap();
+        let heads = req.join().unwrap();
+        assert_eq!(heads.len(), 2);
+        assert!(!heads[0].contains("range:"));
+        assert!(heads[1].starts_with("get /blobs/ab ") && heads[1].contains("range: bytes=5-\r\n"));
+        assert_eq!(std::fs::read(&dest).unwrap(), b"helloworld");
+        assert_eq!(sha, crate::hashing::sha256_bytes(b"helloworld"));
+        assert_eq!(seen, 10);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn http_download_restarts_when_the_server_ignores_the_range() {
+        let dir = scratch("server-restart");
+        let (base, req) = stub_seq(vec![
+            b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nhello",
+            reply("200 OK", "helloworld"),
+        ]);
+        let dest = dir.join("blob.part");
+        let sha = HttpServer::new(&base, None).download("ab", &dest, 10, &|| false, &mut |_| {}).unwrap();
+        assert_eq!(req.join().unwrap().len(), 2);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"helloworld");
+        assert_eq!(sha, crate::hashing::sha256_bytes(b"helloworld"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn non_json_error_is_unavailable() {
         let (base, req) = stub(reply("503 Service Unavailable\r\nContent-Type: text/html", "<html></html>"));
         let err = HttpServer::new(&base, Some("t".into())).me().unwrap_err();
@@ -1790,10 +1972,12 @@ mod tests {
         other.mods[0].files[0].size = 9;
         assert_eq!(up.commit(&begun.publish_id, &other, "", &[]).unwrap_err().code, "bad_manifest");
         assert_eq!(up.commit(&begun.publish_id, &m, &"x".repeat(32001), &[]).unwrap_err().code, "bad_changelog");
+        let long = VersionEntry { version: "v".repeat(201), published_at: 1, notes: String::new() };
+        assert_eq!(up.commit(&begun.publish_id, &m, "", &[long]).unwrap_err().code, "bad_changelog");
 
         let sha = &begun.missing[0];
         let url = &up.upload_urls(&begun.publish_id, &begun.missing).unwrap()[sha];
-        assert_eq!(url, &format!("fake://{}/{}", begun.publish_id, sha));
+        assert!(url.starts_with(&format!("fake://blobs/{}?", sha)));
         let src = dir.join("src");
         std::fs::write(&src, b"datx").unwrap();
         assert_eq!(up.put_blob(url, &src, 4, sha, &mut |_| {}).unwrap_err().code, "upload_refused");
@@ -1870,6 +2054,84 @@ mod tests {
         owner.expire_session();
         assert_eq!(owner.me().unwrap_err().to_string(), "Signed out of the pack server. Sign in again in Settings.");
         assert_eq!(owner.me().unwrap_err().text(owner.base()), "Signed out of packs.test. Sign in again in Settings.");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fake_invites_expire_after_a_day() {
+        let owner = FakeServer::new();
+        owner.seed_pack(OWNER, &manifest("pack-g", "1.0", &[]), "");
+        let viewer = owner.add_user("v1", "Viewer", None);
+        let first = owner.pack_invite("pack-g").unwrap();
+        let (_, code) = parse_invite(&first.url).unwrap();
+        owner.advance_clock(86399);
+        viewer.invite_info(&code).unwrap();
+        owner.advance_clock(1);
+        assert_eq!(viewer.invite_info(&code).unwrap_err().code, "invite_gone");
+        assert_eq!(viewer.accept_invite(&code).unwrap_err().code, "invite_gone");
+        let second = owner.pack_invite("pack-g").unwrap();
+        assert_ne!(second.url, first.url);
+        let (_, code) = parse_invite(&owner.uploader_invite().unwrap().url).unwrap();
+        owner.advance_clock(86400);
+        assert_eq!(viewer.accept_invite(&code).unwrap_err().code, "invite_gone");
+    }
+
+    #[test]
+    fn fake_accept_answers_server_full() {
+        let owner = FakeServer::new();
+        owner.seed_pack(OWNER, &manifest("pack-h", "1.0", &[]), "");
+        owner.seed_pack(OWNER, &manifest("pack-i", "1.0", &[]), "");
+        let up = owner.add_user("u1", "Uploader", Some("uploader"));
+        let viewer = owner.add_user("v1", "Viewer", None);
+        let fresh = owner.add_user("n1", "Newbie", None);
+        let code = |pack: &str| parse_invite(&owner.pack_invite(pack).unwrap().url).unwrap().1;
+        viewer.accept_invite(&code("pack-h")).unwrap();
+        // Owner, uploader and viewer fill a server of three
+        owner.set_max_users(3);
+        assert_eq!(fresh.accept_invite(&code("pack-h")).unwrap_err().code, "server_full");
+        let (_, upload) = parse_invite(&owner.uploader_invite().unwrap().url).unwrap();
+        assert_eq!(fresh.accept_invite(&upload).unwrap_err().code, "server_full");
+        // People already counted still get in
+        viewer.accept_invite(&code("pack-i")).unwrap();
+        up.accept_invite(&code("pack-i")).unwrap();
+        owner.set_max_users(4);
+        fresh.accept_invite(&code("pack-h")).unwrap();
+    }
+
+    #[test]
+    fn fake_upload_url_outlives_its_publish() {
+        let dir = scratch("fake-url");
+        let owner = FakeServer::new();
+        let up = owner.add_user("u1", "Uploader", Some("uploader"));
+        let m = manifest("pack-j", "1.0", &[b"data"]);
+        let src = dir.join("src");
+        std::fs::write(&src, b"data").unwrap();
+        let sha = crate::hashing::sha256_bytes(b"data");
+
+        let begun = up.begin("pack-j", "Pack", "1.0", &blobs_of(&m)).unwrap();
+        let url = up.upload_urls(&begun.publish_id, &begun.missing).unwrap()[&sha].clone();
+        up.cancel(&begun.publish_id).unwrap();
+        up.put_blob(&url, &src, 4, &sha, &mut |_| {}).unwrap();
+        assert_eq!(up.blob(&sha).unwrap(), b"data");
+
+        let begun = up.begin("pack-j", "Pack", "1.0", &blobs_of(&m)).unwrap();
+        let url = up.upload_urls(&begun.publish_id, &begun.missing).unwrap()[&sha].clone();
+        owner.advance_clock(300);
+        let e = up.put_blob(&url, &src, 4, &sha, &mut |_| {}).unwrap_err();
+        assert_eq!((e.code.as_str(), e.message.as_str()), ("upload_refused", "403 AccessDenied"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fake_commit_answers_published_at() {
+        let dir = scratch("fake-published-at");
+        let owner = FakeServer::new();
+        let up = owner.add_user("u1", "Uploader", Some("uploader"));
+        let m = manifest("pack-k", "1.0", &[]);
+        let begun = up.begin("pack-k", "Pack", "1.0", &[]).unwrap();
+        let at = up.commit(&begun.publish_id, &m, "", &[]).unwrap();
+        assert_eq!(at, Some(up.changelog("pack-k").unwrap()[0].published_at));
+        assert_eq!(at, Some(up.manifest("pack-k").unwrap().published_at));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

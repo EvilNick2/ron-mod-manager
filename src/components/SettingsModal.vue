@@ -91,8 +91,7 @@ async function saveGameConfig() {
 async function signIn(base: string) {
   serverBusy.value[base] = "in";
   try {
-    await signInServer(base);
-    checkPackUpdates();
+    if (await signInServer(base)) checkPackUpdates();
   } catch (e) {
     console.error("Pack server sign-in failed:", e);
     await showAlert("Failed to sign in: " + e);

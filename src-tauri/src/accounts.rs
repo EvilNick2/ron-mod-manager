@@ -2,7 +2,9 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -20,6 +22,8 @@ const SERVERS_FILE: &str = "servers.json";
 const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(300);
 const KEYRING_SERVICE: &str = "ron-mod-manager";
 const BAD_BASE: &str = "Enter a server address like https://packs.example.com";
+/// The error a sign-in stopped by the user ends with, which the UI does not alert
+pub const SIGN_IN_CANCELLED: &str = "Sign-in was cancelled";
 
 static CONFIG_DIR: OnceLock<PathBuf> = OnceLock::new();
 
@@ -62,32 +66,41 @@ fn servers_in(dir: &Path) -> Vec<String> {
     out
 }
 
-fn write_servers(dir: &Path, list: &[String]) {
-    if let Ok(json) = serde_json::to_string_pretty(list) {
-        let _ = fs::create_dir_all(dir);
-        let _ = fs::write(dir.join(SERVERS_FILE), json);
+// Written to a temp file and renamed over the old one, so a failed write never leaves half a list
+fn write_servers(dir: &Path, list: &[String]) -> Result<(), String> {
+    let path = dir.join(SERVERS_FILE);
+    let fail = |e: std::io::Error| format!("Could not save {}: {}", path.display(), e);
+    let json = serde_json::to_string_pretty(list).map_err(|e| e.to_string())?;
+    fs::create_dir_all(dir).map_err(fail)?;
+    let temp = dir.join(format!(".{}.{}.tmp", SERVERS_FILE, uuid::Uuid::new_v4().simple()));
+    let written = fs::write(&temp, json).and_then(|_| fs::rename(&temp, &path));
+    if let Err(e) = written {
+        let _ = fs::remove_file(&temp);
+        return Err(fail(e));
     }
+    Ok(())
 }
 
-fn remember_server_in(dir: &Path, base: &str) {
+fn remember_server_in(dir: &Path, base: &str) -> Result<(), String> {
     let mut list = servers_in(dir);
-    if !list.iter().any(|b| b == base) {
-        list.push(base.to_string());
-        write_servers(dir, &list);
+    if list.iter().any(|b| b == base) {
+        return Ok(());
     }
+    list.push(base.to_string());
+    write_servers(dir, &list)
 }
 
-fn forget_server_in(dir: &Path, base: &str) {
+fn forget_server_in(dir: &Path, base: &str) -> Result<(), String> {
     if base == DEFAULT_SERVER {
-        return;
+        return Ok(());
     }
     let mut list = servers_in(dir);
     list.retain(|b| b != base);
-    write_servers(dir, &list);
+    write_servers(dir, &list)
 }
 
 // Servers that installed or published packs use, so a signed out one keeps its Settings row
-fn pack_servers(mods_dir: &Path) -> Vec<String> {
+pub(crate) fn pack_servers(mods_dir: &Path) -> Vec<String> {
     let mut out: Vec<String> = crate::vfs::child_dirs(mods_dir)
         .unwrap_or_default()
         .into_iter()
@@ -117,15 +130,19 @@ pub fn servers(mods_dir: Option<&Path>) -> Vec<String> {
     }
 }
 
+/// Logs a failure, since its callers have already done what the user asked
 pub fn remember_server(base: &str) {
     if let Some(dir) = CONFIG_DIR.get() {
-        remember_server_in(dir, base);
+        if let Err(e) = remember_server_in(dir, base) {
+            eprintln!("[ACCOUNTS] Could not remember {}: {}", base, e);
+        }
     }
 }
 
-pub fn forget_server(base: &str) {
-    if let Some(dir) = CONFIG_DIR.get() {
-        forget_server_in(dir, base);
+pub fn forget_server(base: &str) -> Result<(), String> {
+    match CONFIG_DIR.get() {
+        Some(dir) => forget_server_in(dir, base),
+        None => Ok(()),
     }
 }
 
@@ -199,8 +216,9 @@ fn clear_session_in(store: &dyn SessionStore, base: &str) {
     store.clear(base);
 }
 
-fn check_in<T>(store: &dyn SessionStore, base: &str, r: Result<T, ServerError>) -> Result<T, ServerError> {
-    if matches!(&r, Err(e) if e.code == "signed_out") {
+// Clears the session on signed_out, unless it was replaced by a sign-in after `token` was read
+fn check_in<T>(store: &dyn SessionStore, base: &str, token: Option<&str>, r: Result<T, ServerError>) -> Result<T, ServerError> {
+    if matches!(&r, Err(e) if e.code == "signed_out") && session_in(store, base).map(|s| s.token).as_deref() == token {
         clear_session_in(store, base);
     }
     r
@@ -230,16 +248,20 @@ pub fn client(base: &str) -> HttpServer {
 pub struct Conn {
     server: Box<dyn PackServer>,
     store: Arc<dyn SessionStore>,
+    /// The session token when the Conn was made, so a later sign-in is not overwritten
+    token: Option<String>,
 }
 
 impl Conn {
     pub fn live(base: &str) -> Conn {
-        Conn { server: Box::new(client(base)), store: Arc::new(KeyringStore) }
+        let token = token(base);
+        Conn { server: Box::new(HttpServer::new(base, token.clone())), store: Arc::new(KeyringStore), token }
     }
 
     #[cfg(test)]
     pub fn new(server: impl PackServer + 'static, store: Arc<dyn SessionStore>) -> Conn {
-        Conn { server: Box::new(server), store }
+        let token = session_in(&*store, server.base()).map(|s| s.token);
+        Conn { server: Box::new(server), store, token }
     }
 
     pub fn server(&self) -> &dyn PackServer {
@@ -255,12 +277,16 @@ impl Conn {
     }
 
     pub fn call<T>(&self, r: Result<T, ServerError>) -> Result<T, ServerError> {
-        check_in(&*self.store, self.base(), r)
+        check_in(&*self.store, self.base(), self.token.as_deref(), r)
     }
 
-    /// Saves the user `me` names over the stored one, keeping the token, so role changes reach the app
+    /// Saves the user `me` names over the stored one, keeping the token, so role changes reach the app.
+    /// Skipped when the stored session is not the one this Conn was made with.
     pub fn update_user(&self, me: &Me) {
         let Some(mut session) = session_in(&*self.store, self.base()) else { return };
+        if self.token.as_deref() != Some(session.token.as_str()) {
+            return;
+        }
         let user = User { id: me.id.clone(), name: me.name.clone(), role: me.role.clone() };
         if session.user == user {
             return;
@@ -324,9 +350,12 @@ fn respond(stream: &mut std::net::TcpStream, status: &str, content_type: &str, b
     let _ = stream.write_all(msg.as_bytes());
 }
 
-pub fn wait_for_code(listener: &TcpListener, state: &str) -> Result<String, String> {
+pub fn wait_for_code(listener: &TcpListener, state: &str, cancel: &dyn Fn() -> bool) -> Result<String, String> {
     let deadline = Instant::now() + SIGN_IN_TIMEOUT;
     loop {
+        if cancel() {
+            return Err(SIGN_IN_CANCELLED.to_string());
+        }
         if Instant::now() >= deadline {
             return Err("Sign-in timed out".to_string());
         }
@@ -363,8 +392,70 @@ pub fn wait_for_code(listener: &TcpListener, state: &str) -> Result<String, Stri
     }
 }
 
+// The cancel flag of each sign-in waiting for its browser redirect, keyed by base
+#[derive(Default)]
+struct SignIns {
+    running: BTreeMap<String, Arc<AtomicBool>>,
+    /// A cancel that came before its sign-in started, as when the blocking task is slow to start
+    early: BTreeMap<String, Instant>,
+}
+
+static SIGN_INS: Mutex<SignIns> = Mutex::new(SignIns { running: BTreeMap::new(), early: BTreeMap::new() });
+
+// An early cancel only counts for a sign-in that starts this soon after it, so a stray one cannot stop a later sign-in
+const EARLY_CANCEL: Duration = Duration::from_secs(10);
+
+fn sign_ins() -> std::sync::MutexGuard<'static, SignIns> {
+    SIGN_INS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Registers a sign-in's cancel flag until dropped
+struct SignIn {
+    base: String,
+    flag: Arc<AtomicBool>,
+}
+
+impl SignIn {
+    fn begin(base: &str) -> SignIn {
+        let mut map = sign_ins();
+        let early = map.early.remove(base).is_some_and(|at| at.elapsed() < EARLY_CANCEL);
+        let flag = Arc::new(AtomicBool::new(early));
+        map.running.insert(base.to_string(), flag.clone());
+        SignIn { base: base.to_string(), flag }
+    }
+
+    fn cancelled(&self) -> bool {
+        self.flag.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for SignIn {
+    fn drop(&mut self) {
+        let mut map = sign_ins();
+        if map.running.get(&self.base).is_some_and(|f| Arc::ptr_eq(f, &self.flag)) {
+            map.running.remove(&self.base);
+        }
+    }
+}
+
+/// False when no sign-in to base is running yet, in which case the next one to start soon is cancelled
+fn cancel_sign_in_for(base: &str) -> bool {
+    let mut map = sign_ins();
+    match map.running.get(base) {
+        Some(flag) => {
+            flag.store(true, Ordering::SeqCst);
+            true
+        }
+        None => {
+            map.early.insert(base.to_string(), Instant::now());
+            false
+        }
+    }
+}
+
 pub fn sign_in_blocking(app: &AppHandle, base: &str) -> Result<User, String> {
     let base = normalize_base(base)?;
+    let running = SignIn::begin(&base);
     let verifier = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
     let state = uuid::Uuid::new_v4().simple().to_string();
 
@@ -386,7 +477,7 @@ pub fn sign_in_blocking(app: &AppHandle, base: &str) -> Result<User, String> {
         .open_url(url.as_str(), None::<&str>)
         .map_err(|e| format!("Failed to open browser: {}", e))?;
 
-    let code = wait_for_code(&listener, &state)?;
+    let code = wait_for_code(&listener, &state, &|| running.cancelled())?;
     let (token, user) = HttpServer::new(&base, None)
         .token_exchange(&code, &verifier)
         .map_err(|e| e.text(&base))?;
@@ -425,14 +516,20 @@ pub async fn sign_in_server(app: AppHandle, base: String) -> Result<User, String
         .map_err(|e| e.to_string())?
 }
 
+/// Stops a sign-in waiting for its browser redirect. It then fails with SIGN_IN_CANCELLED.
+#[tauri::command]
+pub fn cancel_sign_in(base: String) -> Result<(), String> {
+    cancel_sign_in_for(&normalize_base(&base)?);
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn sign_out_server(base: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let base = normalize_base(&base)?;
         let _ = client(&base).logout();
         clear_session(&base);
-        forget_server(&base);
-        Ok(())
+        forget_server(&base)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -509,13 +606,13 @@ mod tests {
     #[test]
     fn remember_and_forget_servers() {
         let dir = temp("servers-remember");
-        remember_server_in(&dir, "https://a.test");
-        remember_server_in(&dir, "https://a.test");
-        remember_server_in(&dir, DEFAULT_SERVER);
+        remember_server_in(&dir, "https://a.test").unwrap();
+        remember_server_in(&dir, "https://a.test").unwrap();
+        remember_server_in(&dir, DEFAULT_SERVER).unwrap();
         assert_eq!(servers_in(&dir), vec![DEFAULT_SERVER.to_string(), "https://a.test".to_string()]);
-        forget_server_in(&dir, DEFAULT_SERVER);
+        forget_server_in(&dir, DEFAULT_SERVER).unwrap();
         assert_eq!(servers_in(&dir).len(), 2);
-        forget_server_in(&dir, "https://a.test");
+        forget_server_in(&dir, "https://a.test").unwrap();
         assert_eq!(servers_in(&dir), vec![DEFAULT_SERVER.to_string()]);
     }
 
@@ -535,7 +632,7 @@ mod tests {
         put("Mine", None, Some(Published { server: Some("https://mine.test".into()), dirty: false }));
         put("Drive", Some(PackSource { kind: "drive".into(), folder_id: Some("F".into()), ..Default::default() }), None);
         put("Default", server(DEFAULT_SERVER), None);
-        remember_server_in(&dir, "https://a.test");
+        remember_server_in(&dir, "https://a.test").unwrap();
         assert_eq!(
             listed_in(&dir, Some(&mods)),
             vec![DEFAULT_SERVER.to_string(), "https://a.test".to_string(), "https://mine.test".to_string(), "https://viewed.test".to_string()]
@@ -543,6 +640,92 @@ mod tests {
         assert_eq!(listed_in(&dir, None), vec![DEFAULT_SERVER.to_string(), "https://a.test".to_string()]);
         // Listing never remembers a pack's server, so forgetting one still drops it from servers.json
         assert_eq!(servers_in(&dir), vec![DEFAULT_SERVER.to_string(), "https://a.test".to_string()]);
+    }
+
+    #[test]
+    fn write_servers_replaces_through_a_temp_file() {
+        let dir = temp("servers-write");
+        let list = vec![DEFAULT_SERVER.to_string(), "https://a.test".to_string()];
+        write_servers(&dir, &list).unwrap();
+        assert_eq!(read_servers(&dir), list);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+
+        // A folder in the file's place makes the write fail and is left alone
+        let blocked = temp("servers-blocked");
+        std::fs::create_dir(blocked.join(SERVERS_FILE)).unwrap();
+        assert!(write_servers(&blocked, &list).is_err());
+        assert!(remember_server_in(&blocked, "https://b.test").is_err());
+        assert!(forget_server_in(&blocked, "https://b.test").is_err());
+        assert!(blocked.join(SERVERS_FILE).is_dir());
+        assert_eq!(std::fs::read_dir(&blocked).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn wait_for_code_stops_when_cancelled() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let started = Instant::now();
+        assert_eq!(wait_for_code(&listener, "abc", &|| true), Err(SIGN_IN_CANCELLED.to_string()));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn cancel_sign_in_reaches_a_running_sign_in() {
+        let base = "https://cancel.test";
+        let running = SignIn::begin(base);
+        assert!(!running.cancelled());
+        assert!(cancel_sign_in_for(base));
+        assert!(running.cancelled());
+        drop(running);
+        // A new sign-in starts with a fresh flag
+        assert!(!SignIn::begin(base).cancelled());
+    }
+
+    #[test]
+    fn cancel_before_the_sign_in_starts_is_kept_for_it() {
+        let base = "https://early-cancel.test";
+        assert!(!cancel_sign_in_for(base));
+        let first = SignIn::begin(base);
+        assert!(first.cancelled());
+        drop(first);
+        // Used up by that sign-in, so the next one is not cancelled
+        assert!(!SignIn::begin(base).cancelled());
+    }
+
+    #[test]
+    fn signed_out_skips_a_session_replaced_since_the_conn_was_made() {
+        use crate::server::fake::{FakeServer, BASE};
+        let store: Arc<dyn SessionStore> = Arc::new(MemoryStore::default());
+        save_session_in(&*store, BASE, &sample()).unwrap();
+        let conn = Conn::new(FakeServer::new(), store.clone());
+        let relogin = Session { token: "tok2".into(), user: sample().user };
+        save_session_in(&*store, BASE, &relogin).unwrap();
+        let out: Result<(), ServerError> = conn.call(Err(ServerError::new("signed_out", "Sign in again")));
+        assert_eq!(out.unwrap_err().code, "signed_out");
+        assert_eq!(session_in(&*store, BASE), Some(relogin));
+
+        let fresh = Conn::new(FakeServer::new(), store.clone());
+        let _ = fresh.call::<()>(Err(ServerError::new("signed_out", "Sign in again")));
+        assert_eq!(session_in(&*store, BASE), None);
+    }
+
+    #[test]
+    fn update_user_skips_a_session_replaced_since_the_conn_was_made() {
+        use crate::server::fake::{FakeServer, BASE};
+        let store: Arc<dyn SessionStore> = Arc::new(MemoryStore::default());
+        save_session_in(&*store, BASE, &sample()).unwrap();
+        let conn = Conn::new(FakeServer::new(), store.clone());
+        let me = Me { id: "1".into(), name: "Nick".into(), role: Some("uploader".into()), packs: vec![] };
+
+        let relogin = Session { token: "tok2".into(), user: User { id: "2".into(), name: "Other".into(), role: None } };
+        save_session_in(&*store, BASE, &relogin).unwrap();
+        conn.update_user(&me);
+        assert_eq!(session_in(&*store, BASE), Some(relogin));
+
+        let fresh = Conn::new(FakeServer::new(), store.clone());
+        let me2 = Me { id: "2".into(), name: "Other".into(), role: Some("owner".into()), packs: vec![] };
+        fresh.update_user(&me2);
+        assert_eq!(session_in(&*store, BASE).unwrap().user.role.as_deref(), Some("owner"));
     }
 
     fn sample() -> Session {
@@ -567,17 +750,17 @@ mod tests {
     fn signed_out_clears_session() {
         let store = MemoryStore::default();
         save_session_in(&store, "https://a.test", &sample()).unwrap();
-        let ok: Result<u32, ServerError> = check_in(&store, "https://a.test", Ok(1));
+        let ok: Result<u32, ServerError> = check_in(&store, "https://a.test", Some("tok"), Ok(1));
         assert_eq!(ok, Ok(1));
         assert!(session_in(&store, "https://a.test").is_some());
 
         let other: Result<u32, ServerError> =
-            check_in(&store, "https://a.test", Err(ServerError::new("unavailable", "down")));
+            check_in(&store, "https://a.test", Some("tok"), Err(ServerError::new("unavailable", "down")));
         assert_eq!(other.unwrap_err().code, "unavailable");
         assert!(session_in(&store, "https://a.test").is_some());
 
         let out: Result<u32, ServerError> =
-            check_in(&store, "https://a.test", Err(ServerError::new("signed_out", "Sign in again")));
+            check_in(&store, "https://a.test", Some("tok"), Err(ServerError::new("signed_out", "Sign in again")));
         assert_eq!(out.unwrap_err().code, "signed_out");
         assert_eq!(session_in(&store, "https://a.test"), None);
     }

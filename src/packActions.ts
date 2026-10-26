@@ -140,9 +140,12 @@ export async function alertFailure(prefix: string, e: unknown): Promise<void> {
 }
 
 export const SIGN_IN_PREFIX = "sign-in:";
+// Matches accounts::SIGN_IN_CANCELLED
+export const SIGN_IN_CANCELLED = "Sign-in was cancelled";
 
-// Sign-in waits for the browser redirect for up to 300 s, so it shows as an op in the progress modal
-export async function signInServer(base: string): Promise<ServerUser> {
+// Sign-in waits for the browser redirect for up to 300 s, so it shows as an op in the progress modal.
+// Null when the user cancelled it, which needs no alert.
+export async function signInServer(base: string): Promise<ServerUser | null> {
   const key = SIGN_IN_PREFIX + base;
   if (store.inFlight[key]) throw `Already signing in to ${hostOf(base)}, finish in your browser first`;
   beginOp(key, `Sign in to ${hostOf(base)}`);
@@ -152,6 +155,9 @@ export async function signInServer(base: string): Promise<ServerUser> {
   };
   try {
     return await invoke("sign_in_server", { base }) as ServerUser;
+  } catch (e) {
+    if (e === SIGN_IN_CANCELLED) return null;
+    throw e;
   } finally {
     endOp(key);
     await loadServers();
@@ -236,9 +242,9 @@ export function opName(packId: string): string {
 }
 
 const UPLOAD_STAGES = ["uploading", "checking_server"];
-const CANCEL_STAGES = ["downloading", "waiting", ...UPLOAD_STAGES];
+const CANCEL_STAGES = ["downloading", "waiting", "signing_in", ...UPLOAD_STAGES];
 
-// Only transfers can be cancelled, and only while they are still moving files or waiting to retry
+// Only transfers and sign-ins can be cancelled, and transfers only while they are still moving files or waiting to retry
 export function canCancel(packId: string): boolean {
   const stage = store.packProgress[packId]?.stage ?? "";
   return !!store.inFlight[packId] && CANCEL_STAGES.includes(stage);
@@ -246,6 +252,16 @@ export function canCancel(packId: string): boolean {
 
 export async function cancelPackOp(packId: string): Promise<void> {
   if (store.cancelling[packId] || !canCancel(packId)) return;
+  if (packId.startsWith(SIGN_IN_PREFIX)) {
+    store.cancelling[packId] = true;
+    try {
+      await invoke("cancel_sign_in", { base: packId.slice(SIGN_IN_PREFIX.length) });
+    } catch (e) {
+      console.error("Failed to cancel sign-in:", e);
+      delete store.cancelling[packId];
+    }
+    return;
+  }
   const upload = UPLOAD_STAGES.includes(store.packProgress[packId]?.stage ?? "");
   const confirmed = await showConfirm(
     upload
@@ -547,7 +563,7 @@ export async function addPackFromLink(): Promise<void> {
     let info = await inspectLink(link);
     if (!info.signed_in) {
       if (!(await showConfirm(`Sign in to ${hostOf(info.base)} with Discord to continue?`))) return;
-      await signInServer(info.base);
+      if (!(await signInServer(info.base))) return;
       checkPackUpdates();
       info = await inspectLink(link);
       if (!info.signed_in) return;
@@ -637,7 +653,7 @@ async function runSwitch(pack: PackManifest): Promise<void> {
     const info = await inspectLink(link, oldId);
     if (!info.signed_in) {
       if (!(await showConfirm(`Sign in to ${hostOf(info.base)} with Discord to continue?`))) return;
-      await signInServer(info.base);
+      if (!(await signInServer(info.base))) return;
       checkPackUpdates();
       if (!(await inspectLink(link, oldId)).signed_in) return;
     }

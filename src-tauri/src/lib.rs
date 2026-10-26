@@ -60,6 +60,7 @@ pub fn run() {
             config::get_api_key,
             accounts::list_servers,
             accounts::sign_in_server,
+            accounts::cancel_sign_in,
             accounts::sign_out_server,
             manage::pack_invite_link,
             manage::reset_pack_invite,

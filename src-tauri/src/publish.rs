@@ -348,7 +348,8 @@ impl Upload<'_> {
         cancelled()
     }
 
-    fn send(&mut self, name: &str, version: &str, manifest: &RemoteManifest, notes: &str, history: &[VersionEntry]) -> Result<(), ServerError> {
+    /// The time the server stored, when it sends one
+    fn send(&mut self, name: &str, version: &str, manifest: &RemoteManifest, notes: &str, history: &[VersionEntry]) -> Result<Option<u64>, ServerError> {
         self.publish_id.clear();
         if (self.cancel)() {
             return Err(cancelled());
@@ -582,12 +583,13 @@ fn run_publish(
     if matches!(&result, Err(e) if e.code == "publish_gone") {
         result = up.send(&manifest.name, version, &ready, &notes, &history);
     }
-    conn.text(result)?;
+    // An older server does not send its time, so the local clock stands in
+    let published_at = conn.text(result)?.unwrap_or(now);
     let uploaded = up.put.len();
 
     mark_published(pack_dir, &base, version)?;
     let mut log = packs::read_changelog(pack_dir);
-    log.entries.insert(0, VersionEntry { version: version.to_string(), published_at: now, notes });
+    log.entries.insert(0, VersionEntry { version: version.to_string(), published_at, notes });
     log.base = None;
     if let Err(e) = packs::write_changelog(pack_dir, &log) {
         eprintln!("[PUBLISH] Could not save the changelog for {}: {}", pack_id, e);
@@ -1217,13 +1219,25 @@ mod tests {
         assert!(log.base.is_none());
         assert_eq!(log.entries.iter().map(|v| v.version.as_str()).collect::<Vec<_>>(), ["2.1.0", "2.0.0", "1.0.0"]);
         assert_eq!(log.entries[0].notes, w.versions()[0].notes);
-        assert_eq!(log.entries[0].published_at, NOW);
+        assert_eq!(log.entries[0].published_at, w.versions()[0].published_at);
+        assert_ne!(log.entries[0].published_at, NOW);
 
         bump_vests(&pack_dir);
         publish(&w, &pack_dir, "2.2.0").unwrap();
         let log = packs::read_changelog(&pack_dir);
         assert_eq!(log.entries.len(), 4);
         assert_eq!(log.entries[0].notes, "### Updated\n- Better Vests 1.2 to 1.3");
+    }
+
+    #[test]
+    fn old_server_without_published_at_uses_the_local_clock() {
+        let pack_dir = pack_fixture("local-clock", &base_mods());
+        let w = World::new();
+        w.owner.omit_published_at();
+        publish(&w, &pack_dir, "1.0.0").unwrap();
+        let log = packs::read_changelog(&pack_dir);
+        assert_eq!(log.entries[0].version, "1.0.0");
+        assert_eq!(log.entries[0].published_at, NOW);
     }
 
     #[test]

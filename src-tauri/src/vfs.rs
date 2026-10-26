@@ -936,15 +936,20 @@ fn delete_pack_dir(mods_dir: &Path, paks_dir: Option<&Path>, pack_id: &str) -> R
     remove_pack_dir(mods_dir, paks_dir, pack_id)
 }
 
-// delete_pack_dir without its checks, for a caller that already holds the pack's op
+// delete_pack_dir without its checks, for a caller that already holds the pack's op.
+// Each mod is marked off once it is unlinked, so a folder left by a failure has flags that match its links.
 pub(crate) fn remove_pack_dir(mods_dir: &Path, paks_dir: Option<&Path>, pack_id: &str) -> Result<(), String> {
     let pack_dir = mods_dir.join(pack_id);
-    if let Some(paks_dir) = paks_dir {
-        for name in child_dirs(&pack_dir)? {
-            let key = format!("{}/{}", pack_id, name);
-            if parse_key(&key).is_ok() {
-                unlink_mod(paks_dir, &key)?;
-            }
+    for name in child_dirs(&pack_dir)? {
+        let key = format!("{}/{}", pack_id, name);
+        if parse_key(&key).is_err() {
+            continue;
+        }
+        if let Some(paks_dir) = paks_dir {
+            unlink_mod(paks_dir, &key)?;
+        }
+        if let Err(e) = clear_enabled_flag(&pack_dir.join(&name)) {
+            eprintln!("[VFS] Could not turn off {} before deleting it: {}", key, e);
         }
     }
     let aside = mods_dir.join(format!(".deleting-{}", uuid::Uuid::new_v4()));
@@ -2327,6 +2332,33 @@ mod tests {
         assert!(after.source.is_none());
         assert!(after.installed_hashes.is_empty());
         assert!(after.published.is_none());
+    }
+
+    // A zip cannot make a pack name a server, so it cannot add a server row to Settings
+    #[test]
+    fn zip_contents_never_link_or_publish_the_pack() {
+        use crate::packs::read_manifest;
+        let (m, p, z) = (scratch("mods"), scratch("paks"), scratch("zips"));
+        let linked = br#"{"pack_id": "CS", "name": "CS", "mod_ids": ["3063"], "imported_at": 1,
+            "source": {"kind": "server", "server": "https://evil.test"},
+            "published": {"server": "https://evil.test", "dirty": false}}"#;
+        make_pack_zip(&z.join("cs.zip"), serde_json::json!({
+            "name": "CS v1.5",
+            "mod_ids": ["3063"],
+            "source": {"kind": "server", "server": "https://evil.test"},
+            "published": {"server": "https://evil.test", "dirty": false},
+        }), &[
+            ("pack.json", linked),
+            ("3063/pack.json", linked),
+            ("3063/metadata.json", br#"{"version": "1.0"}"#),
+            ("3063/a.pak", b"a"),
+        ]);
+        import_from_archive(&z.join("cs.zip"), &m, &p, &mut |_| {}).unwrap();
+        let man = read_manifest(&m.join("CS")).unwrap();
+        assert!(man.source.is_none());
+        assert!(man.published.is_none());
+        assert_eq!(man.mod_ids, ["3063"]);
+        assert!(crate::accounts::pack_servers(&m).is_empty());
     }
 
     #[test]

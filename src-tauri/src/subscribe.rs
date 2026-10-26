@@ -560,6 +560,17 @@ fn carry_changelog(pack_dir: &Path, staged: &Path) -> Result<(), String> {
         .map_err(|e| format!("Failed to copy {}: {}", old.display(), e))
 }
 
+// A switch to a new id whose server changelog could not be fetched shows the old pack's entries until the next fetch
+fn keep_old_history(from: &Path, target: &Path) {
+    let entries = packs::read_changelog(from).entries;
+    if entries.is_empty() {
+        return;
+    }
+    if let Err(e) = packs::write_changelog(target, &packs::Changelog { entries, base: None }) {
+        eprintln!("[SUBSCRIBE] Could not save the changelog of {}: {}", target.display(), e);
+    }
+}
+
 /// Saves the server's changelog over the local entries, keeping `base`. None when the server call failed.
 fn refresh_changelog(conn: &Conn, pack_dir: &Path, pack_id: &str) -> Option<Vec<VersionEntry>> {
     let entries = conn.call(conn.server().changelog(pack_id)).ok()?;
@@ -645,9 +656,14 @@ fn install_seeded(
         }
         return Err(vfs::abandon_staging(&staging, e));
     }
+    let replacing = plan.installed.is_some();
     let summary = vfs::finish_import(&archive, plan, mods_dir, paks_dir, &staging)?;
     drop_cache(&cache);
-    refresh_changelog(conn, &target, pack_id);
+    if refresh_changelog(conn, &target, pack_id).is_none() && !replacing {
+        if let Some(from) = seed_from {
+            keep_old_history(from, &target);
+        }
+    }
     Ok(summary)
 }
 
@@ -676,6 +692,7 @@ pub fn add_from_invite(
 
 const OWN_PUBLISH: &str = "You publish this pack. Fork it to follow another pack.";
 const UPLOADER_INVITE: &str = "That is an uploader invite, not a pack link.";
+const WRONG_PACK_LINK: &str = "That invite link is for another pack.";
 
 #[derive(Serialize, Debug)]
 pub struct SwitchPreview {
@@ -762,6 +779,8 @@ pub struct SwitchSummary {
 /// Installs new_pack_id with the files of pack_id reused, then deletes pack_id. A failed or
 /// cancelled install leaves pack_id as it was. Mods keep their on or off state by mod id, and
 /// mods new to the pack are on when the pack is the active preset, as in an update.
+/// `save_config` moves the presets to the new pack. For a new id it runs before pack_id is
+/// deleted, and when it fails pack_id is kept.
 #[allow(clippy::too_many_arguments)]
 pub fn switch_pack_with(
     conn: &Conn,
@@ -772,9 +791,20 @@ pub fn switch_pack_with(
     mods_dir: &Path,
     paks_dir: &Path,
     progress: &mut dyn FnMut(Progress),
+    save_config: &mut dyn FnMut(&ImportSummary) -> Result<(), String>,
 ) -> Result<SwitchSummary, String> {
     let (old_dir, local) = switch_source(mods_dir, pack_id)?;
     check_switch_target(mods_dir, pack_id, new_pack_id, conn.base())?;
+    if let Some(link) = invite {
+        let (_, code) = parse_invite(link)?;
+        let info = conn.text(conn.server().invite_info(&code))?;
+        if info.kind == "uploader" {
+            return Err(UPLOADER_INVITE.to_string());
+        }
+        if info.pack.map(|p| p.id).as_deref() != Some(new_pack_id) {
+            return Err(WRONG_PACK_LINK.to_string());
+        }
+    }
     let moving = new_pack_id != pack_id;
     let _old = if moving { Some(OpGuard::begin_named(&old_dir, OpKind::Local, &local.name)?) } else { None };
     let flags: BTreeMap<String, bool> =
@@ -783,6 +813,12 @@ pub fn switch_pack_with(
     let mut import = install_seeded(conn, new_pack_id, invite, uploader, Some(&old_dir), mods_dir, paks_dir, progress)?;
     let paks = paks_dir.is_dir().then_some(paks_dir);
     if moving {
+        if let Err(e) = save_config(&import) {
+            return Err(format!(
+                "{} was installed but saved presets could not be updated, so {} was kept. Delete {} before switching again: {}",
+                new_pack_id, local.name, new_pack_id, e
+            ));
+        }
         if let Err(e) = vfs::remove_pack_dir(mods_dir, paks, pack_id) {
             eprintln!("[SUBSCRIBE] Could not delete {} after switching it: {}", pack_id, e);
             import.failed_deletes.push(old_dir.display().to_string());
@@ -807,6 +843,9 @@ pub fn switch_pack_with(
     }
     if let Some(paks) = paks {
         vfs::sweep_orphans(paks, mods_dir);
+    }
+    if !moving {
+        save_config(&import).map_err(|e| format!("The pack was switched but saved presets could not be updated: {}", e))?;
     }
     Ok(SwitchSummary { import, not_enabled })
 }
@@ -850,7 +889,8 @@ impl UpdateCheck {
     }
 
     fn failed(local: &PackManifest, error: String) -> UpdateCheck {
-        let status = if error == DRIVE_GONE { "unsupported" } else { "error" };
+        // A Drive pack can never be checked, which the UI shows apart from a check that failed
+        let status = if is_drive(local) { "unsupported" } else { "error" };
         UpdateCheck { error: Some(error), ..UpdateCheck::new(local, status) }
     }
 }
@@ -891,12 +931,16 @@ pub fn check_pack(conn: &Conn, pack_dir: &Path) -> Result<UpdateCheck, String> {
     Ok(check)
 }
 
+fn is_drive(local: &PackManifest) -> bool {
+    local.source.as_ref().is_some_and(|s| s.kind != SERVER_KIND)
+}
+
 /// The server a linked pack installs from, or why it has none
 fn linked_base(local: &PackManifest) -> Result<String, String> {
     let unlinked = || format!("{} is not linked to a pack server", local.name);
     match &local.source {
         None => Err(unlinked()),
-        Some(s) if s.kind != SERVER_KIND => Err(DRIVE_GONE.to_string()),
+        Some(_) if is_drive(local) => Err(DRIVE_GONE.to_string()),
         Some(s) => s.server.clone().ok_or_else(unlinked),
     }
 }
@@ -1034,21 +1078,20 @@ pub async fn switch_pack(
     let old_id = pack_id.clone();
     let active = crate::config::load_config(app_handle.clone())?.active_preset.as_deref() == Some(format!("pack:{}", pack_id).as_str());
     let handle = app_handle.clone();
-    let summary = tauri::async_runtime::spawn_blocking(move || {
+    tauri::async_runtime::spawn_blocking(move || {
         let mut emit = |p: Progress| {
             let _ = handle.emit("pack-progress", p);
         };
+        let mut save = |import: &ImportSummary| {
+            let mut config = crate::config::load_config(app_handle.clone())?;
+            presets_after_switch(&mut config, &old_id, import);
+            crate::config::save_config(app_handle.clone(), config)
+        };
         let invite = link.as_deref().map(str::trim);
-        switch_pack_with(&Conn::live(&base), &pack_id, &new_pack_id, invite, active, &mods_dir, &paks_dir, &mut emit)
+        switch_pack_with(&Conn::live(&base), &pack_id, &new_pack_id, invite, active, &mods_dir, &paks_dir, &mut emit, &mut save)
     })
     .await
-    .map_err(|e| e.to_string())??;
-
-    let mut config = crate::config::load_config(app_handle.clone())?;
-    presets_after_switch(&mut config, &old_id, &summary.import);
-    crate::config::save_config(app_handle, config)
-        .map_err(|e| format!("The pack was switched but saved presets could not be updated: {}", e))?;
-    Ok(summary)
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -1567,6 +1610,21 @@ mod tests {
         for ok in ["console.pak", "com10.pak", "lpt0", "nul-mod/x.pak"] {
             assert!(safe_rel_path(ok).is_ok(), "{ok}");
         }
+    }
+
+    #[test]
+    fn manifest_for_another_pack_refused_before_download() {
+        let w = World::new();
+        remote_fixture(&w, &base_mods());
+        let mut other = w.owner.manifest(PACK).unwrap();
+        other.pack_id = "Other-Pack".into();
+        w.owner.answer_manifest_with(PACK, other);
+        let (mods, paks) = (scratch("sub-wrong-pack"), scratch("sub-wrong-pack-paks"));
+        assert_eq!(add(&w, &mods, &paks).unwrap_err(), "The server sent a different pack (Other-Pack)");
+        assert_eq!(w.downloads(), 0);
+        assert!(listing(&mods).iter().all(|p| p.is_empty()));
+        // The knob answers once
+        add(&w, &mods, &paks).unwrap();
     }
 
     #[test]
@@ -2815,7 +2873,118 @@ mod tests {
     }
 
     fn switch_as(w: &World, pack_id: &str, new_pack_id: &str, link: &str, active: bool, mods: &Path, paks: &Path) -> Result<SwitchSummary, String> {
-        switch_pack_with(&w.conn(), pack_id, new_pack_id, Some(link), active, mods, paks, &mut |_| {})
+        switch_pack_with(&w.conn(), pack_id, new_pack_id, Some(link), active, mods, paks, &mut |_| {}, &mut |_| Ok(()))
+    }
+
+    #[test]
+    fn switch_refuses_a_link_to_another_pack() {
+        let (w, mods, paks, _) = fork_world("switch-wrong-link");
+        remote_fixture_as(&w, &base_mods(), "Other-Pack");
+        let other = invite(&w, "Other-Pack");
+        let before = tree(&mods);
+        let downloads = w.downloads();
+        assert_eq!(switch(&w, PACK, FORK, &other, &mods, &paks).unwrap_err(), "That invite link is for another pack.");
+        assert_eq!(tree(&mods), before);
+        assert_eq!(w.downloads(), downloads);
+        assert!(w.owner.as_user(VIEWER).viewers("Other-Pack").is_err());
+    }
+
+    #[test]
+    fn switch_saves_config_before_deleting_the_old_pack() {
+        let (w, mods, paks, link) = fork_world("switch-save-first");
+        crate::vfs::enable_key(&mods, &paks, &format!("{}/3063", PACK)).unwrap();
+        let old = mods.join(PACK);
+        let mut seen = Vec::new();
+        let mut save = |summary: &ImportSummary| {
+            seen.push((summary.pack.pack_id.clone(), old.exists()));
+            Ok(())
+        };
+        switch_pack_with(&w.conn(), PACK, FORK, Some(&link), false, &mods, &paks, &mut |_| {}, &mut save).unwrap();
+        assert_eq!(seen, [(FORK.to_string(), true)]);
+        assert!(!old.exists());
+    }
+
+    #[test]
+    fn failed_config_save_keeps_the_old_pack() {
+        let (w, mods, paks, link) = fork_world("switch-save-fails");
+        crate::vfs::enable_key(&mods, &paks, &format!("{}/3063", PACK)).unwrap();
+        let old = mods.join(PACK);
+        let before = snapshot(&old);
+        let mut save = |_: &ImportSummary| Err("disk full".to_string());
+        let err = switch_pack_with(&w.conn(), PACK, FORK, Some(&link), false, &mods, &paks, &mut |_| {}, &mut save).unwrap_err();
+        assert_eq!(
+            err,
+            "Casual-Fork was installed but saved presets could not be updated, so Casual Shitters was kept. Delete Casual-Fork before switching again: disk full"
+        );
+        assert!(mods.join(FORK).is_dir());
+        assert_eq!(snapshot(&old), before);
+        assert!(vfs::flag_enabled(&old.join("3063")));
+        assert_eq!(links(&paks, "Casual-Shitters.3063_").len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn old_pack_left_by_a_failed_delete_has_no_mods_on() {
+        let (w, mods, paks, link) = fork_world("switch-delete-fails");
+        crate::vfs::enable_key(&mods, &paks, &format!("{}/3063", PACK)).unwrap();
+        crate::vfs::enable_key(&mods, &paks, &format!("{}/3311", PACK)).unwrap();
+        let locked = paks.clone();
+        let held = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = held.clone();
+        w.owner.cancel_after(0, move || flag.store(lock_dir(&locked), std::sync::atomic::Ordering::SeqCst));
+        let summary = switch(&w, PACK, FORK, &link, &mods, &paks);
+        if !held.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        unlock_dir(&paks);
+        let summary = summary.unwrap();
+        let old = mods.join(PACK);
+        assert_eq!(summary.failed_deletes, [old.display().to_string()]);
+        assert!(old.is_dir());
+        // A mod whose unlink failed keeps its link, so its flag must stay on to match
+        for id in ["3063", "3311"] {
+            let linked = !links(&paks, &format!("{}.{}_", PACK, id)).is_empty();
+            assert!(linked);
+            assert_eq!(vfs::flag_enabled(&old.join(id)), linked, "{}", id);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delete_that_fails_after_unlinking_leaves_mods_off() {
+        let (_, mods, paks, _) = fork_world("delete-unlinks-flags");
+        crate::vfs::enable_key(&mods, &paks, &format!("{}/3063", PACK)).unwrap();
+        // A read only mods folder lets the unlinks through and stops the folder rename
+        if !lock_dir(&mods) {
+            return;
+        }
+        let result = vfs::remove_pack_dir(&mods, Some(&paks), PACK);
+        unlock_dir(&mods);
+        assert!(result.is_err());
+        let old = mods.join(PACK);
+        assert!(links(&paks, "Casual-Shitters.").is_empty());
+        assert!(!vfs::flag_enabled(&old.join("3063")));
+        assert!(!vfs::flag_enabled(&old.join("3311")));
+    }
+
+    #[test]
+    fn switch_with_an_uploader_invite_says_so() {
+        let (w, mods, paks, _) = fork_world("switch-uploader-link");
+        let up = w.owner.uploader_invite().unwrap().url;
+        let before = tree(&mods);
+        assert_eq!(switch(&w, PACK, FORK, &up, &mods, &paks).unwrap_err(), UPLOADER_INVITE);
+        assert_eq!(tree(&mods), before);
+        assert_eq!(w.owner.as_user(VIEWER).me().unwrap().role, None);
+    }
+
+    #[test]
+    fn switch_keeps_old_history_when_the_changelog_cannot_be_fetched() {
+        let (w, mods, paks, link) = fork_world("switch-old-history");
+        let old_entries = packs::read_changelog(&mods.join(PACK)).entries;
+        assert!(!old_entries.is_empty());
+        w.owner.fail_changelog(1);
+        switch(&w, PACK, FORK, &link, &mods, &paks).unwrap();
+        assert_eq!(packs::read_changelog(&mods.join(FORK)).entries, old_entries);
     }
 
     /// The old pack installed, the fork on the server and the fork's invite link

@@ -19,7 +19,8 @@ const busy = computed(() => !!(pack.value && store.inFlight[pack.value.pack_id])
 
 const size = ref<number | null>(null);
 const sizeError = ref(false);
-const hasSavedChangelog = ref(false);
+// Shown only when there is history to show, from the pack server or the saved changelog.json
+const hasChangelog = ref(false);
 
 const installedDate = computed(() => {
   const at = pack.value?.imported_at ?? 0;
@@ -35,9 +36,6 @@ const checkText = computed(() => {
 });
 
 const driveText = computed(() => (check.value?.status === "unsupported" && check.value.error) || DRIVE_GONE);
-
-// A server pack can always show its history, other packs only when they carry a changelog.json
-const canShowChangelog = computed(() => fromServer.value || hasSavedChangelog.value);
 
 // The pack disappears when it is deleted or switched to another pack
 watch(pack, (p) => {
@@ -61,14 +59,13 @@ async function loadSize(packId: string) {
 
 let changelogSeq = 0;
 
-// Without a pack server this only reads the saved file, so it is cheap
-async function loadSavedChangelog(packId: string) {
+// One call per pack shown. A server pack asks its server and falls back to the saved file, others only read the file.
+async function loadChangelog(packId: string) {
   const seq = ++changelogSeq;
-  hasSavedChangelog.value = false;
-  if (fromServer.value) return;
+  hasChangelog.value = false;
   try {
     const changelog = await invoke("pack_changelog", { packId }) as { entries: unknown[] };
-    if (seq === changelogSeq) hasSavedChangelog.value = changelog.entries.length > 0;
+    if (seq === changelogSeq) hasChangelog.value = changelog.entries.length > 0;
   } catch (e) {
     console.error("Failed to read the changelog:", e);
   }
@@ -79,7 +76,7 @@ watch(
   (key) => {
     if (!key || !pack.value) return;
     loadSize(pack.value.pack_id);
-    loadSavedChangelog(pack.value.pack_id);
+    loadChangelog(pack.value.pack_id);
   },
   { immediate: true },
 );
@@ -170,7 +167,7 @@ function manageAccess() {
             <Users :size="15" color="#a1a1aa" /> Manage access
           </button>
         </template>
-        <button v-if="canShowChangelog" class="pack-btn" @click="showChangelog">
+        <button v-if="hasChangelog" class="pack-btn" @click="showChangelog">
           <FileText :size="15" color="#a1a1aa" /> Changelog
         </button>
         <button v-if="!publishedTo" class="pack-btn" @click="switchLink" :disabled="busy">
