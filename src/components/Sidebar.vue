@@ -350,9 +350,6 @@ async function launchGame() {
               <button class="pack-icon-btn" @click.stop="onApplyPack(pack)" title="Apply Modpack">
                 <Check :size="13" color="#22c55e" />
               </button>
-              <button class="pack-icon-btn" @click.stop="exportPack(pack)" title="Export Modpack to .zip">
-                <Upload :size="13" color="#f59e0b" />
-              </button>
               <button
                 v-if="canPublish() && !pack.source"
                 class="pack-icon-btn"
@@ -362,7 +359,7 @@ async function launchGame() {
               >
                 <CloudUpload :size="13" color="#3b82f6" />
               </button>
-              <div v-if="pack.source || pack.published?.server" class="pack-menu-anchor" :data-menu-anchor="pack.pack_id">
+              <div class="pack-menu-anchor" :data-menu-anchor="pack.pack_id">
                 <button
                   class="pack-icon-btn"
                   @click.stop="toggleMenu(pack)"
@@ -372,6 +369,7 @@ async function launchGame() {
                   <MoreHorizontal :size="13" color="#a1a1aa" />
                 </button>
                 <div v-if="openMenu === pack.pack_id" class="pack-menu" @click.stop>
+                  <button class="pack-menu-item" @click="fromMenu(exportPack, pack)">Export to .zip</button>
                   <template v-if="pack.source">
                     <button class="pack-menu-item" @click="fromMenu(verifyPack, pack)">Verify files</button>
                     <button class="pack-menu-item" @click="fromMenu(forkPack, pack)">Fork</button>
