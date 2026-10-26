@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{self, File};
@@ -156,18 +154,21 @@ pub struct Verified {
     pub bad: Vec<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Link {
     pub url: String,
     pub expires_at: u64,
 }
 
+#[allow(dead_code)]
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Viewer {
     pub id: String,
     pub name: String,
 }
 
+#[allow(dead_code)]
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct AdminUser {
     pub id: String,
@@ -176,6 +177,7 @@ pub struct AdminUser {
     pub packs: u32,
 }
 
+#[allow(dead_code)]
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct RemovedViewer {
     pub invite_reset: bool,
@@ -216,6 +218,7 @@ pub struct RemoteFileEntry {
     pub sha256: String,
 }
 
+#[allow(dead_code)]
 pub trait PackServer: Send + Sync {
     fn base(&self) -> &str;
     fn me(&self) -> Result<Me, ServerError>;
@@ -672,6 +675,11 @@ pub mod fake {
         corrupt: BTreeSet<String>,
         replace: Option<(usize, RemoteManifest)>,
         cancel_hook: Option<(usize, Box<dyn Fn() + Send>)>,
+        fail_puts_at: Option<usize>,
+        expire_commit: bool,
+        drop_before_commit: Option<String>,
+        lost_puts: BTreeMap<String, usize>,
+        stored_before_urls: Option<Vec<u8>>,
         downloads: usize,
         puts: usize,
         begins: usize,
@@ -816,10 +824,6 @@ pub mod fake {
             FakeServer { state: self.state.clone(), user: id.into() }
         }
 
-        pub fn user_id(&self) -> &str {
-            &self.user
-        }
-
         /// Stores bytes in the bucket and returns their hash, as if a PUT had landed
         pub fn store_blob(&self, bytes: &[u8]) -> String {
             let sha = hashing::sha256_bytes(bytes);
@@ -899,6 +903,38 @@ pub mod fake {
             let mut st = self.lock();
             let at = st.downloads + n;
             st.cancel_hook = Some((at, Box::new(hook)));
+        }
+
+        /// The PUT after the next n accepted ones fails once, as a dropped connection
+        pub fn fail_puts_after(&self, n: usize) {
+            let mut st = self.lock();
+            let at = st.puts + n;
+            st.fail_puts_at = Some(at);
+        }
+
+        /// The next commit finds its publish expired, as one left open past its hour
+        pub fn expire_next_commit(&self) {
+            self.lock().expire_commit = true;
+        }
+
+        /// Before the next commit, `sha256`'s upload disappears and loses its verified mark
+        pub fn drop_upload_before_commit(&self, sha256: &str) {
+            self.lock().drop_before_commit = Some(sha256.to_string());
+        }
+
+        /// The next n PUTs of `sha256` are accepted but never land, so verify answers bad
+        pub fn lose_puts_of(&self, sha256: &str, n: usize) {
+            self.lock().lost_puts.insert(sha256.to_string(), n);
+        }
+
+        /// The next upload_urls call finds `bytes` already stored, as another uploader's commit landing first
+        pub fn store_before_next_urls(&self, bytes: &[u8]) {
+            self.lock().stored_before_urls = Some(bytes.to_vec());
+        }
+
+        /// Publishes begun and neither committed nor cancelled
+        pub fn open_publishes(&self) -> usize {
+            self.lock().publishes.len()
         }
 
         /// Counts finished downloads only
@@ -1127,7 +1163,12 @@ pub mod fake {
         }
 
         fn upload_urls(&self, publish_id: &str, hashes: &[String]) -> Result<BTreeMap<String, String>, ServerError> {
-            let st = self.gate()?;
+            let mut st = self.gate()?;
+            if let Some(bytes) = st.stored_before_urls.take() {
+                let sha = hashing::sha256_bytes(&bytes);
+                st.objects.insert(sha.clone(), bytes);
+                st.stored.insert(sha);
+            }
             st.uploader(&self.user)?;
             st.own_publish(publish_id, &self.user)?;
             if hashes.len() > MAX_BATCH {
@@ -1146,6 +1187,10 @@ pub mod fake {
         fn put_blob(&self, url: &str, src: &Path, size: u64, sha256: &str, on_bytes: &mut dyn FnMut(u64)) -> Result<(), ServerError> {
             let bytes = fs::read(src).map_err(|e| io_error(format!("Could not open {}: {}", src.display(), e)))?;
             let mut st = self.lock();
+            if st.fail_puts_at.is_some_and(|at| st.puts >= at) {
+                st.fail_puts_at = None;
+                return Err(unavailable("Could not upload to the pack server: connection reset"));
+            }
             let target = url.strip_prefix("fake://").and_then(|rest| rest.split_once('/'));
             let declared = target.and_then(|(pid, sha)| st.publishes.get(pid).and_then(|p| p.blobs.get(sha).map(|s| (sha, *s))));
             let (sha, declared_size) = match declared {
@@ -1159,8 +1204,13 @@ pub mod fake {
                 return Err(upload_refused(400, "<Error><Code>BadDigest</Code></Error>"));
             }
             let sha = sha.to_string();
-            st.objects.insert(sha, bytes);
             st.puts += 1;
+            match st.lost_puts.get_mut(&sha) {
+                Some(n) if *n > 0 => *n -= 1,
+                _ => {
+                    st.objects.insert(sha, bytes);
+                }
+            }
             drop(st);
             on_bytes(size);
             Ok(())
@@ -1196,6 +1246,16 @@ pub mod fake {
             let mut st = self.gate()?;
             st.uploader(&self.user)?;
             st.own_publish(publish_id, &self.user)?;
+            if std::mem::take(&mut st.expire_commit) {
+                st.publishes.remove(publish_id);
+                return Err(publish_gone());
+            }
+            if let Some(sha) = st.drop_before_commit.take() {
+                st.objects.remove(&sha);
+                if let Some(p) = st.publishes.get_mut(publish_id) {
+                    p.verified.remove(&sha);
+                }
+            }
             let history_bytes = serde_json::to_vec(history).map(|v| v.len()).unwrap_or(usize::MAX);
             if notes.encode_utf16().count() > MAX_NOTES || history.len() > MAX_HISTORY || history_bytes > MAX_HISTORY_BYTES {
                 return Err(err("bad_changelog", "The changelog is too large"));

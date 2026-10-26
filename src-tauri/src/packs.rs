@@ -38,7 +38,9 @@ pub struct InstalledMod {
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 pub struct Published {
-    pub folder_id: String,
+    /// The pack server it was published to. None for a pack published to Google Drive, which counts as never published.
+    #[serde(default)]
+    pub server: Option<String>,
     pub dirty: bool,
 }
 
@@ -450,7 +452,7 @@ mod tests {
     #[test]
     fn mark_dirty_only_touches_published() {
         let mods = scratch("dirty");
-        put_pack(&mods, "Pub", "Pub", |m| m.published = Some(Published { folder_id: "f".into(), dirty: false }));
+        put_pack(&mods, "Pub", "Pub", |m| m.published = Some(Published { server: Some("https://packs.test".into()), dirty: false }));
         put_pack(&mods, "Plain", "Plain", |_| {});
         let before = fs::read(mods.join("Plain/pack.json")).unwrap();
         mark_dirty(&mods, "Plain/3063");

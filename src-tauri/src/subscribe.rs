@@ -213,7 +213,7 @@ struct RunningOp {
     flag: Arc<AtomicBool>,
 }
 
-// Every op that writes to a pack, keyed by pack folder. The cancel flag is only read by downloads.
+// Every op that writes to a pack, keyed by pack folder. The cancel flag is read by downloads and publishes.
 static RUNNING: Mutex<BTreeMap<PathBuf, RunningOp>> = Mutex::new(BTreeMap::new());
 
 fn running() -> std::sync::MutexGuard<'static, BTreeMap<PathBuf, RunningOp>> {
@@ -253,10 +253,10 @@ impl Drop for OpGuard {
     }
 }
 
-/// Asks the download running for a pack to stop. False when none is running.
+/// Asks the download or publish running for a pack to stop. False when none is running.
 pub(crate) fn request_cancel(pack_dir: &Path) -> bool {
     match running().get(pack_dir) {
-        Some(op) if op.kind == OpKind::Download => {
+        Some(op) if matches!(op.kind, OpKind::Download | OpKind::Publish) => {
             op.flag.store(true, Ordering::Relaxed);
             true
         }
@@ -1562,7 +1562,7 @@ mod tests {
         let mut man = packs::read_manifest(&pack_dir).unwrap();
         man.source = None;
         man.name = "My Shitters".into();
-        man.published = Some(packs::Published { folder_id: "f".into(), dirty: false });
+        man.published = Some(packs::Published { server: Some(BASE.into()), dirty: false });
         packs::write_manifest(&pack_dir, &man).unwrap();
         let before = listing(&mods);
         let downloads = w.downloads();
@@ -2255,7 +2255,6 @@ mod tests {
 
     #[test]
     fn publish_and_download_refuse_each_other() {
-        use crate::drive::fake::FakeDrive;
         const ID: &str = "Publish-Clash";
         let busy = format!("{} is busy, try again when it finishes", NAME);
         let w = World::new();
@@ -2266,10 +2265,10 @@ mod tests {
         add_id(&w, ID, &mods, &paks).unwrap();
         bump(&w, &manifest);
         let refused = Arc::new(std::sync::Mutex::new(None));
-        let (seen, pack_dir) = (refused.clone(), mods.join(ID));
+        let (seen, pack_dir, up) = (refused.clone(), mods.join(ID), w.owner.as_user(UPLOADER));
         w.owner.cancel_after(0, move || {
-            let other = FakeDrive::new();
-            *seen.lock().unwrap() = crate::publish::publish_pack(&other, &pack_dir, "9.0.0", 0, &mut |_| {}).err();
+            let conn = Conn::new(up.as_user(UPLOADER), Arc::new(MemoryStore::default()));
+            *seen.lock().unwrap() = crate::publish::publish_pack(&conn, &pack_dir, "9.0.0", 0, None, &mut |_| {}).err();
         });
         update_id(&w, &mods, &paks, ID, false, &[]).unwrap();
         assert_eq!(refused.lock().unwrap().as_deref(), Some(busy.as_str()));
@@ -2284,7 +2283,7 @@ mod tests {
         let before = listing(&mods);
         let mut refused = None;
         let downloads = w.downloads();
-        crate::publish::publish_pack(&FakeDrive::new(), &pack_dir, "1.0.0", 0, &mut |_| {
+        crate::publish::publish_pack(&w.conn_as(UPLOADER), &pack_dir, "9.0.0", 0, None, &mut |_| {
             if refused.is_none() {
                 refused = Some(add_id(&w, ID, &mods, &paks).unwrap_err());
             }
@@ -2293,7 +2292,9 @@ mod tests {
         assert_eq!(refused, Some(busy));
         assert_eq!(w.downloads(), downloads);
         assert!(no_staging(&mods));
-        assert_eq!(listing(&mods).len(), before.len());
+        let mut after = listing(&mods);
+        after.retain(|p| *p != Path::new(ID).join(packs::CHANGELOG_FILE).display().to_string());
+        assert_eq!(after, before);
     }
 
     #[test]

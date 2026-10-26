@@ -2300,11 +2300,11 @@ mod tests {
         let (m, p, z) = (scratch("mods"), scratch("paks"), scratch("zips"));
         upgrade_setup(&m, &p, &z);
         let mut man = read_manifest(&m.join("CS")).unwrap();
-        man.published = Some(Published { folder_id: "F".into(), dirty: false });
+        man.published = Some(Published { server: Some("https://packs.test".into()), dirty: false });
         write_manifest(&m.join("CS"), &man).unwrap();
         import_from_archive(&z.join("v16.zip"), &m, &p, &mut |_| {}).unwrap();
         let after = read_manifest(&m.join("CS")).unwrap();
-        assert_eq!(after.published, Some(Published { folder_id: "F".into(), dirty: true }));
+        assert_eq!(after.published, Some(Published { server: Some("https://packs.test".into()), dirty: true }));
     }
 
     #[test]
@@ -2329,7 +2329,7 @@ mod tests {
         let (m, p, z) = (scratch("mods"), scratch("paks"), scratch("zips"));
         upgrade_setup(&m, &p, &z);
         let mut man = read_manifest(&m.join("CS")).unwrap();
-        man.published = Some(Published { folder_id: "F".into(), dirty: false });
+        man.published = Some(Published { server: Some("https://packs.test".into()), dirty: false });
         man.local_hashes.insert("3063/a.pak".into(), CachedHash { size: 1, mtime_ns: 1, sha256: "x".into() });
         write_manifest(&m.join("CS"), &man).unwrap();
         import_from_archive(&z.join("v16.zip"), &m, &p, &mut |_| {}).unwrap();
