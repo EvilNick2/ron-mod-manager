@@ -1,3 +1,4 @@
+mod accounts;
 mod api;
 mod config;
 mod drive;
@@ -27,6 +28,7 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
+            accounts::init(app.handle());
             // Runs before the window loads, so before the first scan and before any op can stage
             // Listed now, removed off the main thread so a large leftover does not delay the window
             if let Ok(mods_dir) = vfs::get_mods_dir(app.handle()) {
@@ -56,6 +58,9 @@ pub fn run() {
             config::get_default_storage_path,
             config::auto_detect_game_path,
             config::get_api_key,
+            accounts::list_servers,
+            accounts::sign_in_server,
+            accounts::sign_out_server,
             google::google_status,
             google::google_sign_in,
             google::google_sign_out,

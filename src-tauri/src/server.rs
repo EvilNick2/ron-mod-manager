@@ -368,6 +368,21 @@ impl HttpServer {
         self.call(self.request(Method::POST, path).json(&body))
     }
 
+    /// Trades the loopback code for a session token. Needs no token of its own.
+    pub fn token_exchange(&self, code: &str, verifier: &str) -> Result<(String, User), ServerError> {
+        #[derive(Deserialize)]
+        struct Granted {
+            token: String,
+            user: User,
+        }
+        let got: Granted = self.post("/auth/token", json!({ "code": code, "code_verifier": verifier }))?;
+        Ok((got.token, got.user))
+    }
+
+    pub fn logout(&self) -> Result<(), ServerError> {
+        self.post::<serde_json::Value>("/auth/logout", json!({})).map(|_| ())
+    }
+
     fn delete(&self, path: &str) -> Result<serde_json::Value, ServerError> {
         self.call(self.request(Method::DELETE, path))
     }
@@ -1374,6 +1389,34 @@ mod tests {
     fn reply(head: &str, body: &str) -> &'static [u8] {
         let text = format!("HTTP/1.1 {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", head, body.len(), body);
         Box::leak(text.into_bytes().into_boxed_slice())
+    }
+
+    #[test]
+    fn token_exchange_posts_code_and_verifier() {
+        let body = r#"{"token":"tok","user":{"id":"1","name":"Nick","role":null}}"#;
+        let (base, handle) = stub(reply("200 OK", body));
+        let (token, user) = HttpServer::new(&base, None).token_exchange("c0de", "veri").unwrap();
+        assert_eq!(token, "tok");
+        assert_eq!(user, User { id: "1".into(), name: "Nick".into(), role: None });
+        let req = handle.join().unwrap();
+        assert!(req.starts_with("POST /auth/token "));
+        assert!(req.contains(r#""code":"c0de""#) && req.contains(r#""code_verifier":"veri""#));
+    }
+
+    #[test]
+    fn token_exchange_surfaces_the_server_error() {
+        let (base, _h) = stub(reply("400 Bad Request", r#"{"error":"bad_login","message":"Sign-in failed, try again"}"#));
+        let err = HttpServer::new(&base, None).token_exchange("x", "y").unwrap_err();
+        assert_eq!(err.code, "bad_login");
+    }
+
+    #[test]
+    fn logout_sends_the_bearer_token() {
+        let (base, handle) = stub(reply("200 OK", r#"{"ok":true}"#));
+        HttpServer::new(&base, Some("tok".into())).logout().unwrap();
+        let req = handle.join().unwrap();
+        assert!(req.starts_with("POST /auth/logout "));
+        assert!(req.to_ascii_lowercase().contains("authorization: bearer tok"));
     }
 
     #[test]
