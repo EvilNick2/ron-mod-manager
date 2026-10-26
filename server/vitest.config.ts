@@ -15,6 +15,7 @@ export default defineConfig(async () => {
             DISCORD_CLIENT_SECRET: "test-discord-secret",
             R2_ACCESS_KEY_ID: "test-access-key",
             R2_SECRET_ACCESS_KEY: "test-secret-key",
+            PUBLIC_URL: "https://packs.example.com",
           },
         },
       }),
