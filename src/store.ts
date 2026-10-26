@@ -1,4 +1,4 @@
-import { reactive } from 'vue';
+import { reactive, watch } from 'vue';
 
 export interface PackManifest {
   pack_id: string;
@@ -88,6 +88,14 @@ export interface DialogRequest {
   resolve: (result: boolean | string | null) => void;
 }
 
+export interface PackChangelogRequest {
+  packId: string;
+  mode: "history" | "update";
+  // The size and counts line shown above the list in update mode
+  summary: string;
+  resolve: (update: boolean) => void;
+}
+
 export const store = reactive({
   apiKeyStore: "",
   currentMode: "Installed",
@@ -102,6 +110,7 @@ export const store = reactive({
   activeDeploymentFilter: "All" as "All" | "Enabled" | "Disabled",
   activePresetName: "" as string,
   selectedMod: null as any,
+  selectedPack: null as string | null,
   mods: [] as any[],
   onlineMods: [] as any[],
   isFetchingOnline: false,
@@ -134,5 +143,14 @@ export const store = reactive({
   cancelling: {} as Record<string, true>,
   dialogs: [] as DialogRequest[],
   packUpdates: {} as Record<string, UpdateCheck>,
+  packChangelog: null as PackChangelogRequest | null,
   closeBlocked: null as CloseBlocked | null
 });
+
+// The right panel shows one thing at a time, a mod or a pack
+watch(() => store.selectedPack, (id) => {
+  if (id) store.selectedMod = null;
+}, { flush: "sync" });
+watch(() => store.selectedMod, (mod) => {
+  if (mod) store.selectedPack = null;
+}, { flush: "sync" });

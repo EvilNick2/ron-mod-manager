@@ -21,7 +21,8 @@ import {
   Play,
   CloudUpload,
   Link,
-  MoreHorizontal
+  MoreHorizontal,
+  Info
 } from 'lucide-vue-next';
 
 async function loginNexus() {
@@ -343,6 +344,9 @@ async function launchGame() {
           <div class="pack-card-bottom">
             <span class="pack-card-version">{{ versionLabel(pack.version) }}</span>
             <div class="pack-card-actions">
+              <button class="pack-icon-btn" @click.stop="store.selectedPack = pack.pack_id" title="Pack details">
+                <Info :size="13" color="#a1a1aa" />
+              </button>
               <button class="pack-icon-btn" @click.stop="onApplyPack(pack)" title="Apply Modpack">
                 <Check :size="13" color="#22c55e" />
               </button>
@@ -357,9 +361,6 @@ async function launchGame() {
                 title="Publish modpack"
               >
                 <CloudUpload :size="13" color="#3b82f6" />
-              </button>
-              <button v-if="pack.published?.server" class="pack-icon-btn" @click.stop="copyInviteLink(pack)" title="Copy invite link">
-                <Link :size="13" color="#a1a1aa" />
               </button>
               <div v-if="pack.source || pack.published?.server" class="pack-menu-anchor" :data-menu-anchor="pack.pack_id">
                 <button
@@ -376,7 +377,10 @@ async function launchGame() {
                     <button class="pack-menu-item" @click="fromMenu(forkPack, pack)">Fork</button>
                     <button class="pack-menu-item" @click="fromMenu(leavePack, pack)">Leave pack</button>
                   </template>
-                  <button v-if="pack.published?.server" class="pack-menu-item" @click="fromMenu(manageAccess, pack)">Manage access</button>
+                  <template v-if="pack.published?.server">
+                    <button class="pack-menu-item" @click="fromMenu(copyInviteLink, pack)">Copy invite link</button>
+                    <button class="pack-menu-item" @click="fromMenu(manageAccess, pack)">Manage access</button>
+                  </template>
                 </div>
               </div>
               <button

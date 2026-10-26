@@ -598,6 +598,106 @@ export async function addPackFromLink(): Promise<void> {
   if (imported.label) await checkPackUpdates();
 }
 
+interface SwitchPreview {
+  base: string;
+  new_pack_id: string;
+  name: string;
+  version: string;
+  uploader: string | null;
+  reused_files: number;
+  total_files: number;
+  download_bytes: number;
+}
+
+interface SwitchSummary extends ImportSummary {
+  not_enabled: string[];
+}
+
+// Held from the first prompt to the end, so a double click cannot stack prompts or switch twice
+let switching = false;
+
+export async function switchPackLink(pack: PackManifest): Promise<void> {
+  if (switching || store.inFlight[pack.pack_id] || pack.published?.server) return;
+  switching = true;
+  try {
+    await runSwitch(pack);
+  } finally {
+    switching = false;
+  }
+}
+
+async function runSwitch(pack: PackManifest): Promise<void> {
+  const oldId = pack.pack_id;
+  const input = await showPrompt("Paste the invite link to switch to:", "", { title: `Switch ${pack.name}` });
+  if (!input || !input.trim()) return;
+  const link = input.trim();
+  const busy = (name: string) => `${name} is busy, try again when it finishes`;
+  try {
+    const info = await inspectLink(link);
+    if (!info.signed_in) {
+      if (!(await showConfirm(`Sign in to ${hostOf(info.base)} with Discord to continue?`))) return;
+      await signInServer(info.base);
+      checkPackUpdates();
+      if (!(await inspectLink(link)).signed_in) return;
+    }
+    if (store.inFlight[oldId]) {
+      await showAlert(busy(pack.name));
+      return;
+    }
+    const preview = await invoke("preview_switch", { packId: oldId, link }) as SwitchPreview;
+    const newId = preview.new_pack_id;
+    const by = preview.uploader ? ` by ${preview.uploader}` : "";
+    const question = `Switch ${pack.name} to ${preview.name}${by}? ${preview.reused_files} of ${preview.total_files} files reused, ${formatSize(preview.download_bytes)} to download.`;
+    if (!(await showConfirm(question, { confirmLabel: "Switch" }))) return;
+    if (store.inFlight[oldId] || store.inFlight[newId]) {
+      await showAlert(busy(store.inFlight[oldId] ? pack.name : preview.name));
+      return;
+    }
+
+    let summary: SwitchSummary | null = null;
+    let failed: { error: unknown } | null = null;
+    // Download progress is reported under the new pack id, the old one only stays locked
+    beginOp(newId, preview.name);
+    if (newId !== oldId) {
+      beginOp(oldId, pack.name);
+      store.progressHidden[oldId] = true;
+    }
+    try {
+      summary = await invoke("switch_pack", { packId: oldId, base: preview.base, newPackId: newId, link }) as SwitchSummary;
+    } catch (e) {
+      if (e !== CANCELLED) {
+        console.error("Failed to switch:", e);
+        failed = { error: e };
+      }
+    }
+    endOp(newId);
+    endOp(oldId);
+    if (summary && store.activePresetName === `pack:${oldId}`) store.activePresetName = `pack:${newId}`;
+    await refreshMods().catch((e) => console.error("Failed to refresh mods:", e));
+    await loadPresets().catch((e) => console.error("Failed to load presets:", e));
+    if (store.selectedPack === oldId && !store.packs.some((p) => p.pack_id === oldId)) store.selectedPack = null;
+    await checkPackUpdates();
+    if (failed !== null) {
+      await alertFailure("Failed to switch: ", failed.error);
+      return;
+    }
+    if (summary === null) return;
+    if (summary.failed_deletes.length > 0) {
+      console.warn(`Folders left behind after switching ${pack.name}:`, summary.failed_deletes);
+    }
+    let message = `Switched ${pack.name} to ${packLabel(summary.pack.name, summary.pack.version)}.`;
+    if (summary.not_enabled.length > 0) {
+      message += ` These mods could not be turned on: ${summary.not_enabled.join(", ")}`;
+    }
+    await showAlert(message);
+  } catch (e) {
+    if (e !== CANCELLED) {
+      console.error("Failed to switch:", e);
+      await alertFailure("Failed to switch: ", e);
+    }
+  }
+}
+
 async function runPackUpdate(pack: PackManifest, run: () => Promise<UpdateSummary>, failure: string): Promise<void> {
   let summary: UpdateSummary | null = null;
   let failed: { error: unknown } | null = null;
@@ -624,11 +724,25 @@ async function runPackUpdate(pack: PackManifest, run: () => Promise<UpdateSummar
   }
 }
 
+// Resolves true when the player picks Update. A history view always resolves false.
+export function openPackChangelog(packId: string, mode: "history" | "update", summary = ""): Promise<boolean> {
+  store.packChangelog?.resolve(false);
+  return new Promise((resolve) => {
+    store.packChangelog = { packId, mode, summary, resolve };
+  });
+}
+
+export function closePackChangelog(update: boolean): void {
+  const request = store.packChangelog;
+  store.packChangelog = null;
+  request?.resolve(update);
+}
+
 export async function updatePack(pack: PackManifest): Promise<void> {
   const check = store.packUpdates[pack.pack_id];
   if (check?.status !== "available" || store.inFlight[pack.pack_id]) return;
-  const question = `Update ${pack.name} to ${check.remote_version}? ${check.added.length} mods added, ${check.changed.length} updated, ${check.removed.length} removed and deleted from disk. Downloads ${formatSize(check.download_bytes)}.`;
-  if (!(await showConfirm(question))) return;
+  const summary = `${check.added.length} mods added, ${check.changed.length} updated, ${check.removed.length} removed and deleted from disk. Downloads ${formatSize(check.download_bytes)}.`;
+  if (!(await openPackChangelog(pack.pack_id, "update", summary))) return;
   if (store.inFlight[pack.pack_id]) return;
   await runPackUpdate(pack, () => invoke("update_linked_pack", { packId: pack.pack_id }), "Failed to update: ");
 }

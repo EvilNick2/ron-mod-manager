@@ -5,6 +5,7 @@ import { showAlert, showConfirm } from "../dialogs";
 import { invoke } from "@tauri-apps/api/core";
 import { ref, computed } from "vue";
 import { ExternalLink, Download, PackageSearch, X, Plus, Puzzle, Trash2 } from 'lucide-vue-next';
+import PackDetails from './PackDetails.vue';
 
 const isToggling = ref(false);
 const errorMsg = ref("");
@@ -161,7 +162,9 @@ const cleanDescription = computed(() => {
 </script>
 
 <template>
-  <aside class="right-panel" v-if="store.selectedMod">
+  <PackDetails v-if="store.selectedPack" />
+
+  <aside class="right-panel" v-else-if="store.selectedMod">
     <div class="panel-header">
       <h2>{{ store.selectedMod.name }}</h2>
       <a v-if="store.selectedMod.nexus_mod_id != null" href="#" class="external-link" title="View on Nexus Mods" @click.prevent="invoke('open_browser_url', { url: `https://www.nexusmods.com/readyornot/mods/${store.selectedMod.nexus_mod_id}` })">

@@ -16,6 +16,7 @@ import ProgressModal from "./components/ProgressModal.vue";
 import DialogModal from "./components/DialogModal.vue";
 import PackAccessModal from "./components/PackAccessModal.vue";
 import ServerAdminModal from "./components/ServerAdminModal.vue";
+import PackChangelogModal from "./components/PackChangelogModal.vue";
 
 const isDragging = ref(false);
 
@@ -119,7 +120,7 @@ onMounted(async () => {
     <h2>Drop Mod Archive Here</h2>
   </div>
 
-  <div class="app-layout" :class="{ 'modal-open': store.isSettingsOpen || store.installingModPath || store.postInstallModId || store.isUpdateModalOpen || store.closeBlocked || store.packAccessFor || store.serverAdminFor || hasVisibleOps() || store.dialogs.length > 0, 'blur-enabled': store.isBlurEnabled }">
+  <div class="app-layout" :class="{ 'modal-open': store.isSettingsOpen || store.installingModPath || store.postInstallModId || store.isUpdateModalOpen || store.closeBlocked || store.packAccessFor || store.serverAdminFor || store.packChangelog || hasVisibleOps() || store.dialogs.length > 0, 'blur-enabled': store.isBlurEnabled }">
     <Sidebar />
     <ModGrid />
     <RightPanel />
@@ -144,6 +145,10 @@ onMounted(async () => {
 
     <transition name="fade">
       <ServerAdminModal v-if="store.serverAdminFor" />
+    </transition>
+
+    <transition name="fade">
+      <PackChangelogModal v-if="store.packChangelog" />
     </transition>
 
     <ProgressModal />
