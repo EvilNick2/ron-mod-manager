@@ -12,34 +12,33 @@ const VISIBLE = `p.manifest is not null and p.published_at is not null and (
 
 const isOwner = (role: User["role"]) => (role === "owner" ? 1 : 0);
 
-async function roleOf(env: Env, userId: string): Promise<User["role"]> {
-  const row = await env.DB.prepare("select role from users where id = ?")
-    .bind(userId)
-    .first<{ role: User["role"] }>();
-  return row?.role ?? null;
-}
-
-export async function canSee(env: Env, userId: string, packId: string): Promise<boolean> {
-  const row = await env.DB.prepare(`select 1 as ok from packs p where p.id = ? and ${VISIBLE}`)
-    .bind(packId, isOwner(await roleOf(env, userId)), userId, userId)
-    .first();
-  return !!row;
-}
-
 export async function visiblePacks(env: Env, user: User) {
   const rows = await env.DB.prepare(
-    `select p.id, p.name, p.version, p.uploader_id, u.name as uploader_name
+    `select p.id, p.name, p.version, p.uploader_id, u.name as uploader_name,
+            exists (select 1 from pack_viewers v where v.pack_id = p.id and v.user_id = ?) as viewing
      from packs p left join users u on u.id = p.uploader_id
      where ${VISIBLE} order by p.name, p.id`,
   )
-    .bind(isOwner(user.role), user.id, user.id)
-    .all<{ id: string; name: string; version: string; uploader_id: string; uploader_name: string | null }>();
+    .bind(user.id, isOwner(user.role), user.id, user.id)
+    .all<{
+      id: string;
+      name: string;
+      version: string;
+      uploader_id: string;
+      uploader_name: string | null;
+      viewing: number;
+    }>();
   return rows.results.map((r) => ({
     id: r.id,
     name: r.name,
     version: r.version,
     uploader: { id: r.uploader_id, name: r.uploader_name ?? "" },
-    access: r.uploader_id === user.id ? ("uploader" as const) : ("viewer" as const),
+    access:
+      r.uploader_id === user.id
+        ? ("uploader" as const)
+        : r.viewing
+          ? ("viewer" as const)
+          : ("owner" as const),
   }));
 }
 
@@ -90,11 +89,10 @@ export async function getBlob(req: Request, env: Env, sha: string): Promise<Resp
     "accept-ranges": "bytes",
   };
   if (!("body" in obj)) throw gone();
-  const r = obj.range as { offset?: number; length?: number } | undefined;
-  const partial = req.headers.has("range") && r && ((r.offset ?? 0) > 0 || (r.length ?? obj.size) < obj.size);
-  if (partial) {
-    const start = r.offset ?? 0;
-    const length = r.length ?? obj.size - start;
+  const r = obj.range as { offset?: number; length?: number; suffix?: number } | undefined;
+  const start = r?.suffix !== undefined ? obj.size - Math.min(r.suffix, obj.size) : (r?.offset ?? 0);
+  const length = r?.suffix !== undefined ? Math.min(r.suffix, obj.size) : (r?.length ?? obj.size - start);
+  if (req.headers.has("range") && r && (start > 0 || length < obj.size)) {
     headers["content-range"] = `bytes ${start}-${start + length - 1}/${obj.size}`;
     headers["content-length"] = String(length);
     return new Response(obj.body, { status: 206, headers });

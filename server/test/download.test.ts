@@ -117,6 +117,16 @@ it("me lists visible packs", async () => {
   expect(mine.packs.map((p) => [p.id, p.access])).toEqual([["pack-a", "uploader"]]);
 });
 
+it("the owner sees other packs with owner access", async () => {
+  await signIn("up", "Uppy");
+  const owner = await signIn("own", "Own", "owner");
+  await pack("pack-a", "up", []);
+  await pack("pack-b", "up", []);
+  await view("pack-b", "own");
+  const me = (await (await api("/me", {}, owner)).json()) as { packs: { id: string; access: string }[] };
+  expect(me.packs.map((p) => [p.id, p.access])).toEqual([["pack-a", "owner"], ["pack-b", "viewer"]]);
+});
+
 it("uncommitted packs are hidden", async () => {
   const up = await signIn("up");
   await pack("pack-u", "up", [hash("b")], false);
@@ -124,4 +134,15 @@ it("uncommitted packs are hidden", async () => {
   const me = (await (await api("/me", {}, up)).json()) as { packs: unknown[] };
   expect(me.packs).toEqual([]);
   expect((await api(`/blobs/${hash("b")}`, {}, up)).status).toBe(404);
+});
+
+it("suffix ranges return the tail", async () => {
+  const token = await signIn("up");
+  await pack("pack-a", "up", [hash("a")]);
+  await putBlob(hash("a"), "0123456789");
+  const res = await api(`/blobs/${hash("a")}`, { headers: { range: "bytes=-3" } }, token);
+  expect(res.status).toBe(206);
+  expect(res.headers.get("content-range")).toBe("bytes 7-9/10");
+  expect(res.headers.get("content-length")).toBe("3");
+  expect(await res.text()).toBe("789");
 });

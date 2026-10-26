@@ -26,9 +26,14 @@ export function fail(
 }
 
 export async function readJson<T>(req: Request): Promise<T> {
+  let body: unknown;
   try {
-    return (await req.json()) as T;
+    body = await req.json();
   } catch {
     throw new HttpError(400, "bad_request", "Request body is not valid JSON");
   }
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    throw new HttpError(400, "bad_request", "Request body must be a JSON object");
+  }
+  return body as T;
 }

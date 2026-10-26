@@ -1,6 +1,6 @@
 # RON Pack Server
 
-A Cloudflare Worker that lets people share modpacks through the RON Mod Manager desktop app. It uses D1 for accounts and pack records, R2 for the mod files, and Discord for sign-in. Files go straight between the app and R2 through short-lived presigned URLs. The Worker only hands out access.
+A Cloudflare Worker that lets people share modpacks through the RON Mod Manager desktop app. It uses D1 for accounts and pack records, R2 for the mod files, and Discord for sign-in. Uploads go straight from the app to R2 through short-lived presigned PUT URLs. Downloads stream through the Worker, which reads R2 through its binding.
 
 The app has the maintainer's server built in. Anyone can run their own copy and point the app at it. This guide is for that.
 
@@ -8,8 +8,11 @@ The app has the maintainer's server built in. Anyone can run their own copy and 
 
 Read this before you deploy.
 
-- Workers Free and D1 Free stop working when you pass their limits. They do not bill you.
+The cost limits below assume the Workers Free plan. On Workers Paid, Worker requests are billed and downloads have no limit at all.
+
+- Workers Free and D1 Free stop working when you pass their limits. They do not bill you. Workers Free allows 100,000 requests a day across the account.
 - R2 bills storage past 10 GB-month at $0.015 per GB-month. It bills Class A operations (writes and lists) past 1 million a month. R2 has no spending cap.
+- R2 bills Class B operations (reads) past 10 million a month. Every download is one Class B read through the Worker. `OP_BUDGET` does not count them. Only the Workers Free cap of 100,000 requests a day keeps them under the free 10 million, at most about 3.1 million a month.
 
 The server bounds R2 use with two settings:
 
@@ -18,7 +21,9 @@ The server bounds R2 use with two settings:
 
 These limits only cover traffic that goes through this server. Set an R2 budget alert in the Cloudflare dashboard as well. Do not rely on the server alone.
 
-With the defaults, storage past 10 GB costs at most about $0.15 a month (10 GB x $0.015).
+The R2 free allowances are per account and shared with everything else on it. Other R2 data on the same account uses up the free 10 GB unless it sits in the bucket bound as `EXTRA_BUCKET`. Other Class A use shares the free 1 million operations.
+
+With the defaults, if nothing else is on the account, storage past 10 GB costs at most about $0.15 a month (10 GB x $0.015). If other data already fills the free 10 GB, all 20 GB of the cap is billed, about $0.30 a month. In the same worst case the full `OP_BUDGET` of 900,000 Class A operations is billed too, about $4.05 a month at $4.50 per million. Downloads add nothing on Workers Free.
 
 ## Setup
 
@@ -37,7 +42,7 @@ You need a Cloudflare account, Node.js, and a Discord account. Run all commands 
    npx wrangler r2 bucket create ron-packs
    ```
 
-   Keep the bucket private. Do not turn on the r2.dev URL. Do not attach a public custom domain to the bucket. All access goes through presigned URLs.
+   Keep the bucket private. Do not turn on the r2.dev URL. Do not attach a public custom domain to the bucket. Uploads use presigned PUT URLs and downloads go through the Worker.
 
 3. Create the D1 database.
 
@@ -78,7 +83,7 @@ You need a Cloudflare account, Node.js, and a Discord account. Run all commands 
 
    All numeric vars are strings. A missing or invalid value makes the server return a `config` error.
 
-   `EXTRA_BUCKET` is an optional second R2 binding. If you add it to `r2_buckets`, its size counts toward the storage cap. Leave it out if you do not need it.
+   `EXTRA_BUCKET` is an optional second R2 binding. If you add it to `r2_buckets`, its size counts toward the storage cap. The binding name must be exactly `EXTRA_BUCKET`. Every publish lists that bucket to measure it, and those lists are Class A operations counted in `OP_BUDGET`. Leave it out if you do not need it.
 
 8. Set the three secrets. Each command asks for the value.
 
@@ -129,6 +134,8 @@ TODO (Nick): record the results of the live checks after deploying. Does R2 refu
 ## Cleanup
 
 A cron trigger runs every 15 minutes (`*/15 * * * *`). It removes abandoned publishes and unreferenced blobs. Each run deletes at most 40 objects, so a large backlog clears over several runs.
+
+Deleting a pack or removing an uploader ends access at once, but the files leave R2 at 40 per run. A pack of about 280 files takes about 2 hours to clear. Cancelled publishes, and publishes of a deleted pack, keep counting toward the storage cap until cleanup has removed their files, which takes at least 5 minutes.
 
 ## Development
 

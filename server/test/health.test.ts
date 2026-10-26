@@ -17,3 +17,10 @@ it("migrations ran", async () => {
   const row = await env.DB.prepare("select count(*) as n from users").first<{ n: number }>();
   expect(row?.n).toBe(0);
 });
+
+it("lookup indexes exist", async () => {
+  const rows = await env.DB.prepare("select name from sqlite_master where type = 'index' and name not like 'sqlite_%' order by name").all<{ name: string }>();
+  expect(rows.results.map((r) => r.name)).toEqual(
+    expect.arrayContaining(["pack_viewers_user", "publish_blobs_sha", "publishes_expires"]),
+  );
+});

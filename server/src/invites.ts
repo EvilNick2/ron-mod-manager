@@ -76,6 +76,7 @@ export async function acceptInvite(
   await requireRoom(env, user);
 
   if (!pack) {
+    if (user.role) return { kind: "uploader", pack_id: null };
     const claim = await env.DB.prepare(
       "update invites set used_at = ? where code = ? and used_at is null and expires_at > ?",
     )

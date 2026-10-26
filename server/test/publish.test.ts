@@ -1,6 +1,7 @@
 import { env } from "cloudflare:workers";
 import { afterEach, beforeEach, expect, it } from "vitest";
 import { nowSeconds } from "../src/auth";
+import { cleanup } from "../src/cleanup";
 import { api, signIn } from "./helpers";
 
 const realCap = env.STORAGE_CAP_BYTES;
@@ -278,14 +279,14 @@ it("expired publishes are gone", async () => {
   expect(((await res.json()) as { error: string }).error).toBe("publish_gone");
 });
 
-it("another user sees a publish as gone and cancel frees it", async () => {
+it("another user sees a publish as gone and cancel expires it", async () => {
   const t1 = await signIn("u1");
   const t2 = await signIn("u2");
   const { publish_id } = await started("pack-a", [{ sha256: hash("a"), size: 5 }], t1);
   expect((await api(`/publishes/${publish_id}`, { method: "DELETE" }, t2)).status).toBe(404);
   expect((await api(`/publishes/${publish_id}`, { method: "DELETE" }, t1)).status).toBe(200);
-  const left = await env.DB.prepare("select count(*) as n from publish_blobs").first<{ n: number }>();
-  expect(left?.n).toBe(0);
+  const left = await env.DB.prepare("select expires_at from publishes").first<{ expires_at: number }>();
+  expect(left!.expires_at).toBeLessThanOrEqual(nowSeconds());
 });
 
 it("expired reservations still count towards the cap", async () => {
@@ -320,6 +321,7 @@ it("a wrong size for a stored hash is refused and its object survives verify", a
   expect(await env.PACKS.head(`blobs/${hash("a")}`)).not.toBeNull();
   const urls = await post(`/publishes/${p2.publish_id}/urls`, { blobs: [hash("a")] }, b);
   expect(urls.status).toBe(400);
+  expect(((await urls.json()) as { error: string }).error).toBe("already_stored");
 });
 
 it("commit refuses when another user owns the pack", async () => {
@@ -383,4 +385,95 @@ it("commit fails cleanly when the publish vanishes before its batch", async () =
   }
   const pack = await env.DB.prepare("select manifest from packs where id = 'pack-a'").first<{ manifest: string | null }>();
   expect(pack!.manifest).toBeNull();
+});
+
+it("a cancelled publish keeps counting towards the cap until cleanup runs", async () => {
+  const token = await signIn("u1");
+  setVar("STORAGE_CAP_BYTES", "10");
+  const blobs = [{ sha256: hash("a"), size: 8 }];
+  const { publish_id } = await started("pack-a", blobs, token);
+  expect((await api(`/publishes/${publish_id}`, { method: "DELETE" }, token)).status).toBe(200);
+
+  for (const res of [
+    await post(`/publishes/${publish_id}/urls`, { blobs: [hash("a")] }, token),
+    await post(`/publishes/${publish_id}/verify`, { blobs: [hash("a")] }, token),
+    await post(`/publishes/${publish_id}/commit`, { manifest: manifest("pack-a", blobs) }, token),
+    await api(`/publishes/${publish_id}`, { method: "DELETE" }, token),
+  ]) {
+    expect(res.status).toBe(404);
+    expect(((await res.json()) as { error: string }).error).toBe("publish_gone");
+  }
+
+  expect((await begin("pack-b", [{ sha256: hash("b"), size: 8 }], token)).status).toBe(507);
+  await cleanup(env, nowSeconds());
+  expect((await begin("pack-b", [{ sha256: hash("b"), size: 8 }], token)).status).toBe(507);
+  await cleanup(env, nowSeconds() + 901);
+  expect((await begin("pack-b", [{ sha256: hash("b"), size: 8 }], token)).status).toBe(200);
+});
+
+it("deleting a pack during an open publish keeps its storage counted and fails the commit", async () => {
+  const token = await signIn("u1");
+  setVar("STORAGE_CAP_BYTES", "10");
+  const blobs = [{ sha256: hash("a"), size: 8 }];
+  const { publish_id } = await started("pack-a", blobs, token);
+  await put(hash("a"), 8);
+  await post(`/publishes/${publish_id}/verify`, { blobs: [hash("a")] }, token);
+  expect((await api("/packs/pack-a", { method: "DELETE" }, token)).status).toBe(200);
+  const res = await post(`/publishes/${publish_id}/commit`, { manifest: manifest("pack-a", blobs) }, token);
+  expect(res.status).toBe(404);
+  expect(((await res.json()) as { error: string }).error).toBe("publish_gone");
+  expect((await begin("pack-b", [{ sha256: hash("b"), size: 8 }], token)).status).toBe(507);
+});
+
+it("a commit in flight when its pack is deleted writes nothing", async () => {
+  const token = await signIn("u1");
+  const blobs = [{ sha256: hash("a"), size: 5 }];
+  const { publish_id } = await started("pack-a", blobs, token);
+  await put(hash("a"), 5);
+  await post(`/publishes/${publish_id}/verify`, { blobs: [hash("a")] }, token);
+
+  const real = env.DB;
+  const wrapped = new Proxy(real, {
+    get(target, prop) {
+      if (prop === "batch") {
+        return async (stmts: D1PreparedStatement[]) => {
+          await real.prepare("delete from packs where id = 'pack-a'").run();
+          return real.batch(stmts);
+        };
+      }
+      const v = Reflect.get(target, prop, target);
+      return typeof v === "function" ? v.bind(target) : v;
+    },
+  });
+  (env as unknown as Record<string, unknown>).DB = wrapped;
+  let res: Response;
+  try {
+    res = await post(`/publishes/${publish_id}/commit`, { manifest: manifest("pack-a", blobs) }, token);
+  } finally {
+    (env as unknown as Record<string, unknown>).DB = real;
+  }
+  expect(res.status).toBe(404);
+  expect(((await res.json()) as { error: string }).error).toBe("publish_gone");
+  for (const t of ["blobs", "pack_blobs", "packs"]) {
+    const n = await env.DB.prepare(`select count(*) as n from ${t}`).first<{ n: number }>();
+    expect(n!.n).toBe(0);
+  }
+  const held = await env.DB.prepare("select count(*) as n from publish_blobs").first<{ n: number }>();
+  expect(held!.n).toBe(1);
+});
+
+it("a body that is not a JSON object is a bad request", async () => {
+  const token = await signIn("u1");
+  for (const body of ["null", "5", "[]"]) {
+    const res = await api("/packs/pack-a/publish/begin", { method: "POST", body }, token);
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: string }).error).toBe("bad_request");
+  }
+});
+
+it("begin refuses a blob too large for one upload", async () => {
+  const token = await signIn("u1");
+  const res = await begin("pack-a", [{ sha256: hash("a"), size: 5 * 1024 ** 3 + 1 }], token);
+  expect(res.status).toBe(400);
+  expect((await begin("pack-a", [{ sha256: hash("a"), size: 5 * 1024 ** 3 }], token)).status).toBe(200);
 });

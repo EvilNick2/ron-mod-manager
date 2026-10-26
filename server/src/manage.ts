@@ -1,4 +1,5 @@
 import { DAY, nowSeconds, randomToken, requireUser, type User } from "./auth";
+import { cancelledExpiry } from "./cleanup";
 import type { Env } from "./env";
 import { HttpError, json } from "./http";
 import { inviteUrl } from "./invites";
@@ -8,20 +9,23 @@ const PACK_ID = /^[A-Za-z0-9-]{1,64}$/;
 const packGone = () => new HttpError(404, "pack_gone", "This pack is not available");
 const userGone = () => new HttpError(404, "user_gone", "This person is not on the server");
 
-function packStatements(env: Env, id: string): D1PreparedStatement[] {
-  const run = (sql: string) => env.DB.prepare(sql).bind(id);
+// `ids` is SQL giving pack ids from one bound value. Open publishes are expired, not deleted, so their reservations count until cleanup.
+function packStatements(env: Env, ids: string, arg: string): D1PreparedStatement[] {
+  const run = (sql: string) => env.DB.prepare(sql).bind(arg);
   return [
-    run("delete from pack_viewers where pack_id = ?"),
-    run("delete from pack_blobs where pack_id = ?"),
-    run("delete from invites where pack_id = ?"),
-    run("delete from publish_blobs where publish_id in (select id from publishes where pack_id = ?)"),
-    run("delete from publishes where pack_id = ?"),
-    run("delete from packs where id = ?"),
+    run(`delete from pack_viewers where pack_id in (${ids})`),
+    run(`delete from pack_blobs where pack_id in (${ids})`),
+    run(`delete from invites where pack_id in (${ids})`),
+    env.DB.prepare(`update publishes set expires_at = min(expires_at, ?) where pack_id in (${ids})`).bind(
+      cancelledExpiry(nowSeconds()),
+      arg,
+    ),
+    run(`delete from packs where id in (${ids})`),
   ];
 }
 
 export async function deletePack(env: Env, packId: string): Promise<void> {
-  await env.DB.batch(packStatements(env, packId));
+  await env.DB.batch(packStatements(env, "?", packId));
 }
 
 async function loadPack(env: Env, id: string): Promise<{ id: string; uploader_id: string }> {
@@ -85,11 +89,15 @@ export async function listViewers(req: Request, env: Env, id: string): Promise<R
 
 export async function removeViewer(req: Request, env: Env, id: string, userId: string): Promise<Response> {
   const { packId } = await managedPack(req, env, id);
-  const res = await env.DB.prepare("delete from pack_viewers where pack_id = ? and user_id = ?")
-    .bind(packId, userId)
-    .run();
+  const [invites, res] = await env.DB.batch([
+    env.DB.prepare(
+      `delete from invites where kind = 'viewer' and pack_id = ?
+       and exists (select 1 from pack_viewers where pack_id = ? and user_id = ?)`,
+    ).bind(packId, packId, userId),
+    env.DB.prepare("delete from pack_viewers where pack_id = ? and user_id = ?").bind(packId, userId),
+  ]);
   if (res.meta.changes !== 1) throw userGone();
-  return json({ ok: true });
+  return json({ ok: true, invite_reset: invites.meta.changes > 0 });
 }
 
 export async function removePack(req: Request, env: Env, id: string): Promise<Response> {
@@ -102,7 +110,7 @@ export async function leavePack(req: Request, env: Env, id: string): Promise<Res
   const user = await requireUser(req, env);
   const pack = await loadPack(env, id);
   if (pack.uploader_id === user.id) {
-    throw new HttpError(400, "bad_request", "You cannot leave your own pack");
+    throw new HttpError(400, "own_pack", "You cannot leave your own pack");
   }
   const res = await env.DB.prepare("delete from pack_viewers where pack_id = ? and user_id = ?")
     .bind(pack.id, user.id)
@@ -132,20 +140,21 @@ export async function listUsers(req: Request, env: Env): Promise<Response> {
 
 export async function removeUser(req: Request, env: Env, id: string): Promise<Response> {
   const owner = await requireOwner(req, env);
-  if (id === owner.id) throw new HttpError(400, "bad_request", "The owner cannot remove themselves");
+  if (id === owner.id) throw new HttpError(400, "self_remove", "The owner cannot remove themselves");
   const target = await env.DB.prepare("select id from users where id = ?").bind(id).first();
   if (!target) throw userGone();
-  const packs = await env.DB.prepare("select id from packs where uploader_id = ?")
-    .bind(id)
-    .all<{ id: string }>();
   const run = (sql: string) => env.DB.prepare(sql).bind(id);
   await env.DB.batch([
-    ...packs.results.flatMap((p) => packStatements(env, p.id)),
+    ...packStatements(env, "select id from packs where uploader_id = ?", id),
+    run(`delete from invites where kind = 'viewer'
+         and pack_id in (select pack_id from pack_viewers where user_id = ?)`),
     run("delete from pack_viewers where user_id = ?"),
     run("delete from sessions where user_id = ?"),
     run("delete from invites where created_by = ?"),
-    run("delete from publish_blobs where publish_id in (select id from publishes where user_id = ?)"),
-    run("delete from publishes where user_id = ?"),
+    env.DB.prepare("update publishes set expires_at = min(expires_at, ?) where user_id = ?").bind(
+      cancelledExpiry(nowSeconds()),
+      id,
+    ),
     run("update users set role = null where id = ?"),
   ]);
   return json({ ok: true });

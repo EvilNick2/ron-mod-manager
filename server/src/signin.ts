@@ -86,7 +86,7 @@ export async function authCallback(env: Env, url: URL): Promise<Response> {
   await env.DB.prepare(
     `insert into users (id, name, role, created_at) values (?, ?, ?, ?)
      on conflict (id) do update set name = excluded.name,
-       role = case when ? then 'owner' else role end`,
+       role = case when ? then 'owner' when role = 'owner' then 'uploader' else role end`,
   )
     .bind(user.id, user.name, owner ? "owner" : null, nowSeconds(), owner ? 1 : 0)
     .run();

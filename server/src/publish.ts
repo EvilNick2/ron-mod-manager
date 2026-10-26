@@ -1,5 +1,6 @@
 import { nowSeconds, randomToken, requireUser, type User } from "./auth";
 import { numberVar, type Env } from "./env";
+import { cancelledExpiry } from "./cleanup";
 import { HttpError, json, readJson } from "./http";
 import { presignPut } from "./presign";
 import { DB_BYTES_SQL, classAUsed, countClassA, extraBucketBytes } from "./storage";
@@ -7,6 +8,8 @@ import { DB_BYTES_SQL, classAUsed, countClassA, extraBucketBytes } from "./stora
 const PUBLISH_LIFETIME = 3600;
 const MAX_BATCH = 50;
 const MAX_BLOBS = 2000;
+// R2 refuses a single PUT larger than 5 GiB.
+const MAX_BLOB_SIZE = 5 * 1024 ** 3;
 const PACK_ID = /^[A-Za-z0-9-]{1,64}$/;
 const HASH = /^[0-9a-f]{64}$/;
 
@@ -77,6 +80,7 @@ export async function beginPublish(req: Request, env: Env, packId: string): Prom
   for (const b of body.blobs as BlobRef[]) {
     if (!b || typeof b.sha256 !== "string" || !HASH.test(b.sha256)) throw badRequest("Bad blob hash");
     if (!Number.isSafeInteger(b.size) || b.size < 0) throw badRequest("Bad blob size");
+    if (b.size > MAX_BLOB_SIZE) throw badRequest("A file is larger than 5 GiB and cannot be uploaded");
     if (wanted.has(b.sha256) && wanted.get(b.sha256) !== b.size) throw badRequest("Conflicting sizes");
     wanted.set(b.sha256, b.size);
   }
@@ -173,7 +177,9 @@ export async function publishUrls(req: Request, env: Env, pid: string): Promise<
   const hashes = hashList(body.blobs);
   const known = await declared(env, publish.id);
   inPublish(known, hashes);
-  if ((await storedHashes(env, hashes)).size) throw badRequest("Blob is already stored");
+  if ((await storedHashes(env, hashes)).size) {
+    throw new HttpError(400, "already_stored", "A blob is already stored, verify it instead");
+  }
   const budget = numberVar(env, "OP_BUDGET");
   if ((await classAUsed(env)) + hashes.length > budget) {
     throw new HttpError(429, "op_budget", "The monthly upload budget is used up");
@@ -270,36 +276,37 @@ export async function commitPublish(req: Request, env: Env, pid: string): Promis
     published_at: publishedAt,
   });
   const rows = JSON.stringify([...known].map(([h, size]) => ({ h, s: size })));
-  const live = "exists (select 1 from publishes where id = ?)";
+  const live = `exists (select 1 from publishes where id = ? and expires_at > ?)
+    and exists (select 1 from packs where id = ? and uploader_id = ?)`;
+  const guard = [publish.id, publishedAt, publish.pack_id, user.id];
   const stmts = [
     env.DB.prepare(
       `insert or ignore into blobs (sha256, size)
        select json_extract(value, '$.h'), json_extract(value, '$.s') from json_each(?)
        where ${live}`,
-    ).bind(rows, publish.id),
-    env.DB.prepare(`delete from pack_blobs where pack_id = ? and ${live}`).bind(
-      publish.pack_id,
-      publish.id,
-    ),
+    ).bind(rows, ...guard),
+    env.DB.prepare(`delete from pack_blobs where pack_id = ? and ${live}`).bind(publish.pack_id, ...guard),
     env.DB.prepare(
       `insert into pack_blobs (pack_id, sha256)
        select ?, json_extract(value, '$.h') from json_each(?) where ${live}`,
-    ).bind(publish.pack_id, rows, publish.id),
+    ).bind(publish.pack_id, rows, ...guard),
     env.DB.prepare(
       `update packs set manifest = ?, name = ?, version = ?, published_at = ?
        where id = ? and uploader_id = ? and ${live}`,
-    ).bind(stored, publish.name, publish.version, publishedAt, publish.pack_id, user.id, publish.id),
-    env.DB.prepare("delete from publish_blobs where publish_id = ?").bind(publish.id),
-    env.DB.prepare("delete from publishes where id = ?").bind(publish.id),
+    ).bind(stored, publish.name, publish.version, publishedAt, publish.pack_id, user.id, ...guard),
+    env.DB.prepare(`delete from publish_blobs where publish_id = ? and ${live}`).bind(publish.id, ...guard),
+    env.DB.prepare(`delete from publishes where id = ? and ${live}`).bind(publish.id, ...guard),
   ];
   const results = await env.DB.batch(stmts);
-  if (results[results.length - 1].meta.changes !== 1) throw gone();
+  if (results[3].meta.changes !== 1 || results[5].meta.changes !== 1) throw gone();
   return json({ ok: true });
 }
 
 export async function cancelPublish(req: Request, env: Env, pid: string): Promise<Response> {
   const user = await requireUploader(req, env);
   const publish = await ownPublish(env, user, pid);
-  await dropPublish(env, publish.id);
+  await env.DB.prepare("update publishes set expires_at = ? where id = ?")
+    .bind(cancelledExpiry(nowSeconds()), publish.id)
+    .run();
   return json({ ok: true });
 }

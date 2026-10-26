@@ -112,6 +112,14 @@ it("owner id gets owner role", async () => {
   expect(((await tok.json()) as { user: { role: string } }).user.role).toBe("owner");
 });
 
+it("a former owner is demoted on sign-in", async () => {
+  await env.DB.prepare("insert or replace into users (id, name, role, created_at) values ('d9', 'old', 'owner', 1)").run();
+  stubDiscord({ id: "d9", username: "old" });
+  const verifier = "q".repeat(50);
+  const tok = await postToken(await runToAppCode(verifier), verifier);
+  expect(((await tok.json()) as { user: { role: string } }).user.role).toBe("uploader");
+});
+
 it("non-loopback redirect is refused", async () => {
   const bad = [
     "http://evil.example/cb",

@@ -4,8 +4,14 @@ import { countClassA } from "./storage";
 
 const MAX_DELETES = 40;
 const PREFIX = "blobs/";
-// A commit can run a few seconds after its publish expires, so cleanup waits one cron interval.
+// Cleanup waits one cron interval past expiry, which also outlasts every presigned URL.
 const EXPIRY_GRACE = 900;
+
+// Cancelled publishes expire now, so cleanup waits the full grace and in-flight uploads finish first.
+export const cancelledExpiry = (now: number) => now;
+
+const ABANDONED_PACKS = `select id from packs where manifest is null
+  and not exists (select 1 from publishes where pack_id = packs.id and expires_at > ?)`;
 
 const OPEN_PUBLISH_HASHES = `select pb.sha256 from publish_blobs pb
   join publishes p on p.id = pb.publish_id where p.expires_at > ?`;
@@ -24,6 +30,9 @@ export async function cleanup(env: Env, now: number): Promise<void> {
     env.DB.prepare("delete from logins where expires_at <= ?").bind(now),
     env.DB.prepare("delete from invites where expires_at <= ?").bind(now),
     env.DB.prepare("delete from sessions where last_used < ?").bind(now - IDLE_EXPIRY),
+    env.DB.prepare(`delete from pack_viewers where pack_id in (${ABANDONED_PACKS})`).bind(now),
+    env.DB.prepare(`delete from invites where pack_id in (${ABANDONED_PACKS})`).bind(now),
+    env.DB.prepare(`delete from packs where id in (${ABANDONED_PACKS})`).bind(now),
   ]);
 
   const cutoff = now - EXPIRY_GRACE;

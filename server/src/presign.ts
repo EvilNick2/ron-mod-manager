@@ -1,6 +1,8 @@
 import { AwsClient } from "aws4fetch";
 import type { Env } from "./env";
 
+export const URL_LIFETIME = 300;
+
 export async function presignPut(
   env: Env,
   sha256: string,
@@ -14,7 +16,7 @@ export async function presignPut(
     service: "s3",
     region: "auto",
   });
-  const url = `https://${env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com/${env.R2_BUCKET_NAME}/blobs/${sha256}?X-Amz-Expires=300`;
+  const url = `https://${env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com/${env.R2_BUCKET_NAME}/blobs/${sha256}?X-Amz-Expires=${URL_LIFETIME}`;
   const signed = await client.sign(url, {
     method: "PUT",
     headers: { "content-length": String(size), "x-amz-checksum-sha256": sha256Base64 },

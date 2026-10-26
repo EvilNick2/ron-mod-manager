@@ -134,7 +134,7 @@ it("accepting twice is harmless", async () => {
   const used = await env.DB.prepare("select used_at from invites where code = ?")
     .bind(code)
     .first<{ used_at: number | null }>();
-  expect(used?.used_at).not.toBeNull();
+  expect(used?.used_at).toBeNull();
 
   // the owner accepting a fresh invite keeps the owner role
   const code2 = await mintUploader(owner);

@@ -101,6 +101,7 @@ it("viewer leaves", async () => {
   const up = await signIn("up");
   const leave = await api("/packs/pack-a/membership", { method: "DELETE" }, up);
   expect(leave.status).toBe(400);
+  expect(((await leave.json()) as { error: string }).error).toBe("own_pack");
 });
 
 it("only the pack's uploader manages it", async () => {
@@ -148,8 +149,8 @@ it("removing an uploader deletes their packs", async () => {
   expect(await count("select count(*) as n from packs where id = 'pack-a'")).toBe(0);
   expect(await count("select count(*) as n from pack_viewers where pack_id = 'pack-a'")).toBe(0);
   expect(await count("select count(*) as n from pack_blobs")).toBe(0);
-  expect(await count("select count(*) as n from publishes")).toBe(0);
-  expect(await count("select count(*) as n from publish_blobs")).toBe(0);
+  expect(await count("select count(*) as n from publishes where expires_at <= ?", nowSeconds())).toBe(1);
+  expect(await count("select count(*) as n from publish_blobs")).toBe(1);
   expect(await count("select count(*) as n from pack_viewers where user_id = 'up'")).toBe(0);
   expect(await count("select count(*) as n from sessions where user_id = 'up'")).toBe(0);
   expect(await count("select count(*) as n from packs where id = 'pack-b'")).toBe(1);
@@ -164,7 +165,7 @@ it("owner cannot remove themselves", async () => {
   const up = await signIn("up");
   const res = await api("/admin/users/own", { method: "DELETE" }, owner);
   expect(res.status).toBe(400);
-  expect(((await res.json()) as { error: string }).error).toBe("bad_request");
+  expect(((await res.json()) as { error: string }).error).toBe("self_remove");
   expect((await api("/admin/users", {}, up)).status).toBe(403);
   expect((await api("/admin/users/own", { method: "DELETE" }, up)).status).toBe(403);
 });
@@ -181,4 +182,35 @@ it("removed people free a slot", async () => {
   expect((await api("/admin/users/up", { method: "DELETE" }, owner)).status).toBe(200);
   const ok = await api(`/invites/${code}/accept`, { method: "POST" }, late);
   expect(ok.status).toBe(200);
+});
+
+it("a removed viewer's old link answers invite_gone", async () => {
+  const up = await signIn("up");
+  const v = await signIn("v", "V", null);
+  await pack("pack-a", "up");
+  const link = (await (await invite("pack-a", up)).json()) as InviteBody;
+  const accept = () => api(`/invites/${link.url.split("/i/")[1]}/accept`, { method: "POST" }, v);
+  expect((await accept()).status).toBe(200);
+  const removed = await api("/packs/pack-a/viewers/v", { method: "DELETE" }, up);
+  expect(await removed.json()).toEqual({ ok: true, invite_reset: true });
+  const again = await accept();
+  expect(again.status).toBe(404);
+  expect(((await again.json()) as { error: string }).error).toBe("invite_gone");
+});
+
+it("removing a user kills the links of packs they viewed and their old token", async () => {
+  const owner = await signIn("own", "Own", "owner");
+  const up = await signIn("up");
+  const v = await signIn("v", "V", null);
+  await pack("pack-a", "up");
+  const link = (await (await invite("pack-a", up)).json()) as InviteBody;
+  const accept = () => api(`/invites/${link.url.split("/i/")[1]}/accept`, { method: "POST" }, v);
+  expect((await accept()).status).toBe(200);
+  expect((await api("/admin/users/v", { method: "DELETE" }, owner)).status).toBe(200);
+  expect((await api("/me", {}, v)).status).toBe(401);
+  const v2 = await signIn("v", "V", null);
+  const again = await api(`/invites/${link.url.split("/i/")[1]}/accept`, { method: "POST" }, v2);
+  expect(again.status).toBe(404);
+  expect(((await again.json()) as { error: string }).error).toBe("invite_gone");
+  void accept;
 });

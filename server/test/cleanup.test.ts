@@ -173,3 +173,26 @@ it("a large expired publish drains in slices and does not block others", async (
   expect(await count("publishes")).toBe(0);
   expect(await count("publish_blobs")).toBe(0);
 });
+
+it("an abandoned first publish leaves no pack row after cleanup", async () => {
+  const add = (id: string, manifest: string | null) =>
+    env.DB.prepare("insert into packs (id, uploader_id, name, version, manifest) values (?, 'u', 'n', '1', ?)")
+      .bind(id, manifest)
+      .run();
+  await add("p", null);
+  await add("open", null);
+  await add("live", "{}");
+  await addPublish("pub", nowSeconds() - 1000, []);
+  await env.DB.prepare(
+    "insert into publishes (id, pack_id, user_id, name, version, expires_at) values ('pub2', 'open', 'u', 'n', '1', ?)",
+  ).bind(nowSeconds() + 3600).run();
+  await env.DB.prepare("insert into pack_viewers (pack_id, user_id) values ('p', 'v')").run();
+  await env.DB.prepare(
+    "insert into invites (code, kind, pack_id, created_by, expires_at) values ('c', 'viewer', 'p', 'u', ?)",
+  ).bind(nowSeconds() + 3600).run();
+  await cleanup(env, nowSeconds());
+  const left = await env.DB.prepare("select id from packs order by id").all<{ id: string }>();
+  expect(left.results.map((r) => r.id)).toEqual(["live", "open"]);
+  expect(await count("pack_viewers")).toBe(0);
+  expect(await count("invites")).toBe(0);
+});
