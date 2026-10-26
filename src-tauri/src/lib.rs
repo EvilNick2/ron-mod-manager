@@ -5,6 +5,7 @@ mod google;
 mod hashing;
 mod packs;
 mod publish;
+mod server;
 mod sso;
 mod subscribe;
 mod updater;
