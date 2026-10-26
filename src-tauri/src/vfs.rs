@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use serde::{Serialize, Deserialize};
@@ -984,6 +985,33 @@ fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
     Ok(())
 }
 
+// Keeps the source's history and records its mods so the fork's first publish can diff against them.
+// A fork without a changelog still works, so failures here are only logged.
+fn write_fork_changelog(pack_dir: &Path, source: &PackManifest, staged: &Path) {
+    let build = || -> Result<crate::packs::Changelog, String> {
+        let mut base = crate::packs::BaseSnapshot { name: source.name.clone(), version: source.version.clone(), ..Default::default() };
+        for id in &source.mod_ids {
+            let dir = pack_dir.join(id);
+            let meta = read_meta(&dir);
+            let name = meta.as_ref().and_then(|m| m.get("name")).and_then(|n| n.as_str()).unwrap_or(id).to_string();
+            let hash = match source.installed_hashes.get(id) {
+                Some(record) => record.hash.clone(),
+                None => {
+                    let files = crate::hashing::hash_mod_files_cached(&dir, id, &source.local_hashes, &mut BTreeMap::new(), &mut |_| {})?;
+                    crate::hashing::mod_hash(files.iter().map(|f| (f.path.as_str(), f.sha256.as_str())), &crate::hashing::addon_states(&dir))
+                }
+            };
+            base.mods.insert(id.clone(), crate::packs::ModState { name, version: meta_version(meta.as_ref()), hash, nexus_mod_id: id.parse().ok() });
+        }
+        let mut log = crate::packs::read_changelog(pack_dir);
+        log.base = Some(base);
+        Ok(log)
+    };
+    if let Err(e) = build().and_then(|log| crate::packs::write_changelog(staged, &log)) {
+        eprintln!("[FORK] Could not write the changelog for {}: {}", source.name, e);
+    }
+}
+
 // Copies the pack into a staging folder and renames it into place, so a failure leaves nothing behind.
 fn fork_pack_dir(mods_dir: &Path, pack_id: &str, new_name: &str) -> Result<PackManifest, String> {
     let pack_dir = mods_dir.join(pack_id);
@@ -1026,6 +1054,7 @@ fn fork_pack_dir(mods_dir: &Path, pack_id: &str, new_name: &str) -> Result<PackM
             ..Default::default()
         };
         write_manifest(&staged, &manifest)?;
+        write_fork_changelog(&pack_dir, &source, &staged);
         fs::rename(&staged, mods_dir.join(&new_id)).map_err(|e| format!("Failed to create the fork: {}", e))?;
         Ok(manifest)
     };
@@ -2914,6 +2943,36 @@ mod tests {
         assert_eq!(tree(&m.join("CS")), before);
         assert_eq!(read_json(&m.join("CS/3063/metadata.json"))["enabled"], Value::Bool(true));
         assert_eq!(pack_size(&m.join("CS/3063")), 3 + 3 + 30);
+    }
+
+    #[test]
+    fn fork_writes_base_and_keeps_history() {
+        use crate::packs::{read_changelog, write_changelog, write_manifest, BaseSnapshot, Changelog, InstalledMod, ModState, PackManifest};
+        use crate::server::VersionEntry;
+        let m = scratch("fork-base");
+        put(&m, "CS/3063/a.pak", b"aaa");
+        put(&m, "CS/3063/metadata.json", br#"{"name": "Vests", "installed_version": "1.4"}"#);
+        put(&m, "CS/4296/b.pak", b"bb");
+        put(&m, "CS/4296/metadata.json", br#"{"name": "Blood"}"#);
+        let pack = m.join("CS");
+        write_manifest(&pack, &PackManifest {
+            pack_id: "CS".into(), name: "Casual".into(), version: Some("1.2".into()),
+            mod_ids: vec!["3063".into(), "4296".into()],
+            installed_hashes: [("3063".to_string(), InstalledMod { hash: "recorded".into(), files: Default::default() })].into(),
+            ..Default::default() }).unwrap();
+        let history = vec![VersionEntry { version: "1.2".into(), published_at: 9, notes: "Older notes".into() }];
+        write_changelog(&pack, &Changelog { entries: history.clone(), base: Some(BaseSnapshot { name: "Origin".into(), ..Default::default() }) }).unwrap();
+
+        fork_pack_dir(&m, "CS", "My Fork").unwrap();
+        let log = read_changelog(&m.join("My-Fork"));
+        assert_eq!(log.entries, history);
+        let base = log.base.unwrap();
+        assert_eq!((base.name.as_str(), base.version.as_deref()), ("Casual", Some("1.2")));
+        assert_eq!(base.mods["3063"], ModState { name: "Vests".into(), version: Some("1.4".into()), hash: "recorded".into(), nexus_mod_id: Some(3063) });
+        let blood = &base.mods["4296"];
+        assert_eq!((blood.name.as_str(), blood.version.as_deref(), blood.nexus_mod_id), ("Blood", None, Some(4296)));
+        let files = crate::hashing::hash_mod_files(&pack.join("4296"), &mut |_| {}).unwrap();
+        assert_eq!(blood.hash, crate::hashing::mod_hash(files.iter().map(|f| (f.path.as_str(), f.sha256.as_str())), &Default::default()));
     }
 
     #[test]

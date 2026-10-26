@@ -1,5 +1,6 @@
 mod accounts;
 mod api;
+mod changelog;
 mod config;
 mod drive;
 mod google;

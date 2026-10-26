@@ -47,6 +47,25 @@ pub async fn fetch_mod_metadata(game_domain: String, mod_id: u32) -> Result<Valu
     }
 }
 
+pub fn fetch_mod_changelogs_blocking(game_domain: &str, mod_id: u32) -> Result<Value, String> {
+    let api_key = crate::config::get_api_key()?.ok_or("No API key found. Please log in first.")?;
+    let url = format!("https://api.nexusmods.com/v1/games/{}/mods/{}/changelogs.json", game_domain, mod_id);
+    let mut headers = HeaderMap::new();
+    headers.insert("apikey", HeaderValue::from_str(&api_key).map_err(|e| e.to_string())?);
+    headers.insert("accept", HeaderValue::from_static("application/json"));
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let res = client.get(&url).headers(headers).send().map_err(|e| e.to_string())?;
+    if res.status().is_success() {
+        res.json::<Value>().map_err(|e| e.to_string())
+    } else {
+        Err(format!("Nexus API Error: {}", res.status()))
+    }
+}
+
 #[tauri::command]
 pub fn open_browser_url(app_handle: tauri::AppHandle, url: String) -> Result<(), String> {
     app_handle.opener().open_url(&url, None::<&str>)
