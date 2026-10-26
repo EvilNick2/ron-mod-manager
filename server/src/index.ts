@@ -18,7 +18,7 @@ import {
   removeViewer,
   resetPackInvite,
 } from "./manage";
-import { getBlob, getManifest, me } from "./packs";
+import { getBlob, getChangelog, getManifest, me } from "./packs";
 import {
   beginPublish,
   cancelPublish,
@@ -46,6 +46,7 @@ type CodeHandler = (req: Request, env: Env, ...params: string[]) => Promise<Resp
 const dynamicRoutes: { method: string; pattern: RegExp; handler: CodeHandler }[] = [
   { method: "GET", pattern: /^\/invites\/([^/]+)$/, handler: showInvite },
   { method: "GET", pattern: /^\/packs\/([^/]+)\/manifest$/, handler: getManifest },
+  { method: "GET", pattern: /^\/packs\/([^/]+)\/changelog$/, handler: getChangelog },
   { method: "GET", pattern: /^\/blobs\/([^/]+)$/, handler: getBlob },
   { method: "POST", pattern: /^\/invites\/([^/]+)\/accept$/, handler: acceptInviteRoute },
   { method: "POST", pattern: /^\/packs\/([^/]+)\/publish\/begin$/, handler: beginPublish },

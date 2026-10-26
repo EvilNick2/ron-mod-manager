@@ -58,6 +58,22 @@ export async function getManifest(req: Request, env: Env, packId: string): Promi
   return new Response(row.manifest, { headers: { "content-type": "application/json" } });
 }
 
+export async function getChangelog(req: Request, env: Env, packId: string): Promise<Response> {
+  const user = await requireUser(req, env);
+  const gone = new HttpError(404, "pack_gone", "This pack is not available");
+  if (!PACK_ID.test(packId) || /^[0-9]+$/.test(packId)) throw gone;
+  const row = await env.DB.prepare(`select p.id from packs p where p.id = ? and ${VISIBLE}`)
+    .bind(packId, isOwner(user.role), user.id, user.id)
+    .first();
+  if (!row) throw gone;
+  const rows = await env.DB.prepare(
+    "select version, published_at, notes from pack_versions where pack_id = ? order by id desc",
+  )
+    .bind(packId)
+    .all<{ version: string; published_at: number; notes: string }>();
+  return json({ versions: rows.results });
+}
+
 function rangeSatisfiable(header: string | null, size: number): boolean {
   const m = header ? /^bytes=(\d*)-(\d*)$/.exec(header) : null;
   if (!m || (!m[1] && !m[2])) return true;

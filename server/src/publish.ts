@@ -12,6 +12,10 @@ const MAX_BLOBS = 2000;
 const MAX_BLOB_SIZE = 5 * 1024 ** 3;
 const PACK_ID = /^[A-Za-z0-9-]{1,64}$/;
 const HASH = /^[0-9a-f]{64}$/;
+const MAX_NOTES = 32000;
+const MAX_HISTORY = 99;
+const MAX_HISTORY_BYTES = 1000000;
+const KEEP_VERSIONS = 100;
 
 interface BlobRef {
   sha256: string;
@@ -240,10 +244,26 @@ function manifestPairs(manifest: any, packId: string): Set<string> {
   return pairs;
 }
 
+function changelogInput(body: { notes?: unknown; history?: unknown }): { notes: string; history: unknown[] } {
+  const bad = () => new HttpError(400, "bad_changelog", "The changelog is too large");
+  const notes = body.notes ?? "";
+  const history = body.history ?? [];
+  if (typeof notes !== "string" || notes.length > MAX_NOTES) throw bad();
+  if (!Array.isArray(history) || history.length > MAX_HISTORY) throw bad();
+  if (new TextEncoder().encode(JSON.stringify(history)).length > MAX_HISTORY_BYTES) throw bad();
+  for (const e of history) {
+    if (!e || typeof e.version !== "string" || !Number.isSafeInteger(e.published_at) || typeof e.notes !== "string") {
+      throw bad();
+    }
+  }
+  return { notes, history };
+}
+
 export async function commitPublish(req: Request, env: Env, pid: string): Promise<Response> {
   const user = await requireUploader(req, env);
   const publish = await ownPublish(env, user, pid);
-  const body = await readJson<{ manifest?: any }>(req);
+  const body = await readJson<{ manifest?: any; notes?: unknown; history?: unknown }>(req);
+  const { notes, history } = changelogInput(body);
   const known = await declared(env, publish.id);
   const want = new Set([...known].map(([h, s]) => `${h}:${s}`));
   const got = manifestPairs(body.manifest, publish.pack_id);
@@ -279,6 +299,9 @@ export async function commitPublish(req: Request, env: Env, pid: string): Promis
   const live = `exists (select 1 from publishes where id = ? and expires_at > ?)
     and exists (select 1 from packs where id = ? and uploader_id = ?)`;
   const guard = [publish.id, publishedAt, publish.pack_id, user.id];
+  const seed = JSON.stringify(
+    history.map((e: any) => ({ v: e.version, p: e.published_at, n: e.notes })),
+  );
   const stmts = [
     env.DB.prepare(
       `insert or ignore into blobs (sha256, size)
@@ -294,11 +317,25 @@ export async function commitPublish(req: Request, env: Env, pid: string): Promis
       `update packs set manifest = ?, name = ?, version = ?, published_at = ?
        where id = ? and uploader_id = ? and ${live}`,
     ).bind(stored, publish.name, publish.version, publishedAt, publish.pack_id, user.id, ...guard),
+    env.DB.prepare(
+      `insert into pack_versions (pack_id, version, published_at, notes)
+       select ?, json_extract(value, '$.v'), json_extract(value, '$.p'), json_extract(value, '$.n')
+       from json_each(?)
+       where not exists (select 1 from pack_versions where pack_id = ?) and ${live}`,
+    ).bind(publish.pack_id, seed, publish.pack_id, ...guard),
+    env.DB.prepare(
+      `insert into pack_versions (pack_id, version, published_at, notes)
+       select ?, ?, ?, ? where ${live}`,
+    ).bind(publish.pack_id, publish.version, publishedAt, notes, ...guard),
+    env.DB.prepare(
+      `delete from pack_versions where pack_id = ? and ${live}
+       and id not in (select id from pack_versions where pack_id = ? order by id desc limit ?)`,
+    ).bind(publish.pack_id, ...guard, publish.pack_id, KEEP_VERSIONS),
     env.DB.prepare(`delete from publish_blobs where publish_id = ? and ${live}`).bind(publish.id, ...guard),
     env.DB.prepare(`delete from publishes where id = ? and ${live}`).bind(publish.id, ...guard),
   ];
   const results = await env.DB.batch(stmts);
-  if (results[3].meta.changes !== 1 || results[5].meta.changes !== 1) throw gone();
+  if (results[3].meta.changes !== 1 || results[8].meta.changes !== 1) throw gone();
   return json({ ok: true });
 }
 

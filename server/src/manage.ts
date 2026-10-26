@@ -16,6 +16,7 @@ function packStatements(env: Env, ids: string, arg: string): D1PreparedStatement
     run(`delete from pack_viewers where pack_id in (${ids})`),
     run(`delete from pack_blobs where pack_id in (${ids})`),
     run(`delete from invites where pack_id in (${ids})`),
+    run(`delete from pack_versions where pack_id in (${ids})`),
     env.DB.prepare(`update publishes set expires_at = min(expires_at, ?) where pack_id in (${ids})`).bind(
       cancelledExpiry(nowSeconds()),
       arg,
