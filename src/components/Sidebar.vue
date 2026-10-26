@@ -393,7 +393,7 @@ async function launchGame() {
               </button>
             </div>
           </div>
-          <span v-if="pack.published?.dirty" class="pack-dirty">Changes not uploaded</span>
+          <span v-if="pack.published?.server && pack.published.dirty" class="pack-dirty">Changes not uploaded</span>
           <div v-if="store.packUpdates[pack.pack_id]?.status === 'available'" class="pack-update">
             <span class="pack-update-text">{{ updateLine(store.packUpdates[pack.pack_id]) }}</span>
             <button

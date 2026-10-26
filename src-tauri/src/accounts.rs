@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use tauri::AppHandle;
 use tauri_plugin_opener::OpenerExt;
 
-use crate::server::{HttpServer, PackServer, ServerError, User};
+use crate::server::{HttpServer, Me, PackServer, ServerError, User};
 
 pub const DEFAULT_SERVER: &str = "https://packs.evilnick.net";
 
@@ -86,9 +86,33 @@ fn forget_server_in(dir: &Path, base: &str) {
     write_servers(dir, &list);
 }
 
-pub fn servers() -> Vec<String> {
+// Servers that installed or published packs use, so a signed out one keeps its Settings row
+fn pack_servers(mods_dir: &Path) -> Vec<String> {
+    let mut out: Vec<String> = crate::vfs::child_dirs(mods_dir)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|name| crate::packs::read_manifest(&mods_dir.join(name)))
+        .flat_map(|m| m.source.and_then(|s| s.server).into_iter().chain(m.published.and_then(|p| p.server)))
+        .filter_map(|base| normalize_base(&base).ok())
+        .collect();
+    out.sort();
+    out
+}
+
+fn listed_in(dir: &Path, mods_dir: Option<&Path>) -> Vec<String> {
+    let mut out = servers_in(dir);
+    for base in mods_dir.map(pack_servers).unwrap_or_default() {
+        if !out.contains(&base) {
+            out.push(base);
+        }
+    }
+    out
+}
+
+/// Remembered servers, then the servers of the packs in mods_dir
+pub fn servers(mods_dir: Option<&Path>) -> Vec<String> {
     match CONFIG_DIR.get() {
-        Some(dir) => servers_in(dir),
+        Some(dir) => listed_in(dir, mods_dir),
         None => vec![DEFAULT_SERVER.to_string()],
     }
 }
@@ -234,6 +258,19 @@ impl Conn {
         check_in(&*self.store, self.base(), r)
     }
 
+    /// Saves the user `me` names over the stored one, keeping the token, so role changes reach the app
+    pub fn update_user(&self, me: &Me) {
+        let Some(mut session) = session_in(&*self.store, self.base()) else { return };
+        let user = User { id: me.id.clone(), name: me.name.clone(), role: me.role.clone() };
+        if session.user == user {
+            return;
+        }
+        session.user = user;
+        if let Err(e) = save_session_in(&*self.store, self.base(), &session) {
+            eprintln!("[ACCOUNTS] Could not save the session for {}: {}", self.base(), e);
+        }
+    }
+
     /// `call`, with the error as the user sentence naming this server
     pub fn text<T>(&self, r: Result<T, ServerError>) -> Result<T, String> {
         self.call(r).map_err(|e| e.text(self.base()))
@@ -366,9 +403,10 @@ pub struct ServerStatus {
 }
 
 #[tauri::command]
-pub async fn list_servers() -> Result<Vec<ServerStatus>, String> {
-    tauri::async_runtime::spawn_blocking(|| {
-        servers()
+pub async fn list_servers(app_handle: AppHandle) -> Result<Vec<ServerStatus>, String> {
+    let mods_dir = crate::vfs::get_mods_dir(&app_handle).ok();
+    tauri::async_runtime::spawn_blocking(move || {
+        servers(mods_dir.as_deref())
             .into_iter()
             .map(|base| {
                 let user = session(&base).map(|s| s.user);
@@ -479,6 +517,32 @@ mod tests {
         assert_eq!(servers_in(&dir).len(), 2);
         forget_server_in(&dir, "https://a.test");
         assert_eq!(servers_in(&dir), vec![DEFAULT_SERVER.to_string()]);
+    }
+
+    #[test]
+    fn servers_used_by_packs_stay_listed() {
+        use crate::packs::{self, PackManifest, PackSource, Published};
+        let dir = temp("servers-packs");
+        let mods = temp("servers-packs-mods");
+        let put = |id: &str, source: Option<PackSource>, published: Option<Published>| {
+            let pack_dir = mods.join(id);
+            std::fs::create_dir_all(&pack_dir).unwrap();
+            let man = PackManifest { pack_id: id.into(), name: id.into(), source, published, ..Default::default() };
+            packs::write_manifest(&pack_dir, &man).unwrap();
+        };
+        let server = |base: &str| Some(PackSource { kind: "server".into(), server: Some(base.into()), ..Default::default() });
+        put("Viewed", server("https://viewed.test"), None);
+        put("Mine", None, Some(Published { server: Some("https://mine.test".into()), dirty: false }));
+        put("Drive", Some(PackSource { kind: "drive".into(), folder_id: Some("F".into()), ..Default::default() }), None);
+        put("Default", server(DEFAULT_SERVER), None);
+        remember_server_in(&dir, "https://a.test");
+        assert_eq!(
+            listed_in(&dir, Some(&mods)),
+            vec![DEFAULT_SERVER.to_string(), "https://a.test".to_string(), "https://mine.test".to_string(), "https://viewed.test".to_string()]
+        );
+        assert_eq!(listed_in(&dir, None), vec![DEFAULT_SERVER.to_string(), "https://a.test".to_string()]);
+        // Listing never remembers a pack's server, so forgetting one still drops it from servers.json
+        assert_eq!(servers_in(&dir), vec![DEFAULT_SERVER.to_string(), "https://a.test".to_string()]);
     }
 
     fn sample() -> Session {

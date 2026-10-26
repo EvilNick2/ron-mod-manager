@@ -491,6 +491,15 @@ pub fn publish_pack(
     result
 }
 
+// The owner and viewers can see another uploader's pack, which begin would refuse as pack_taken.
+// True when me() fails, so begin decides.
+fn uploads_pack(conn: &Conn, pack_id: &str) -> bool {
+    match conn.call(conn.server().me()) {
+        Ok(me) => me.packs.iter().find(|p| p.id == pack_id).is_none_or(|p| p.access == "uploader"),
+        Err(_) => true,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_publish(
     conn: &Conn,
@@ -511,6 +520,9 @@ fn run_publish(
         Err(e) if e.code == "pack_gone" => None,
         Err(e) => return Err(e.text(&base)),
     };
+    if remote.is_some() && manifest.published.as_ref().and_then(|p| p.server.as_deref()).is_none() && !uploads_pack(conn, pack_id) {
+        return Err(ServerError::new("pack_taken", "").text(&base));
+    }
     if let Some(old) = &remote {
         if old.format > FORMAT {
             return Err("Update RON Mod Manager to publish this pack".to_string());
@@ -592,7 +604,7 @@ pub fn dirty_packs(mods_dir: &Path) -> Vec<PackRef> {
         .filter(|e| e.path().is_dir())
         .filter_map(|e| {
             let manifest = packs::read_manifest(&e.path())?;
-            if !manifest.published.as_ref().is_some_and(|p| p.dirty) {
+            if !manifest.published.as_ref().is_some_and(|p| p.dirty && p.server.is_some()) {
                 return None;
             }
             Some(PackRef { pack_id: e.file_name().to_string_lossy().to_string(), name: manifest.name, version: manifest.version })
@@ -662,7 +674,7 @@ pub async fn publish_pack_cmd(
     let domain = config.game_domain.unwrap_or_else(|| "readyornot".to_string());
     tauri::async_runtime::spawn_blocking(move || {
         let published = packs::read_manifest(&pack_dir).and_then(|m| m.published).and_then(|p| p.server);
-        let signed_in: Vec<(String, Option<String>)> = accounts::servers()
+        let signed_in: Vec<(String, Option<String>)> = accounts::servers(None)
             .into_iter()
             .filter_map(|base| accounts::session(&base).map(|s| (base, s.user.role)))
             .collect();
@@ -960,6 +972,31 @@ mod tests {
         w.owner.seed_pack("other", &theirs, "Theirs");
         assert_eq!(publish(&w, &pack_dir, "1.0.0").unwrap_err(), TAKEN);
         assert_eq!(w.owner.puts(), 0);
+        assert!(packs::read_manifest(&pack_dir).unwrap().published.is_none());
+        assert_eq!(w.owner.manifest(PACK).unwrap().name, "Theirs");
+    }
+
+    #[test]
+    fn owner_publishing_a_taken_id_says_pack_taken() {
+        let pack_dir = pack_fixture("taken-owner", &base_mods());
+        let w = World::new();
+        w.owner.add_user("other", "Other", Some("uploader"));
+        let theirs = RemoteManifest {
+            format: FORMAT,
+            pack_id: PACK.into(),
+            name: "Theirs".into(),
+            version: "3.0.0".into(),
+            status: "ready".into(),
+            published_at: 1,
+            mods: Vec::new(),
+        };
+        w.owner.seed_pack("other", &theirs, "Theirs");
+        let owner = Conn::new(w.owner.as_user(crate::server::fake::OWNER), w.store.clone());
+        for version in ["1.0.0", "3.0.0", "4.0.0"] {
+            let err = publish_pack(&owner, &pack_dir, version, NOW, None, &mut no_progress()).unwrap_err();
+            assert_eq!(err, TAKEN, "{}", version);
+        }
+        assert_eq!(w.owner.begins(), 0);
         assert!(packs::read_manifest(&pack_dir).unwrap().published.is_none());
         assert_eq!(w.owner.manifest(PACK).unwrap().name, "Theirs");
     }
@@ -1514,8 +1551,19 @@ mod tests {
         mk("alpha", "Alpha", at(true));
         mk("clean", "Clean", at(false));
         mk("local", "Local", None);
+        mk("drive", "Drive", Some(Published { server: None, dirty: true }));
         let names: Vec<_> = dirty_packs(&mods).into_iter().map(|p| p.name).collect();
         assert_eq!(names, vec!["Alpha", "Zeta"]);
+    }
+
+    #[test]
+    fn drive_era_dirty_pack_does_not_block_close() {
+        let mods = scratch("close-drive");
+        let dir = mods.join("drive");
+        fs::create_dir_all(&dir).unwrap();
+        let published = Some(Published { server: None, dirty: true });
+        packs::write_manifest(&dir, &PackManifest { pack_id: "drive".into(), name: "Drive".into(), published, ..Default::default() }).unwrap();
+        assert!(close_blocked(&mods).is_none());
     }
 
     fn sha_of(mods: &[LocalMod], id: &str, path: &str) -> String {

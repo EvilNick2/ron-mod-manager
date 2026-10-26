@@ -148,7 +148,8 @@ pub fn ensure_editable(mods_dir: &Path, key: &str) -> Result<(), String> {
 pub fn mark_pack_dirty(mods_dir: &Path, pack_id: &str) {
     let pack_dir = mods_dir.join(pack_id);
     let Some(mut m) = read_manifest(&pack_dir) else { return };
-    let Some(published) = m.published.as_mut() else { return };
+    // A Drive-era publish counts as never published
+    let Some(published) = m.published.as_mut().filter(|p| p.server.is_some()) else { return };
     if published.dirty {
         return;
     }
@@ -461,5 +462,10 @@ mod tests {
         mark_dirty(&mods, "Pub/3063");
         assert!(read_manifest(&mods.join("Pub")).unwrap().published.unwrap().dirty);
         mark_dirty(&mods, "5543");
+
+        put_pack(&mods, "Drive", "Drive", |m| m.published = Some(Published { server: None, dirty: false }));
+        let before = fs::read(mods.join("Drive/pack.json")).unwrap();
+        mark_dirty(&mods, "Drive/3063");
+        assert_eq!(fs::read(mods.join("Drive/pack.json")).unwrap(), before);
     }
 }

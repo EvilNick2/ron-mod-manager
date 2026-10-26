@@ -175,7 +175,8 @@ fn installed_info(mods_dir: &Path, pack_id: &str) -> Option<InstalledInfo> {
 }
 
 /// What an invite holds, without accepting it. Signed out, it only names the server.
-pub fn inspect_invite(conn: &Conn, code: &str, mods_dir: &Path) -> Result<LinkInfo, String> {
+/// `switch_from` is the pack a switch replaces, which may come from another server.
+pub fn inspect_invite(conn: &Conn, code: &str, mods_dir: &Path, switch_from: Option<&str>) -> Result<LinkInfo, String> {
     let mut info = LinkInfo {
         base: conn.base().to_string(),
         code: code.to_string(),
@@ -194,7 +195,9 @@ pub fn inspect_invite(conn: &Conn, code: &str, mods_dir: &Path) -> Result<LinkIn
     };
     if let Some(pack) = &invite.pack {
         validate_pack_id(&pack.id)?;
-        check_target(mods_dir, &pack.id, conn.base())?;
+        if switch_from != Some(pack.id.as_str()) {
+            check_target(mods_dir, &pack.id, conn.base())?;
+        }
         info.installed = installed_info(mods_dir, &pack.id);
     }
     info.signed_in = true;
@@ -586,7 +589,8 @@ pub fn install_pack(
     install_seeded(conn, pack_id, invite, uploader, None, mods_dir, paks_dir, progress)
 }
 
-// install_pack, reusing the files of the pack at seed_from, or else of the copy it replaces
+// install_pack, reusing the files of the pack at seed_from, or else of the copy it replaces.
+// A switch passes seed_from and has checked its target with check_switch_target.
 #[allow(clippy::too_many_arguments)]
 fn install_seeded(
     conn: &Conn,
@@ -599,7 +603,9 @@ fn install_seeded(
     progress: &mut dyn FnMut(Progress),
 ) -> Result<ImportSummary, String> {
     let manifest = fetch_remote(conn, pack_id)?;
-    check_target(mods_dir, pack_id, conn.base())?;
+    if seed_from.is_none() {
+        check_target(mods_dir, pack_id, conn.base())?;
+    }
     let archive = pack_archive(&manifest);
     let plan = vfs::plan_import(&archive, mods_dir)?;
     let target = mods_dir.join(pack_id);
@@ -657,6 +663,9 @@ pub fn add_from_invite(
     let accepted = conn.text(conn.server().accept_invite(&code))?;
     crate::accounts::remember_server(conn.base());
     if accepted.kind == "uploader" {
+        if let Ok(me) = conn.call(conn.server().me()) {
+            conn.update_user(&me);
+        }
         return Ok(None);
     }
     let pack_id = accepted.pack_id.ok_or_else(|| "That invite has no pack".to_string())?;
@@ -693,9 +702,13 @@ fn switch_source(mods_dir: &Path, pack_id: &str) -> Result<(PathBuf, PackManifes
     Ok((pack_dir, local))
 }
 
+// The same id is replaced in place, from whichever server, since the user picked that pack
 fn check_switch_target(mods_dir: &Path, pack_id: &str, new_pack_id: &str, base: &str) -> Result<(), String> {
     validate_pack_id(new_pack_id)?;
-    if new_pack_id != pack_id && packs::read_manifest(&mods_dir.join(new_pack_id)).is_some() {
+    if new_pack_id == pack_id {
+        return Ok(());
+    }
+    if packs::read_manifest(&mods_dir.join(new_pack_id)).is_some() {
         return Err(format!("{} is already installed. Delete it first or update it instead.", new_pack_id));
     }
     check_target(mods_dir, new_pack_id, base)
@@ -915,6 +928,9 @@ fn check_all(mods_dir: &Path, connect: &dyn Fn(&str) -> Conn) -> Vec<UpdateCheck
             let (conn, me) = servers.entry(base.clone()).or_insert_with(|| {
                 let conn = connect(&base);
                 let me = conn.call(conn.server().me()).ok();
+                if let Some(me) = &me {
+                    conn.update_user(me);
+                }
                 (conn, me)
             });
             refresh_uploader(&pack_dir, &local, me.as_ref());
@@ -950,10 +966,10 @@ fn paks_or_placeholder(app_handle: &tauri::AppHandle, mods_dir: &Path) -> PathBu
 }
 
 #[tauri::command]
-pub async fn inspect_pack_link(app_handle: tauri::AppHandle, link: String) -> Result<LinkInfo, String> {
+pub async fn inspect_pack_link(app_handle: tauri::AppHandle, link: String, switch_from: Option<String>) -> Result<LinkInfo, String> {
     let (base, code) = parse_invite(&link)?;
     let mods_dir = vfs::get_mods_dir(&app_handle)?;
-    tauri::async_runtime::spawn_blocking(move || inspect_invite(&Conn::live(&base), &code, &mods_dir))
+    tauri::async_runtime::spawn_blocking(move || inspect_invite(&Conn::live(&base), &code, &mods_dir, switch_from.as_deref()))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -1583,11 +1599,11 @@ mod tests {
         let mods = scratch("sub-inspect");
 
         let out = Conn::new(w.owner.as_user(VIEWER), Arc::new(MemoryStore::default()));
-        let info = inspect_invite(&out, &code, &mods).unwrap();
+        let info = inspect_invite(&out, &code, &mods, None).unwrap();
         assert_eq!((info.base.as_str(), info.code.as_str(), info.signed_in), (BASE, code.as_str(), false));
         assert!(info.pack.is_none() && info.installed.is_none());
 
-        let info = inspect_invite(&w.conn(), &code, &mods).unwrap();
+        let info = inspect_invite(&w.conn(), &code, &mods, None).unwrap();
         assert_eq!((info.base.as_str(), info.kind.as_str(), info.signed_in), (base.as_str(), "viewer", true));
         let pack = info.pack.unwrap();
         assert_eq!((pack.id.as_str(), pack.version.as_str(), pack.uploader.name.as_str()), (PACK, "1.0", "Uploader"));
@@ -1595,11 +1611,11 @@ mod tests {
         assert_eq!(w.downloads(), 0);
 
         add(&w, &mods, &mods.join("paks")).unwrap();
-        let installed = inspect_invite(&w.conn(), &code, &mods).unwrap().installed.unwrap();
+        let installed = inspect_invite(&w.conn(), &code, &mods, None).unwrap().installed.unwrap();
         assert_eq!((installed.version.as_deref(), installed.from.as_str()), (Some("1.0"), "server"));
 
         w.owner.expire_session();
-        let info = inspect_invite(&w.conn(), &code, &mods).unwrap();
+        let info = inspect_invite(&w.conn(), &code, &mods, None).unwrap();
         assert!(!info.signed_in);
         assert!(!w.signed_in());
     }
@@ -2562,6 +2578,36 @@ mod tests {
     }
 
     #[test]
+    fn uploader_invite_refreshes_stored_role() {
+        let w = World::new();
+        w.owner.add_user("newbie", "Newbie", None);
+        let store = Arc::new(MemoryStore::default());
+        let user = User { id: "newbie".into(), name: "Newbie".into(), role: None };
+        save_session_in(&*store, BASE, &Session { token: "tok-n".into(), user }).unwrap();
+        let link = w.owner.uploader_invite().unwrap().url;
+        let mods = scratch("sub-uploader-role");
+        let conn = Conn::new(w.owner.as_user("newbie"), store.clone());
+        add_from_invite(&conn, &link, &mods, &mods.join("paks"), &mut |_| {}).unwrap();
+        let session = session_in(&*store, BASE).unwrap();
+        assert_eq!(session.user.role.as_deref(), Some("uploader"));
+        assert_eq!(session.token, "tok-n");
+    }
+
+    #[test]
+    fn update_check_refreshes_stored_role() {
+        let w = World::new();
+        remote_fixture(&w, &base_mods());
+        let mods = scratch("sub-check-role");
+        add(&w, &mods, &mods.join("paks")).unwrap();
+        w.owner.add_user(VIEWER, "Viewer", Some("uploader"));
+        let checks = check_all(&mods, &|_: &str| w.conn());
+        assert_eq!(checks.len(), 1);
+        let session = session_in(&*w.store, BASE).unwrap();
+        assert_eq!(session.user.role.as_deref(), Some("uploader"));
+        assert_eq!(session.token, "tok");
+    }
+
+    #[test]
     fn viewer_invite_installs_pack() {
         let w = World::new();
         remote_fixture(&w, &base_mods());
@@ -2886,6 +2932,47 @@ mod tests {
         man.published = Some(packs::Published { server: None, dirty: false });
         packs::write_manifest(&pack_dir, &man).unwrap();
         assert_eq!(preview(&w, PACK, &link, &mods).unwrap().reused_files, 2);
+    }
+
+    #[test]
+    fn switch_same_id_to_another_server_reuses_files() {
+        let w = World::new();
+        let manifest = remote_fixture(&w, &base_mods());
+        let (mods, paks) = (scratch("switch-move"), scratch("switch-move-paks"));
+        add(&w, &mods, &paks).unwrap();
+        let pack_dir = mods.join(PACK);
+        let mut man = packs::read_manifest(&pack_dir).unwrap();
+        let source = man.source.as_mut().unwrap();
+        source.server = Some("https://other.test".into());
+        source.invite = Some("https://other.test/i/old".into());
+        source.uploader = Some("Old Uploader".into());
+        packs::write_manifest(&pack_dir, &man).unwrap();
+        bump(&w, &manifest);
+        let link = invite(&w, PACK);
+        let (_, code) = crate::server::parse_invite(&link).unwrap();
+        let err = "A pack called Casual-Shitters from another server is already installed. Delete or fork it first.";
+        assert_eq!(inspect_invite(&w.conn(), &code, &mods, None).unwrap_err(), err);
+        assert!(inspect_invite(&w.conn(), &code, &mods, Some(PACK)).unwrap().signed_in);
+
+        assert_eq!(preview(&w, PACK, &link, &mods).unwrap().new_pack_id, PACK);
+        let downloads = w.downloads();
+        let summary = switch(&w, PACK, PACK, &link, &mods, &paks).unwrap();
+        assert_eq!(summary.pack.version.as_deref(), Some("1.1"));
+        // metadata files are never reused, so only they and the blood pak download again
+        assert_eq!(w.downloads() - downloads, 3);
+        assert_eq!(fs::read(pack_dir.join("3311").join(B_PAK)).unwrap(), b"blood-v2");
+        assert_eq!(fs::read(pack_dir.join("3063").join(A_PAK)).unwrap(), b"vests-v1");
+        let source = packs::read_manifest(&pack_dir).unwrap().source.unwrap();
+        assert_eq!(source.server.as_deref(), Some(BASE));
+        assert_eq!(source.invite.as_deref(), Some(link.as_str()));
+        assert_eq!(source.uploader.as_deref(), Some("Uploader"));
+        assert!(no_staging(&mods));
+
+        // Add from link still refuses a pack from another server
+        let mut man = packs::read_manifest(&pack_dir).unwrap();
+        man.source.as_mut().unwrap().server = Some("https://other.test".into());
+        packs::write_manifest(&pack_dir, &man).unwrap();
+        assert_eq!(add(&w, &mods, &paks).unwrap_err(), err);
     }
 
     #[test]

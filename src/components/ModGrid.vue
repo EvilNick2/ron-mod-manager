@@ -450,7 +450,7 @@ async function refreshModsFromButton() {
             <span v-if="section.version" class="section-version">{{ section.version }}</span>
           </button>
           <span v-if="section.isActive" class="section-active-tag">active</span>
-          <span v-if="packOf(section)?.published?.dirty" class="section-dirty-tag">Changes not uploaded</span>
+          <span v-if="packOf(section)?.published?.server && packOf(section)!.published!.dirty" class="section-dirty-tag">Changes not uploaded</span>
           <span class="section-count">{{ sectionCount(section) }}</span>
           <template v-if="packOf(section) && store.packUpdates[section.id]">
             <span v-if="updateStatusLine(store.packUpdates[section.id])" class="section-update-tag">{{ updateStatusLine(store.packUpdates[section.id]) }}</span>

@@ -202,7 +202,7 @@ export function isLinked(packId: string): boolean {
 }
 
 export function isPublished(packId: string): boolean {
-  return !!store.packs.find((p) => p.pack_id === packId)?.published;
+  return !!store.packs.find((p) => p.pack_id === packId)?.published?.server;
 }
 
 // The webview clipboard API is unreliable on WebKitGTK, so this goes through the plugin
@@ -505,8 +505,8 @@ export async function checkPackUpdates(): Promise<void> {
     const checks = await invoke("check_pack_updates") as UpdateCheck[];
     if (seq !== updateCheckSeq) return;
     store.packUpdates = Object.fromEntries(checks.map((c) => [c.pack_id, c]));
-    const signedOut = checks.find((c) => c.error?.includes("Signed out of"));
-    if (signedOut) noteSignedOut(signedOut.error);
+    // The check also refreshes each server's stored role and drops expired sessions
+    await loadServers();
   } catch (e) {
     console.error("Failed to check modpack updates:", e);
   }
@@ -524,8 +524,9 @@ export function updateStatusLine(check: UpdateCheck | undefined): string {
   return "";
 }
 
-async function inspectLink(link: string): Promise<LinkInfo> {
-  return await invoke("inspect_pack_link", { link }) as LinkInfo;
+// switchFrom is the pack a switch replaces, which may hold the same id from another server
+async function inspectLink(link: string, switchFrom?: string): Promise<LinkInfo> {
+  return await invoke("inspect_pack_link", { link, switchFrom: switchFrom ?? null }) as LinkInfo;
 }
 
 async function acceptUploaderInvite(link: string, info: LinkInfo): Promise<void> {
@@ -633,12 +634,12 @@ async function runSwitch(pack: PackManifest): Promise<void> {
   const link = input.trim();
   const busy = (name: string) => `${name} is busy, try again when it finishes`;
   try {
-    const info = await inspectLink(link);
+    const info = await inspectLink(link, oldId);
     if (!info.signed_in) {
       if (!(await showConfirm(`Sign in to ${hostOf(info.base)} with Discord to continue?`))) return;
       await signInServer(info.base);
       checkPackUpdates();
-      if (!(await inspectLink(link)).signed_in) return;
+      if (!(await inspectLink(link, oldId)).signed_in) return;
     }
     if (store.inFlight[oldId]) {
       await showAlert(busy(pack.name));

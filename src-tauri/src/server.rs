@@ -70,22 +70,16 @@ fn valid_code(code: &str) -> bool {
     !code.is_empty() && code.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
-fn valid_base(base: &str) -> bool {
-    let host = match base.strip_prefix("https://").or_else(|| base.strip_prefix("http://127.0.0.1:")) {
-        Some(h) => h,
-        None => return false,
-    };
-    !host.is_empty() && !host.contains(['/', '?', '#', ' '])
-}
-
+/// The server base, normalized as sessions are keyed, and the invite code
 pub fn parse_invite(link: &str) -> Result<(String, String), String> {
     let link = link.trim();
     let link = link.strip_suffix('/').unwrap_or(link);
     let (base, code) = link.rsplit_once("/i/").ok_or(NOT_INVITE)?;
-    if !valid_base(base) || !valid_code(code) {
+    if !valid_code(code) {
         return Err(NOT_INVITE.to_string());
     }
-    Ok((base.to_string(), code.to_string()))
+    let base = crate::accounts::normalize_base(base).map_err(|_| NOT_INVITE.to_string())?;
+    Ok((base, code.to_string()))
 }
 
 /// The `x-amz-checksum-sha256` value, base64 of the raw hash bytes
@@ -1543,6 +1537,8 @@ mod tests {
             parse_invite("http://127.0.0.1:8787/i/xyz").unwrap(),
             ("http://127.0.0.1:8787".to_string(), "xyz".to_string())
         );
+        assert_eq!(parse_invite("https://Packs.EvilNick.NET/i/abc_D-1").unwrap(), want);
+        assert_eq!(parse_invite("HTTPS://packs.evilnick.net:443/i/abc_D-1").unwrap(), want);
     }
 
     #[test]
@@ -1551,6 +1547,9 @@ mod tests {
             "https://drive.google.com/drive/folders/1AbC",
             "https://packs.evilnick.net/i/",
             "https://packs.evilnick.net/i/abc.def",
+            "https://packs.evilnick.net/sub/i/abc",
+            "http://packs.evilnick.net/i/abc",
+            "https://user@packs.evilnick.net/i/abc",
             "",
         ] {
             assert_eq!(parse_invite(link).unwrap_err(), "That is not a pack invite link.");

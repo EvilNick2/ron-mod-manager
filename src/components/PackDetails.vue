@@ -158,7 +158,7 @@ function manageAccess() {
           <span class="detail-label">Published version</span>
           <span class="detail-value">{{ pack.version }}</span>
         </div>
-        <span v-if="pack.published?.dirty" class="pack-dirty">Changes not uploaded</span>
+        <span v-if="pack.published?.server && pack.published.dirty" class="pack-dirty">Changes not uploaded</span>
       </template>
 
       <div class="action-list">
