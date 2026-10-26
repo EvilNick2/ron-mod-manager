@@ -125,7 +125,7 @@ fn pack_archive(manifest: &RemoteManifest) -> PackArchive {
 // Refuses the creator's own pack, a pack from another server, or a folder that differs only in case
 fn check_target(mods_dir: &Path, pack_id: &str, base: &str) -> Result<(), String> {
     if let Some(existing) = packs::read_manifest(&mods_dir.join(pack_id)) {
-        if existing.published.is_some() {
+        if existing.published.as_ref().is_some_and(|p| p.server.is_some()) {
             return Err(format!("{} is your own published pack. Fork or delete it before adding it from a link.", existing.name));
         }
         if existing.source.as_ref().is_some_and(|s| s.kind == SERVER_KIND && s.server.as_deref() != Some(base)) {
@@ -359,20 +359,40 @@ fn place_cached(cached: &Path, dest: &Path) -> Result<(), String> {
     fs::copy(cached, dest).map(|_| ()).map_err(|e| format!("Failed to copy {} to {}: {}", cached.display(), dest.display(), e))
 }
 
-/// Links every file the installed pack at old_dir already has into the download cache by sha256,
-/// so staging takes it from there in place of downloading it
-pub(crate) fn seed_cache(old_dir: &Path, cache: &Path, manifest: &RemoteManifest) {
-    let Some(local) = packs::read_manifest(old_dir) else { return };
+/// The files an installed pack has, by sha256, metadata files left out. A mod with no install
+/// record, as in a pack made on this machine, is hashed with the pack's hash cache.
+fn pack_files(pack_dir: &Path) -> BTreeMap<String, PathBuf> {
     let mut have: BTreeMap<String, PathBuf> = BTreeMap::new();
-    for (id, record) in local.installed_hashes.iter().filter(|(id, _)| is_digits(id)) {
-        for (path, sha) in record.files.iter().filter(|(path, _)| !hashing::is_meta_file(path)) {
-            let Ok(rel) = safe_rel_path(path) else { continue };
-            let full = old_dir.join(id).join(rel);
-            if is_plain(&full, false) {
+    let Some(local) = packs::read_manifest(pack_dir) else { return have };
+    let Some(mods_dir) = pack_dir.parent().and_then(|d| d.canonicalize().ok()) else { return have };
+    let ids: BTreeSet<&String> = local.mod_ids.iter().chain(local.installed_hashes.keys()).filter(|id| is_digits(id)).collect();
+    for id in ids {
+        let mod_dir = pack_dir.join(id);
+        let files: Vec<(String, String)> = match local.installed_hashes.get(id) {
+            Some(record) => record.files.iter().map(|(path, sha)| (path.clone(), sha.clone())).collect(),
+            None => match hashing::hash_mod_files_cached(&mod_dir, id, &local.local_hashes, &mut BTreeMap::new(), &mut |_| {}) {
+                Ok(entries) => entries.into_iter().map(|f| (f.path, f.sha256)).collect(),
+                Err(_) => continue,
+            },
+        };
+        for (path, sha) in files.into_iter().filter(|(path, _)| !hashing::is_meta_file(path)) {
+            let Ok(rel) = safe_rel_path(&path) else { continue };
+            let full = mod_dir.join(rel);
+            // A symlinked folder in the pack must not pull in files from outside the mods folder
+            let inside = full.canonicalize().is_ok_and(|real| real.starts_with(&mods_dir));
+            if inside && is_plain(&full, false) {
                 have.entry(sha.to_ascii_lowercase()).or_insert(full);
             }
         }
     }
+    have
+}
+
+/// Links every file the installed pack at `from` already has into the download cache of pack_id
+/// by sha256, so staging takes it from there in place of downloading it
+pub(crate) fn seed_cache(from: &Path, mods_dir: &Path, pack_id: &str, manifest: &RemoteManifest) {
+    let have = pack_files(from);
+    let cache = cache_dir(mods_dir, pack_id);
     for f in manifest.mods.iter().flat_map(|m| &m.files) {
         let sha = f.sha256.to_ascii_lowercase();
         let dest = cache.join(&sha);
@@ -561,6 +581,21 @@ pub fn install_pack(
     paks_dir: &Path,
     progress: &mut dyn FnMut(Progress),
 ) -> Result<ImportSummary, String> {
+    install_seeded(conn, pack_id, invite, uploader, None, mods_dir, paks_dir, progress)
+}
+
+// install_pack, reusing the files of the pack at seed_from, or else of the copy it replaces
+#[allow(clippy::too_many_arguments)]
+fn install_seeded(
+    conn: &Conn,
+    pack_id: &str,
+    invite: Option<&str>,
+    uploader: Option<String>,
+    seed_from: Option<&Path>,
+    mods_dir: &Path,
+    paks_dir: &Path,
+    progress: &mut dyn FnMut(Progress),
+) -> Result<ImportSummary, String> {
     let manifest = fetch_remote(conn, pack_id)?;
     check_target(mods_dir, pack_id, conn.base())?;
     let archive = pack_archive(&manifest);
@@ -587,8 +622,8 @@ pub fn install_pack(
     let mod_ids = archive.folders.iter().map(|(id, _)| id.clone()).collect();
     let cache = cache_dir(mods_dir, pack_id);
     let result = (|| {
-        if let Some(old) = &plan.installed {
-            seed_cache(old, &cache, &manifest);
+        if let Some(from) = seed_from.or(plan.installed.as_deref()) {
+            seed_cache(from, mods_dir, pack_id, &manifest);
         }
         stage_remote(conn, &manifest, source, mod_ids, &staged, &cache, &|| op.cancelled(), progress)?;
         match &plan.installed {
@@ -628,6 +663,148 @@ pub fn add_from_invite(
     install_pack(conn, &pack_id, Some(link.trim()), uploader, mods_dir, paks_dir, progress).map(Some)
 }
 
+const OWN_PUBLISH: &str = "You publish this pack. Fork it to follow another pack.";
+const UPLOADER_INVITE: &str = "That is an uploader invite, not a pack link.";
+
+#[derive(Serialize, Debug)]
+pub struct SwitchPreview {
+    pub base: String,
+    pub new_pack_id: String,
+    pub name: String,
+    pub version: String,
+    pub uploader: Option<String>,
+    pub reused_files: usize,
+    pub total_files: usize,
+    pub download_bytes: u64,
+}
+
+// The installed pack to switch, refused when the user publishes it
+fn switch_source(mods_dir: &Path, pack_id: &str) -> Result<(PathBuf, PackManifest), String> {
+    let pack_dir = mods_dir.join(pack_id);
+    let local = packs::parse_key(&format!("{}/1", pack_id))
+        .ok()
+        .and_then(|_| packs::read_manifest(&pack_dir))
+        .ok_or_else(|| format!("No modpack folder for {:?}", pack_id))?;
+    if local.published.as_ref().is_some_and(|p| p.server.is_some()) {
+        return Err(OWN_PUBLISH.to_string());
+    }
+    Ok((pack_dir, local))
+}
+
+fn check_switch_target(mods_dir: &Path, pack_id: &str, new_pack_id: &str, base: &str) -> Result<(), String> {
+    validate_pack_id(new_pack_id)?;
+    if new_pack_id != pack_id && packs::read_manifest(&mods_dir.join(new_pack_id)).is_some() {
+        return Err(format!("{} is already installed. Delete it first or update it instead.", new_pack_id));
+    }
+    check_target(mods_dir, new_pack_id, base)
+}
+
+/// What switching pack_id to the pack behind link would reuse and download. Accepts the invite
+/// and writes nothing to disk.
+pub fn preview_switch_with(conn: &Conn, pack_id: &str, link: &str, mods_dir: &Path) -> Result<SwitchPreview, String> {
+    let (old_dir, _) = switch_source(mods_dir, pack_id)?;
+    let (_, code) = parse_invite(link)?;
+    // Asked first so an uploader invite is not used up
+    let info = conn.text(conn.server().invite_info(&code))?;
+    if info.kind == "uploader" {
+        return Err(UPLOADER_INVITE.to_string());
+    }
+    let accepted = conn.text(conn.server().accept_invite(&code))?;
+    crate::accounts::remember_server(conn.base());
+    let new_pack_id = accepted.pack_id.ok_or_else(|| UPLOADER_INVITE.to_string())?;
+    check_switch_target(mods_dir, pack_id, &new_pack_id, conn.base())?;
+    let manifest = fetch_remote(conn, &new_pack_id)?;
+
+    let have = pack_files(&old_dir);
+    let cache = cache_dir(mods_dir, &new_pack_id);
+    let files: Vec<&RemoteFileEntry> = manifest.mods.iter().flat_map(|m| &m.files).collect();
+    // Cache entries are counted by size only and the install hashes them again, so the count can be optimistic
+    let reused = |f: &RemoteFileEntry| {
+        let sha = f.sha256.to_ascii_lowercase();
+        have.contains_key(&sha) || cache.join(&sha).symlink_metadata().is_ok_and(|m| m.is_file() && m.len() == f.size)
+    };
+    let (kept, fetched): (Vec<&RemoteFileEntry>, Vec<&RemoteFileEntry>) = files.iter().partition(|f| reused(f));
+    Ok(SwitchPreview {
+        base: conn.base().to_string(),
+        new_pack_id,
+        name: manifest.name.clone(),
+        version: manifest.version.clone(),
+        uploader: info.pack.map(|p| p.uploader.name),
+        reused_files: kept.len(),
+        total_files: files.len(),
+        download_bytes: sum_sizes(fetched),
+    })
+}
+
+#[derive(Serialize, Debug)]
+pub struct SwitchSummary {
+    #[serde(flatten)]
+    pub import: ImportSummary,
+    // "<key>: <error>" for each mod that was on before the switch but could not be turned on
+    pub not_enabled: Vec<String>,
+}
+
+/// Installs new_pack_id with the files of pack_id reused, then deletes pack_id. A failed or
+/// cancelled install leaves pack_id as it was. Mods keep their on or off state by mod id, and
+/// mods new to the pack are on when the pack is the active preset, as in an update.
+#[allow(clippy::too_many_arguments)]
+pub fn switch_pack_with(
+    conn: &Conn,
+    pack_id: &str,
+    new_pack_id: &str,
+    invite: Option<&str>,
+    active: bool,
+    mods_dir: &Path,
+    paks_dir: &Path,
+    progress: &mut dyn FnMut(Progress),
+) -> Result<SwitchSummary, String> {
+    let (old_dir, local) = switch_source(mods_dir, pack_id)?;
+    check_switch_target(mods_dir, pack_id, new_pack_id, conn.base())?;
+    let moving = new_pack_id != pack_id;
+    let _old = if moving { Some(OpGuard::begin_named(&old_dir, OpKind::Local, &local.name)?) } else { None };
+    let flags: BTreeMap<String, bool> =
+        local.mod_ids.iter().map(|id| (id.clone(), vfs::flag_enabled(&old_dir.join(id)))).collect();
+    let uploader = uploader_name(conn, new_pack_id);
+    let mut import = install_seeded(conn, new_pack_id, invite, uploader, Some(&old_dir), mods_dir, paks_dir, progress)?;
+    let paks = paks_dir.is_dir().then_some(paks_dir);
+    if moving {
+        if let Err(e) = vfs::remove_pack_dir(mods_dir, paks, pack_id) {
+            eprintln!("[SUBSCRIBE] Could not delete {} after switching it: {}", pack_id, e);
+            import.failed_deletes.push(old_dir.display().to_string());
+        }
+    }
+
+    let target = mods_dir.join(new_pack_id);
+    let mut not_enabled = Vec::new();
+    for key in &import.keys {
+        let Some((_, id)) = key.split_once('/') else { continue };
+        if !flags.get(id).copied().unwrap_or(active) {
+            continue;
+        }
+        let dir = target.join(id);
+        vfs::set_enabled_flag(&dir, true);
+        if let Some(paks) = paks {
+            if let Err(e) = vfs::enable_key(mods_dir, paks, key) {
+                vfs::set_enabled_flag(&dir, false);
+                not_enabled.push(format!("{}: {}", key, e));
+            }
+        }
+    }
+    if let Some(paks) = paks {
+        vfs::sweep_orphans(paks, mods_dir);
+    }
+    Ok(SwitchSummary { import, not_enabled })
+}
+
+/// Moves saved presets and the active one from the old pack to the new, in one config write
+pub(crate) fn presets_after_switch(config: &mut crate::config::AppConfig, old_pack_id: &str, summary: &ImportSummary) {
+    let new_pack_id = &summary.pack.pack_id;
+    crate::config::tidy_presets_after_import(config, new_pack_id, &summary.superseded_ids, &summary.removed_keys);
+    if old_pack_id != new_pack_id {
+        crate::config::rename_pack_in_presets(config, old_pack_id, new_pack_id, &summary.keys);
+    }
+    crate::config::move_active_pack(config, old_pack_id, new_pack_id);
+}
 
 #[derive(Serialize, Debug)]
 pub struct UpdateCheck {
@@ -808,6 +985,52 @@ pub async fn add_pack_from_link(app_handle: tauri::AppHandle, link: String) -> R
     crate::config::save_config(app_handle, config)
         .map_err(|e| format!("The pack was added but saved presets could not be updated: {}", e))?;
     Ok(AddOutcome::Installed { pack_id: summary.pack.pack_id, version: summary.pack.version.unwrap_or_default() })
+}
+
+#[tauri::command]
+pub async fn preview_switch(app_handle: tauri::AppHandle, pack_id: String, link: String) -> Result<SwitchPreview, String> {
+    let (base, _) = parse_invite(&link)?;
+    let mods_dir = vfs::get_mods_dir(&app_handle)?;
+    tauri::async_runtime::spawn_blocking(move || preview_switch_with(&Conn::live(&base), &pack_id, &link, &mods_dir))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// `link` is the invite shown by preview_switch, saved with the pack as a normal install saves it
+#[tauri::command]
+pub async fn switch_pack(
+    app_handle: tauri::AppHandle,
+    pack_id: String,
+    base: String,
+    new_pack_id: String,
+    link: Option<String>,
+) -> Result<SwitchSummary, String> {
+    let base = crate::accounts::normalize_base(&base)?;
+    if let Some(link) = &link {
+        if parse_invite(link)?.0 != base {
+            return Err("That invite link is for another pack server".to_string());
+        }
+    }
+    let mods_dir = vfs::get_mods_dir(&app_handle)?;
+    let paks_dir = paks_or_placeholder(&app_handle, &mods_dir);
+    let old_id = pack_id.clone();
+    let active = crate::config::load_config(app_handle.clone())?.active_preset.as_deref() == Some(format!("pack:{}", pack_id).as_str());
+    let handle = app_handle.clone();
+    let summary = tauri::async_runtime::spawn_blocking(move || {
+        let mut emit = |p: Progress| {
+            let _ = handle.emit("pack-progress", p);
+        };
+        let invite = link.as_deref().map(str::trim);
+        switch_pack_with(&Conn::live(&base), &pack_id, &new_pack_id, invite, active, &mods_dir, &paks_dir, &mut emit)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    let mut config = crate::config::load_config(app_handle.clone())?;
+    presets_after_switch(&mut config, &old_id, &summary.import);
+    crate::config::save_config(app_handle, config)
+        .map_err(|e| format!("The pack was switched but saved presets could not be updated: {}", e))?;
+    Ok(summary)
 }
 
 #[tauri::command]
@@ -2509,5 +2732,343 @@ mod tests {
         assert_eq!(checks[0].status, "error");
         assert_eq!(checks[0].error.as_deref(), Some(UNAVAILABLE));
         assert!(w.signed_in());
+    }
+
+    const FORK: &str = "Casual-Fork";
+    const OWN_PUBLISH: &str = "You publish this pack. Fork it to follow another pack.";
+
+    fn plain_mod(id: &'static str, files: Vec<(&'static str, &'static str)>) -> FixtureMod {
+        FixtureMod { id, files, addons: vec![] }
+    }
+
+    // Three files, of which the fork keeps two and adds one
+    fn old_mods() -> Vec<FixtureMod> {
+        vec![plain_mod("3063", vec![(A_PAK, "vests-v1")]), plain_mod("3311", vec![("b.pak", "blood-v1"), ("c.pak", "extra")])]
+    }
+
+    fn fork_mods() -> Vec<FixtureMod> {
+        vec![
+            plain_mod("3063", vec![(A_PAK, "vests-v1")]),
+            plain_mod("3311", vec![("b.pak", "blood-v1")]),
+            plain_mod("3500", vec![("n.pak", "new-v1")]),
+        ]
+    }
+
+    fn invite(w: &World, pack_id: &str) -> String {
+        w.owner.as_user(UPLOADER).pack_invite(pack_id).unwrap().url
+    }
+
+    fn preview(w: &World, pack_id: &str, link: &str, mods: &Path) -> Result<SwitchPreview, String> {
+        preview_switch_with(&w.conn(), pack_id, link, mods)
+    }
+
+    fn switch(w: &World, pack_id: &str, new_pack_id: &str, link: &str, mods: &Path, paks: &Path) -> Result<ImportSummary, String> {
+        switch_as(w, pack_id, new_pack_id, link, false, mods, paks).map(|s| s.import)
+    }
+
+    fn switch_as(w: &World, pack_id: &str, new_pack_id: &str, link: &str, active: bool, mods: &Path, paks: &Path) -> Result<SwitchSummary, String> {
+        switch_pack_with(&w.conn(), pack_id, new_pack_id, Some(link), active, mods, paks, &mut |_| {})
+    }
+
+    /// The old pack installed, the fork on the server and the fork's invite link
+    fn fork_world(name: &str) -> (World, PathBuf, PathBuf, String) {
+        let w = World::new();
+        remote_fixture(&w, &old_mods());
+        let (mods, paks) = (scratch(name), scratch(&format!("{}-paks", name)));
+        add(&w, &mods, &paks).unwrap();
+        remote_fixture_as(&w, &fork_mods(), FORK);
+        let link = invite(&w, FORK);
+        (w, mods, paks, link)
+    }
+
+    // Every entry under dir with its content, the download cache included
+    fn tree(dir: &Path) -> BTreeMap<String, Option<Vec<u8>>> {
+        walkdir::WalkDir::new(dir)
+            .into_iter()
+            .map(|e| e.unwrap())
+            .map(|e| {
+                let rel = e.path().strip_prefix(dir).unwrap().display().to_string();
+                (rel, e.file_type().is_file().then(|| fs::read(e.path()).unwrap()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn preview_counts_reused_files() {
+        let (w, mods, _, link) = fork_world("switch-preview");
+        let p = preview(&w, PACK, &link, &mods).unwrap();
+        assert_eq!((p.base.as_str(), p.new_pack_id.as_str(), p.name.as_str(), p.version.as_str()), (BASE, FORK, NAME, "1.0"));
+        assert_eq!(p.uploader.as_deref(), Some("Uploader"));
+        assert_eq!((p.reused_files, p.total_files, p.download_bytes), (2, 3, 6));
+
+        let cache = cache_dir(&mods, FORK);
+        fs::create_dir_all(&cache).unwrap();
+        fs::write(cache.join(hashing::sha256_bytes(b"new-v1")), b"new-v1").unwrap();
+        let p = preview(&w, PACK, &link, &mods).unwrap();
+        assert_eq!((p.reused_files, p.total_files, p.download_bytes), (3, 3, 0));
+
+        let up = w.owner.uploader_invite().unwrap().url;
+        assert_eq!(preview(&w, PACK, &up, &mods).unwrap_err(), "That is an uploader invite, not a pack link.");
+        assert_eq!(w.owner.as_user(VIEWER).me().unwrap().role, None);
+        assert_eq!(w.downloads(), 3);
+    }
+
+    #[test]
+    fn preview_writes_nothing() {
+        let (w, mods, _, link) = fork_world("switch-preview-nothing");
+        let cache = cache_dir(&mods, FORK);
+        fs::create_dir_all(&cache).unwrap();
+        fs::write(cache.join(hashing::sha256_bytes(b"new-v1")), b"damage").unwrap();
+        let before = tree(&mods);
+        let downloads = w.downloads();
+        let p = preview(&w, PACK, &link, &mods).unwrap();
+        assert_eq!(p.new_pack_id, FORK);
+        assert_eq!(tree(&mods), before);
+        assert_eq!(w.downloads(), downloads);
+    }
+
+    #[test]
+    fn switch_to_fork_reuses_files() {
+        let (w, mods, paks, link) = fork_world("switch-fork");
+        crate::vfs::enable_key(&mods, &paks, &format!("{}/3063", PACK)).unwrap();
+        assert!(!links(&paks, "").is_empty());
+        let downloads = w.downloads();
+        let summary = switch(&w, PACK, FORK, &link, &mods, &paks).unwrap();
+        assert_eq!(summary.pack.pack_id, FORK);
+        assert_eq!(w.downloads() - downloads, 1);
+        assert!(!mods.join(PACK).exists());
+        assert!(links(&paks, "Casual-Shitters.").is_empty());
+
+        let dir = mods.join(FORK);
+        assert_eq!(fs::read(dir.join("3063").join(A_PAK)).unwrap(), b"vests-v1");
+        assert_eq!(fs::read(dir.join("3311/b.pak")).unwrap(), b"blood-v1");
+        assert_eq!(fs::read(dir.join("3500/n.pak")).unwrap(), b"new-v1");
+        assert!(!dir.join("3311/c.pak").exists());
+        let man = packs::read_manifest(&dir).unwrap();
+        assert_eq!(man.pack_id, FORK);
+        let source = man.source.unwrap();
+        assert_eq!((source.kind.as_str(), source.server.as_deref()), ("server", Some(BASE)));
+        assert_eq!((source.invite.as_deref(), source.uploader.as_deref()), (Some(link.as_str()), Some("Uploader")));
+        assert_eq!(packs::read_changelog(&dir).entries, w.owner.changelog(FORK).unwrap());
+        assert!(!mods.join(vfs::DOWNLOAD_CACHE).exists());
+        assert!(no_staging(&mods));
+    }
+
+    #[test]
+    fn switch_moves_active_preset() {
+        let (w, mods, paks, link) = fork_world("switch-preset");
+        let summary = switch(&w, PACK, FORK, &link, &mods, &paks).unwrap();
+        let mut config = crate::config::AppConfig { active_preset: Some(format!("pack:{}", PACK)), ..Default::default() };
+        config.presets.insert("Mine".into(), vec!["5543".into()]);
+        presets_after_switch(&mut config, PACK, &summary);
+        assert_eq!(config.active_preset.as_deref(), Some("pack:Casual-Fork"));
+        assert_eq!(config.presets["Mine"], ["5543"]);
+    }
+
+    #[test]
+    fn switch_refuses_own_published_pack() {
+        let (w, mods, paks, link) = fork_world("switch-own");
+        let pack_dir = mods.join(PACK);
+        let mut man = packs::read_manifest(&pack_dir).unwrap();
+        man.source = None;
+        man.published = Some(packs::Published { server: Some(BASE.into()), dirty: false });
+        packs::write_manifest(&pack_dir, &man).unwrap();
+        let before = tree(&mods);
+        let downloads = w.downloads();
+        assert_eq!(preview(&w, PACK, &link, &mods).unwrap_err(), OWN_PUBLISH);
+        assert_eq!(switch(&w, PACK, FORK, &link, &mods, &paks).unwrap_err(), OWN_PUBLISH);
+        assert_eq!(tree(&mods), before);
+        assert_eq!(w.downloads(), downloads);
+
+        // A Drive publish counts as never published
+        man.published = Some(packs::Published { server: None, dirty: false });
+        packs::write_manifest(&pack_dir, &man).unwrap();
+        assert_eq!(preview(&w, PACK, &link, &mods).unwrap().reused_files, 2);
+    }
+
+    #[test]
+    fn switch_refuses_installed_target() {
+        let (w, mods, paks, link) = fork_world("switch-installed");
+        add_id(&w, FORK, &mods, &paks).unwrap();
+        let before = tree(&mods);
+        let downloads = w.downloads();
+        let err = "Casual-Fork is already installed. Delete it first or update it instead.";
+        assert_eq!(preview(&w, PACK, &link, &mods).unwrap_err(), err);
+        assert_eq!(switch(&w, PACK, FORK, &link, &mods, &paks).unwrap_err(), err);
+        assert_eq!(tree(&mods), before);
+        assert_eq!(w.downloads(), downloads);
+    }
+
+    #[test]
+    fn failed_switch_keeps_old_pack() {
+        let (w, mods, paks, link) = fork_world("switch-failed");
+        let pack_dir = mods.join(PACK);
+        let before = snapshot(&pack_dir);
+        let untouched = |mods: &Path| {
+            assert_eq!(snapshot(&pack_dir), before);
+            assert!(!mods.join(FORK).exists());
+            assert!(no_staging(mods));
+        };
+
+        let server = w.owner.as_user(OWNER);
+        w.owner.cancel_after(0, move || server.fail_daily_cap(1));
+        assert_eq!(switch(&w, PACK, FORK, &link, &mods, &paks).unwrap_err(), UNAVAILABLE);
+        untouched(&mods);
+
+        let key = mods.join(FORK);
+        w.owner.cancel_after(0, move || {
+            request_cancel(&key);
+        });
+        assert_eq!(switch(&w, PACK, FORK, &link, &mods, &paks).unwrap_err(), crate::drive::CANCELLED);
+        untouched(&mods);
+
+        switch(&w, PACK, FORK, &link, &mods, &paks).unwrap();
+        assert!(!pack_dir.exists());
+    }
+
+    // A pack.json and files for a pack that was not installed from a pack server
+    fn offline_pack(mods: &Path, id: &str, source: Option<packs::PackSource>, record: bool) -> PathBuf {
+        let pack_dir = mods.join(id);
+        let mut installed_hashes = BTreeMap::new();
+        for m in old_mods() {
+            let mut rec = packs::InstalledMod::default();
+            for (path, body) in m.files {
+                fs::create_dir_all(pack_dir.join(m.id)).unwrap();
+                fs::write(pack_dir.join(m.id).join(path), body).unwrap();
+                rec.files.insert(path.to_string(), hashing::sha256_bytes(body.as_bytes()));
+            }
+            if record {
+                installed_hashes.insert(m.id.to_string(), rec);
+            }
+        }
+        let man = PackManifest {
+            pack_id: id.into(),
+            name: id.into(),
+            version: Some("0.9".into()),
+            mod_ids: vec!["3063".into(), "3311".into()],
+            source,
+            installed_hashes,
+            ..Default::default()
+        };
+        packs::write_manifest(&pack_dir, &man).unwrap();
+        pack_dir
+    }
+
+    #[test]
+    fn switch_drive_pack_to_server() {
+        let w = World::new();
+        let (mods, paks) = (scratch("switch-drive"), scratch("switch-drive-paks"));
+        let drive = packs::PackSource { kind: "drive".into(), folder_id: Some("F".into()), ..Default::default() };
+        let pack_dir = offline_pack(&mods, PACK, Some(drive), true);
+        remote_fixture(&w, &fork_mods());
+        let link = invite(&w, PACK);
+        let p = preview(&w, PACK, &link, &mods).unwrap();
+        assert_eq!((p.new_pack_id.as_str(), p.reused_files, p.total_files), (PACK, 2, 3));
+
+        switch(&w, PACK, PACK, &link, &mods, &paks).unwrap();
+        assert_eq!(w.downloads(), 1);
+        assert_eq!(fs::read(pack_dir.join("3500/n.pak")).unwrap(), b"new-v1");
+        assert!(!pack_dir.join("3311/c.pak").exists());
+        let source = packs::read_manifest(&pack_dir).unwrap().source.unwrap();
+        assert_eq!((source.kind.as_str(), source.server.as_deref(), source.folder_id), ("server", Some(BASE), None));
+        assert_eq!(source.invite.as_deref(), Some(link.as_str()));
+        assert_eq!(packs::read_changelog(&pack_dir).entries, w.owner.changelog(PACK).unwrap());
+        assert!(!mods.join(vfs::DOWNLOAD_CACHE).exists());
+    }
+
+    #[test]
+    fn switch_local_pack_hashes_its_files() {
+        let w = World::new();
+        let (mods, paks) = (scratch("switch-local"), scratch("switch-local-paks"));
+        let old = offline_pack(&mods, "My-Pack", None, false);
+        remote_fixture_as(&w, &fork_mods(), FORK);
+        let link = invite(&w, FORK);
+        assert_eq!(preview(&w, "My-Pack", &link, &mods).unwrap().reused_files, 2);
+        switch(&w, "My-Pack", FORK, &link, &mods, &paks).unwrap();
+        assert_eq!(w.downloads(), 1);
+        assert!(!old.exists());
+        assert_eq!(fs::read(mods.join(FORK).join("3063").join(A_PAK)).unwrap(), b"vests-v1");
+    }
+
+    #[test]
+    fn switch_keeps_enabled_mods_and_order() {
+        let (w, mods, paks, link) = fork_world("switch-keep-setup");
+        crate::vfs::enable_key(&mods, &paks, &format!("{}/3063", PACK)).unwrap();
+        let summary = switch_as(&w, PACK, FORK, &link, true, &mods, &paks).unwrap();
+        assert!(summary.not_enabled.is_empty());
+        let dir = mods.join(FORK);
+        assert_eq!(packs::read_manifest(&dir).unwrap().mod_ids, ["3063", "3311", "3500"]);
+        // 3063 stays on, 3311 stays off, 3500 is new to an active pack so it comes on
+        let on: Vec<bool> = ["3063", "3311", "3500"].iter().map(|id| vfs::flag_enabled(&dir.join(id))).collect();
+        assert_eq!(on, [true, false, true]);
+        assert!(links(&paks, "Casual-Shitters.").is_empty());
+        assert_eq!(links(&paks, "Casual-Fork.3063_").into_values().collect::<Vec<_>>(), [b"vests-v1".to_vec()]);
+        assert!(links(&paks, "Casual-Fork.3311_").is_empty());
+        assert_eq!(links(&paks, "Casual-Fork.3500_").len(), 1);
+
+        // Not the active pack, so a mod new to it stays off
+        let (w, mods, paks, link) = fork_world("switch-keep-setup-inactive");
+        crate::vfs::enable_key(&mods, &paks, &format!("{}/3311", PACK)).unwrap();
+        switch_as(&w, PACK, FORK, &link, false, &mods, &paks).unwrap();
+        let dir = mods.join(FORK);
+        let on: Vec<bool> = ["3063", "3311", "3500"].iter().map(|id| vfs::flag_enabled(&dir.join(id))).collect();
+        assert_eq!(on, [false, true, false]);
+        assert_eq!(links(&paks, "").keys().map(|k| k.as_str()).collect::<Vec<_>>(), ["Casual-Fork.3311_b.pak"]);
+    }
+
+    #[test]
+    fn switch_renames_preset_keys() {
+        let (w, mods, paks, link) = fork_world("switch-preset-keys");
+        let summary = switch(&w, PACK, FORK, &link, &mods, &paks).unwrap();
+        let mut config = crate::config::AppConfig { active_preset: Some(format!("pack:{}", PACK)), ..Default::default() };
+        let old = |id: &str| format!("{}/{}", PACK, id);
+        config.presets.insert("Mine".into(), vec!["5543".into(), old("3063"), old("4296"), old("3311")]);
+        config.presets.insert("Only gone".into(), vec![old("4296")]);
+        presets_after_switch(&mut config, PACK, &summary);
+        assert_eq!(config.presets["Mine"], ["5543", "Casual-Fork/3063", "Casual-Fork/3311"]);
+        assert!(!config.presets.contains_key("Only gone"));
+        assert_eq!(config.active_preset.as_deref(), Some("pack:Casual-Fork"));
+    }
+
+    #[test]
+    fn drive_era_publish_is_not_own_pack() {
+        let w = World::new();
+        remote_fixture(&w, &old_mods());
+        let (mods, paks) = (scratch("sub-drive-era"), scratch("sub-drive-era-paks"));
+        add(&w, &mods, &paks).unwrap();
+        let pack_dir = mods.join(PACK);
+        let mut man = packs::read_manifest(&pack_dir).unwrap();
+        man.published = Some(packs::Published { server: None, dirty: false });
+        packs::write_manifest(&pack_dir, &man).unwrap();
+        add(&w, &mods, &paks).unwrap();
+
+        let mut man = packs::read_manifest(&pack_dir).unwrap();
+        man.source = Some(packs::PackSource { kind: "drive".into(), folder_id: Some("F".into()), ..Default::default() });
+        man.published = Some(packs::Published { server: None, dirty: false });
+        packs::write_manifest(&pack_dir, &man).unwrap();
+        let link = invite(&w, PACK);
+        assert_eq!(preview(&w, PACK, &link, &mods).unwrap().reused_files, 3);
+        switch(&w, PACK, PACK, &link, &mods, &paks).unwrap();
+        assert_eq!(packs::read_manifest(&pack_dir).unwrap().source.unwrap().kind, "server");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn switch_skips_files_behind_a_symlinked_folder() {
+        let (w, mods, paks, link) = fork_world("switch-symlink");
+        let outside = scratch("switch-symlink-outside");
+        fs::write(outside.join("b.pak"), b"blood-v1").unwrap();
+        fs::write(outside.join("c.pak"), b"extra").unwrap();
+        let blood = mods.join(PACK).join("3311");
+        fs::remove_dir_all(&blood).unwrap();
+        std::os::unix::fs::symlink(&outside, &blood).unwrap();
+
+        assert_eq!(preview(&w, PACK, &link, &mods).unwrap().reused_files, 1);
+        let downloads = w.downloads();
+        switch(&w, PACK, FORK, &link, &mods, &paks).unwrap();
+        assert_eq!(w.downloads() - downloads, 2);
+        assert_eq!(fs::read(mods.join(FORK).join("3311/b.pak")).unwrap(), b"blood-v1");
+        assert_ne!(inode(&mods.join(FORK).join("3311/b.pak")), inode(&outside.join("b.pak")));
+        assert!(outside.join("b.pak").is_file());
     }
 }

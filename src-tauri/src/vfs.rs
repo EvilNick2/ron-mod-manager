@@ -933,6 +933,12 @@ fn delete_pack_dir(mods_dir: &Path, paks_dir: Option<&Path>, pack_id: &str) -> R
         _ => return Err(format!("No modpack folder for {:?}", pack_id)),
     };
     let _op = OpGuard::begin_named(&pack_dir, OpKind::Local, &manifest.name)?;
+    remove_pack_dir(mods_dir, paks_dir, pack_id)
+}
+
+// delete_pack_dir without its checks, for a caller that already holds the pack's op
+pub(crate) fn remove_pack_dir(mods_dir: &Path, paks_dir: Option<&Path>, pack_id: &str) -> Result<(), String> {
+    let pack_dir = mods_dir.join(pack_id);
     if let Some(paks_dir) = paks_dir {
         for name in child_dirs(&pack_dir)? {
             let key = format!("{}/{}", pack_id, name);

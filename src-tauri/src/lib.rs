@@ -76,6 +76,8 @@ pub fn run() {
             subscribe::verify_linked_pack,
             subscribe::redownload_mods,
             subscribe::cancel_pack_op,
+            subscribe::preview_switch,
+            subscribe::switch_pack,
             config::save_preset,
             config::delete_preset,
             config::load_presets,
