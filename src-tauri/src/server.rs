@@ -668,6 +668,8 @@ pub mod fake {
         expired: bool,
         daily_cap: usize,
         rate_limited: usize,
+        changelog_fails: usize,
+        corrupt: BTreeSet<String>,
         replace: Option<(usize, RemoteManifest)>,
         cancel_hook: Option<(usize, Box<dyn Fn() + Send>)>,
         downloads: usize,
@@ -873,6 +875,16 @@ pub mod fake {
             self.lock().rate_limited = n;
         }
 
+        /// The next n changelog calls answer unavailable
+        pub fn fail_changelog(&self, n: usize) {
+            self.lock().changelog_fails = n;
+        }
+
+        /// The next download of `sha256` arrives with its first byte flipped, as a transfer that went bad
+        pub fn corrupt_next(&self, sha256: &str) {
+            self.lock().corrupt.insert(sha256.to_string());
+        }
+
         /// Once n more downloads have finished, commits `manifest` as the pack's new version, so blobs
         /// only the old version had answer blob_gone. Store the new version's blobs first.
         pub fn replace_version_after(&self, n_downloads: usize, manifest: RemoteManifest) {
@@ -1051,10 +1063,15 @@ pub mod fake {
             }
             let user = self.user.clone();
             let reachable = st.packs.iter().any(|(id, p)| p.blobs.contains(sha256) && st.visible(id, &user));
-            let bytes = match st.objects.get(sha256) {
+            let mut bytes = match st.objects.get(sha256) {
                 Some(b) if reachable => b.clone(),
                 _ => return Err(err("blob_gone", "This file is not available")),
             };
+            if st.corrupt.remove(sha256) {
+                if let Some(b) = bytes.first_mut() {
+                    *b ^= 0xff;
+                }
+            }
             drop(st);
             if bytes.len() as u64 != expected_size {
                 return Err(ServerError::new("size_mismatch", SIZE_MISMATCH));
@@ -1206,7 +1223,11 @@ pub mod fake {
         }
 
         fn changelog(&self, pack_id: &str) -> Result<Vec<VersionEntry>, ServerError> {
-            let st = self.gate()?;
+            let mut st = self.gate()?;
+            if st.changelog_fails > 0 {
+                st.changelog_fails -= 1;
+                return Err(err("unavailable", "The pack server answered 503"));
+            }
             if !st.visible(pack_id, &self.user) {
                 return Err(pack_gone());
             }

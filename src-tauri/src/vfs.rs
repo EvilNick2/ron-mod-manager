@@ -2284,7 +2284,7 @@ mod tests {
         let (m, p, z) = (scratch("mods"), scratch("paks"), scratch("zips"));
         upgrade_setup(&m, &p, &z);
         let mut man = read_manifest(&m.join("CS")).unwrap();
-        man.source = Some(PackSource { kind: "drive".into(), folder_id: "F".into(), resource_key: None });
+        man.source = Some(PackSource { kind: "drive".into(), folder_id: Some("F".into()), ..Default::default() });
         man.installed_hashes.insert("3063".into(), InstalledMod::default());
         write_manifest(&m.join("CS"), &man).unwrap();
         import_from_archive(&z.join("v16.zip"), &m, &p, &mut |_| {}).unwrap();
@@ -2549,7 +2549,7 @@ mod tests {
         fs::create_dir_all(m.join("CS")).unwrap();
         write_manifest(&m.join("CS"), &PackManifest {
             pack_id: "CS".into(), name: "Casual Shitters".into(),
-            source: Some(PackSource { kind: "drive".into(), folder_id: "f".into(), resource_key: None }),
+            source: Some(PackSource { kind: "drive".into(), folder_id: Some("f".into()), ..Default::default() }),
             ..Default::default() }).unwrap();
         let e = move_into_pack(&m, None, "7000", "CS").unwrap_err();
         assert_eq!(e, "Casual Shitters is linked to its creator. Fork it to make changes.");
@@ -2889,7 +2889,7 @@ mod tests {
         write_manifest(&m.join("CS"), &PackManifest {
             pack_id: "CS".into(), name: "Casual".into(), version: Some("1.2".into()),
             mod_ids: vec!["3063".into(), "4296".into()], imported_at: 5,
-            source: Some(PackSource { kind: "drive".into(), folder_id: "f".into(), resource_key: None }),
+            source: Some(PackSource { kind: "drive".into(), folder_id: Some("f".into()), ..Default::default() }),
             local_hashes: [("3063/a.pak".to_string(), crate::packs::CachedHash { size: 3, mtime_ns: 1, sha256: "x".into() })].into(),
             ..Default::default() }).unwrap();
         assert!(crate::packs::ensure_pack_editable(&m, "CS").is_err());

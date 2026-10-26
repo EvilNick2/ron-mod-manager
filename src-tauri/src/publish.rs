@@ -1657,7 +1657,7 @@ mod tests {
     fn linked_pack_cannot_publish() {
         let pack_dir = pack_fixture("linked", &base_mods());
         let mut man = packs::read_manifest(&pack_dir).unwrap();
-        man.source = Some(PackSource { kind: "drive".into(), folder_id: "f".into(), resource_key: None });
+        man.source = Some(PackSource { kind: "drive".into(), folder_id: Some("f".into()), ..Default::default() });
         packs::write_manifest(&pack_dir, &man).unwrap();
         let fake = FakeDrive::new();
         assert_eq!(

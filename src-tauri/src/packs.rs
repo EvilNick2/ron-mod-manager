@@ -3,7 +3,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
+use crate::server::VersionEntry;
+
 const MANIFEST_FILE: &str = "pack.json";
+pub const CHANGELOG_FILE: &str = "changelog.json";
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct PackRef {
@@ -15,8 +18,16 @@ pub struct PackRef {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 pub struct PackSource {
     pub kind: String,
-    pub folder_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invite: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uploader: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
@@ -57,6 +68,43 @@ pub struct PackManifest {
     pub local_hashes: BTreeMap<String, CachedHash>,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(default)]
+pub struct ModState {
+    pub name: String,
+    pub version: Option<String>,
+    pub hash: String,
+    pub nexus_mod_id: Option<u32>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(default)]
+pub struct BaseSnapshot {
+    pub name: String,
+    pub version: Option<String>,
+    /// Keyed by mod id
+    pub mods: BTreeMap<String, ModState>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(default)]
+pub struct Changelog {
+    /// Newest first
+    pub entries: Vec<VersionEntry>,
+    pub base: Option<BaseSnapshot>,
+}
+
+pub fn read_changelog(pack_dir: &Path) -> Changelog {
+    fs::read_to_string(pack_dir.join(CHANGELOG_FILE))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+pub fn write_changelog(pack_dir: &Path, c: &Changelog) -> Result<(), String> {
+    write_json(pack_dir, CHANGELOG_FILE, c)
+}
+
 pub fn read_manifest(pack_dir: &Path) -> Option<PackManifest> {
     let path = pack_dir.join(MANIFEST_FILE);
     let content = fs::read_to_string(&path).ok()?;
@@ -66,10 +114,14 @@ pub fn read_manifest(pack_dir: &Path) -> Option<PackManifest> {
 }
 
 pub fn write_manifest(pack_dir: &Path, m: &PackManifest) -> Result<(), String> {
-    let json = serde_json::to_string_pretty(m).map_err(|e| e.to_string())?;
-    let tmp = pack_dir.join(format!("{}.tmp", MANIFEST_FILE));
+    write_json(pack_dir, MANIFEST_FILE, m)
+}
+
+fn write_json(pack_dir: &Path, name: &str, value: &impl Serialize) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(value).map_err(|e| e.to_string())?;
+    let tmp = pack_dir.join(format!("{}.tmp", name));
     fs::write(&tmp, json).map_err(|e| e.to_string())?;
-    fs::rename(&tmp, pack_dir.join(MANIFEST_FILE)).map_err(|e| {
+    fs::rename(&tmp, pack_dir.join(name)).map_err(|e| {
         let _ = fs::remove_file(&tmp);
         e.to_string()
     })
@@ -348,10 +400,44 @@ mod tests {
     }
 
     #[test]
+    fn drive_source_still_parses() {
+        let m = scratch("drivesource");
+        let old = r#"{"pack_id":"CS","name":"CS","version":"1","mod_ids":[],"imported_at":5,
+            "source":{"kind":"drive","folder_id":"F","resource_key":null}}"#;
+        fs::write(m.join("pack.json"), old).unwrap();
+        let source = read_manifest(&m).unwrap().source.unwrap();
+        assert_eq!(source.kind, "drive");
+        assert_eq!(source.folder_id.as_deref(), Some("F"));
+        assert_eq!((source.server, source.invite, source.uploader), (None, None, None));
+    }
+
+    #[test]
+    fn changelog_round_trips_and_defaults() {
+        let m = scratch("changelog");
+        assert_eq!(read_changelog(&m), Changelog::default());
+        fs::write(m.join("changelog.json"), b"{broken").unwrap();
+        assert_eq!(read_changelog(&m), Changelog::default());
+        fs::write(m.join("changelog.json"), br#"{"entries":[{"version":"1","published_at":3,"notes":"n"}]}"#).unwrap();
+        assert_eq!(read_changelog(&m).entries.len(), 1);
+        assert!(read_changelog(&m).base.is_none());
+
+        let mods = BTreeMap::from([("3063".to_string(), ModState { name: "Vests".into(), hash: "h".into(), ..Default::default() })]);
+        let c = Changelog {
+            entries: vec![VersionEntry { version: "2".into(), published_at: 9, notes: "x".into() }],
+            base: Some(BaseSnapshot { name: "CS".into(), version: Some("1".into()), mods }),
+        };
+        write_changelog(&m, &c).unwrap();
+        assert_eq!(read_changelog(&m), c);
+        let mut names: Vec<_> = fs::read_dir(&m).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        names.sort();
+        assert_eq!(names, ["changelog.json"]);
+    }
+
+    #[test]
     fn linked_pack_refuses_edits() {
         let mods = scratch("linked");
         put_pack(&mods, "CS", "Casual Shitters", |m| {
-            m.source = Some(PackSource { kind: "drive".into(), folder_id: "f".into(), resource_key: None });
+            m.source = Some(PackSource { kind: "drive".into(), folder_id: Some("f".into()), ..Default::default() });
         });
         assert_eq!(ensure_editable(&mods, "CS/3063").unwrap_err(),
             "Casual Shitters is linked to its creator. Fork it to make changes.");

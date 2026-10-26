@@ -70,6 +70,7 @@ pub fn run() {
             subscribe::inspect_pack_link,
             subscribe::add_pack_from_link,
             subscribe::check_pack_updates,
+            subscribe::pack_changelog,
             subscribe::update_linked_pack,
             subscribe::verify_linked_pack,
             subscribe::redownload_mods,

@@ -4,7 +4,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use tauri::AppHandle;
 use tauri_plugin_opener::OpenerExt;
 
-use crate::server::{HttpServer, ServerError, User};
+use crate::server::{HttpServer, PackServer, ServerError, User};
 
 pub const DEFAULT_SERVER: &str = "https://packs.evilnick.net";
 
@@ -114,13 +114,13 @@ pub struct Session {
 }
 
 /// Where sessions are kept, the OS keyring outside tests
-trait SessionStore {
+pub trait SessionStore {
     fn load(&self, base: &str) -> Option<String>;
     fn save(&self, base: &str, json: &str) -> Result<(), String>;
     fn clear(&self, base: &str);
 }
 
-struct KeyringStore;
+pub struct KeyringStore;
 
 impl KeyringStore {
     fn entry(base: &str) -> Result<keyring::Entry, String> {
@@ -146,7 +146,7 @@ impl SessionStore for KeyringStore {
 
 #[cfg(test)]
 #[derive(Default)]
-struct MemoryStore(std::sync::Mutex<std::collections::BTreeMap<String, String>>);
+pub struct MemoryStore(std::sync::Mutex<std::collections::BTreeMap<String, String>>);
 
 #[cfg(test)]
 impl SessionStore for MemoryStore {
@@ -164,11 +164,11 @@ impl SessionStore for MemoryStore {
     }
 }
 
-fn session_in(store: &dyn SessionStore, base: &str) -> Option<Session> {
+pub fn session_in(store: &dyn SessionStore, base: &str) -> Option<Session> {
     serde_json::from_str(&store.load(base)?).ok()
 }
 
-fn save_session_in(store: &dyn SessionStore, base: &str, session: &Session) -> Result<(), String> {
+pub fn save_session_in(store: &dyn SessionStore, base: &str, session: &Session) -> Result<(), String> {
     let json = serde_json::to_string(session).map_err(|e| e.to_string())?;
     store.save(base, &json)
 }
@@ -207,6 +207,44 @@ pub fn client(base: &str) -> HttpServer {
 /// Every caller of a server call routes its result through here
 pub fn check<T>(base: &str, r: Result<T, ServerError>) -> Result<T, ServerError> {
     check_in(&KeyringStore, base, r)
+}
+
+/// A server with the session store its results are checked against
+pub struct Conn {
+    server: Box<dyn PackServer>,
+    store: Arc<dyn SessionStore>,
+}
+
+impl Conn {
+    pub fn live(base: &str) -> Conn {
+        Conn { server: Box::new(client(base)), store: Arc::new(KeyringStore) }
+    }
+
+    #[cfg(test)]
+    pub fn new(server: impl PackServer + 'static, store: Arc<dyn SessionStore>) -> Conn {
+        Conn { server: Box::new(server), store }
+    }
+
+    pub fn server(&self) -> &dyn PackServer {
+        &*self.server
+    }
+
+    pub fn base(&self) -> &str {
+        self.server.base()
+    }
+
+    pub fn signed_in(&self) -> bool {
+        session_in(&*self.store, self.base()).is_some()
+    }
+
+    pub fn call<T>(&self, r: Result<T, ServerError>) -> Result<T, ServerError> {
+        check_in(&*self.store, self.base(), r)
+    }
+
+    /// `call`, with the error as the user sentence naming this server
+    pub fn text<T>(&self, r: Result<T, ServerError>) -> Result<T, String> {
+        self.call(r).map_err(|e| e.text(self.base()))
+    }
 }
 
 pub fn pkce_challenge(verifier: &str) -> String {
