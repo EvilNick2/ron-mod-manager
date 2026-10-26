@@ -493,7 +493,7 @@ const cleanDescription = computed(() => {
 
 .pack-select, .pack-btn {
   width: 100%;
-  background: var(--bg-card);
+  background-color: var(--bg-card);
   border: 1px solid var(--border-light);
   color: var(--text-main);
   padding: 0.6rem;

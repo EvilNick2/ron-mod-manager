@@ -306,7 +306,7 @@ async function browseForArchive() {
 }
 
 .dark-input {
-  background: rgba(0,0,0,0.3);
+  background-color: rgba(0,0,0,0.3);
   border: 1px solid var(--border-dark);
   color: #fff;
   padding: 0.85rem 1rem;

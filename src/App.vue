@@ -172,7 +172,8 @@ onMounted(async () => {
   
   --border-light: #272a33;
   --border-dark: #101217;
-  
+
+  color-scheme: dark;
   font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
 }
 
@@ -198,6 +199,20 @@ onMounted(async () => {
 * {
   scrollbar-width: thin;
   scrollbar-color: var(--bg-hover) var(--bg-darker);
+}
+
+/* WebKitGTK draws native selects with the light GTK theme and ignores their background */
+select {
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23a1a1aa' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 0.75rem center;
+  padding-right: 2rem !important;
+}
+
+option {
+  background: var(--bg-card);
+  color: var(--text-main);
 }
 
 body {
