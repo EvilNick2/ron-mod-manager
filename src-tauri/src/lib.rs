@@ -2,9 +2,8 @@ mod accounts;
 mod api;
 mod changelog;
 mod config;
-mod drive;
-mod google;
 mod hashing;
+mod manage;
 mod packs;
 mod publish;
 mod server;
@@ -62,9 +61,15 @@ pub fn run() {
             accounts::list_servers,
             accounts::sign_in_server,
             accounts::sign_out_server,
-            google::google_status,
-            google::google_sign_in,
-            google::google_sign_out,
+            manage::pack_invite_link,
+            manage::reset_pack_invite,
+            manage::pack_viewers,
+            manage::remove_pack_viewer,
+            manage::leave_pack,
+            manage::delete_server_pack,
+            manage::uploader_invite_link,
+            manage::server_users,
+            manage::remove_server_user,
             publish::publish_pack_cmd,
             publish::list_dirty_packs,
             publish::force_close,

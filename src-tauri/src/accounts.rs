@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -204,11 +202,6 @@ pub fn client(base: &str) -> HttpServer {
     HttpServer::new(base, token(base))
 }
 
-/// Every caller of a server call routes its result through here
-pub fn check<T>(base: &str, r: Result<T, ServerError>) -> Result<T, ServerError> {
-    check_in(&KeyringStore, base, r)
-}
-
 /// A server with the session store its results are checked against
 pub struct Conn {
     server: Box<dyn PackServer>,
@@ -400,6 +393,7 @@ pub async fn sign_out_server(base: String) -> Result<(), String> {
         let base = normalize_base(&base)?;
         let _ = client(&base).logout();
         clear_session(&base);
+        forget_server(&base);
         Ok(())
     })
     .await

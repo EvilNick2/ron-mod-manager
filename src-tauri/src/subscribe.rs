@@ -10,11 +10,13 @@ use serde_json::Value;
 use tauri::Emitter;
 
 use crate::accounts::Conn;
-use crate::drive::{nap, Progress, CANCELLED, SIZE_MISMATCH};
 use crate::hashing;
 use crate::packs::{self, InstalledMod, PackManifest, PackRef, PackSource};
 use crate::publish::{progress_event, Throttle};
-use crate::server::{parse_invite, InvitePack, RemoteFileEntry, RemoteManifest, RemoteMod, ServerError, VersionEntry, FORMAT};
+use crate::server::{
+    nap, parse_invite, InvitePack, Progress, RemoteFileEntry, RemoteManifest, RemoteMod, ServerError, VersionEntry, CANCELLED, FORMAT,
+    SIZE_MISMATCH,
+};
 use crate::vfs::{self, ImportSummary, ModRef, PackArchive, SwapError};
 
 pub(crate) const DRIVE_GONE: &str = "Google Drive packs are no longer supported. Ask the pack's uploader for a new invite link.";
@@ -2394,7 +2396,7 @@ mod tests {
             request_cancel(&key);
         });
         let err = add_id(&w, ID, &mods, &mods.join("paks")).unwrap_err();
-        assert_eq!(err, crate::drive::CANCELLED);
+        assert_eq!(err, CANCELLED);
         assert_eq!(w.downloads(), 1);
         assert_eq!(listing(&mods), before);
         assert!(!mods.join(vfs::DOWNLOAD_CACHE).exists());
@@ -2425,7 +2427,7 @@ mod tests {
             request_cancel(&key);
         });
         let err = update_id(&w, &mods, &paks, ID, true, &[]).unwrap_err();
-        assert_eq!(err, crate::drive::CANCELLED);
+        assert_eq!(err, CANCELLED);
         assert_eq!(w.downloads() - downloads, 1);
         assert_eq!(snapshot(&pack_dir), before);
         assert_eq!(fs::read(pack_dir.join("pack.json")).unwrap(), pack_json);
@@ -2437,7 +2439,7 @@ mod tests {
             request_cancel(&key);
         });
         let err = update_id(&w, &mods, &paks, ID, true, &["3063"]).unwrap_err();
-        assert_eq!(err, crate::drive::CANCELLED);
+        assert_eq!(err, CANCELLED);
         assert_eq!(snapshot(&pack_dir), before);
         assert!(no_staging(&mods));
     }
@@ -2468,7 +2470,7 @@ mod tests {
             request_cancel(&hook_key);
         });
         let err = update_id(&w, &mods, &paks, ID, false, &[]).unwrap_err();
-        assert_eq!(err, crate::drive::CANCELLED);
+        assert_eq!(err, CANCELLED);
         assert!(!request_cancel(&key));
 
         let summary = update_id(&w, &mods, &paks, ID, false, &[]).unwrap();
@@ -2919,7 +2921,7 @@ mod tests {
         w.owner.cancel_after(0, move || {
             request_cancel(&key);
         });
-        assert_eq!(switch(&w, PACK, FORK, &link, &mods, &paks).unwrap_err(), crate::drive::CANCELLED);
+        assert_eq!(switch(&w, PACK, FORK, &link, &mods, &paks).unwrap_err(), CANCELLED);
         untouched(&mods);
 
         switch(&w, PACK, FORK, &link, &mods, &paks).unwrap();

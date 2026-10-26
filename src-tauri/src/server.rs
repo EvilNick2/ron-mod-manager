@@ -15,10 +15,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::drive::{nap, CANCELLED, SIZE_MISMATCH};
 use crate::hashing;
 
 pub const FORMAT: u32 = 2;
+pub const SIZE_MISMATCH: &str = "The download did not match its expected size";
+pub const CANCELLED: &str = "Cancelled";
 
 const MAX_ATTEMPTS: usize = 5;
 const NOT_INVITE: &str = "That is not a pack invite link.";
@@ -154,21 +155,18 @@ pub struct Verified {
     pub bad: Vec<String>,
 }
 
-#[allow(dead_code)]
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Link {
     pub url: String,
     pub expires_at: u64,
 }
 
-#[allow(dead_code)]
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Viewer {
     pub id: String,
     pub name: String,
 }
 
-#[allow(dead_code)]
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct AdminUser {
     pub id: String,
@@ -177,7 +175,6 @@ pub struct AdminUser {
     pub packs: u32,
 }
 
-#[allow(dead_code)]
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct RemovedViewer {
     pub invite_reset: bool,
@@ -218,7 +215,6 @@ pub struct RemoteFileEntry {
     pub sha256: String,
 }
 
-#[allow(dead_code)]
 pub trait PackServer: Send + Sync {
     fn base(&self) -> &str;
     fn me(&self) -> Result<Me, ServerError>;
@@ -252,6 +248,44 @@ pub trait PackServer: Send + Sync {
     fn uploader_invite(&self) -> Result<Link, ServerError>;
     fn users(&self) -> Result<Vec<AdminUser>, ServerError>;
     fn remove_user(&self, user_id: &str) -> Result<(), ServerError>;
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct Progress {
+    pub pack_id: String,
+    pub stage: String,
+    pub done: usize,
+    pub total: usize,
+    pub file: Option<String>,
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+    /// Bytes across the whole stage, zero when the stage does not move bytes
+    pub overall_done: u64,
+    pub overall_total: u64,
+    /// Seconds left before a download held back by the server rate limit is retried
+    pub wait_secs: u64,
+}
+
+impl Progress {
+    pub fn overall(mut self, done: u64, total: u64) -> Progress {
+        self.overall_done = done;
+        self.overall_total = total;
+        self
+    }
+}
+
+// Sleeps in short steps so a cancel is seen quickly. False when cancelled.
+pub(crate) fn nap(total: Duration, cancel: &dyn Fn() -> bool) -> bool {
+    let step = Duration::from_millis(100);
+    let mut slept = Duration::ZERO;
+    while slept < total {
+        if cancel() {
+            return false;
+        }
+        std::thread::sleep(step.min(total - slept));
+        slept += step;
+    }
+    !cancel()
 }
 
 fn unavailable(message: impl fmt::Display) -> ServerError {
@@ -1606,7 +1640,7 @@ mod tests {
         let (base, req) = stub(reply("200 OK\r\nContent-Type: application/octet-stream", "hello"));
         let err = HttpServer::new(&base, None).download("ab", &dir.join("b"), 3, &|| false, &mut |_| {}).unwrap_err();
         req.join().unwrap();
-        assert_eq!(err.to_string(), crate::drive::SIZE_MISMATCH);
+        assert_eq!(err.to_string(), SIZE_MISMATCH);
         assert!(!dir.join("b").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
