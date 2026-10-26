@@ -234,7 +234,7 @@ it("commit swaps the version", async () => {
   await put(hash("a"), 5);
   await post(`/publishes/${p1.publish_id}/verify`, { blobs: [hash("a")] }, token);
   const c1 = await post(`/publishes/${p1.publish_id}/commit`, { manifest: manifest("pack-a", v1) }, token);
-  expect(await c1.json()).toEqual({ ok: true });
+  expect(await c1.json()).toMatchObject({ ok: true });
 
   const v2 = [{ sha256: hash("b"), size: 7 }];
   const p2 = await started("pack-a", v2, token, "2.0");

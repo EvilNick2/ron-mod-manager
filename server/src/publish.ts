@@ -252,7 +252,7 @@ function changelogInput(body: { notes?: unknown; history?: unknown }): { notes: 
   if (!Array.isArray(history) || history.length > MAX_HISTORY) throw bad();
   if (new TextEncoder().encode(JSON.stringify(history)).length > MAX_HISTORY_BYTES) throw bad();
   for (const e of history) {
-    if (!e || typeof e.version !== "string" || !Number.isSafeInteger(e.published_at) || typeof e.notes !== "string") {
+    if (!e || typeof e.version !== "string" || e.version.length > 200 || !Number.isSafeInteger(e.published_at) || typeof e.notes !== "string") {
       throw bad();
     }
   }
@@ -336,7 +336,7 @@ export async function commitPublish(req: Request, env: Env, pid: string): Promis
   ];
   const results = await env.DB.batch(stmts);
   if (results[3].meta.changes !== 1 || results[8].meta.changes !== 1) throw gone();
-  return json({ ok: true });
+  return json({ ok: true, published_at: publishedAt });
 }
 
 export async function cancelPublish(req: Request, env: Env, pid: string): Promise<Response> {

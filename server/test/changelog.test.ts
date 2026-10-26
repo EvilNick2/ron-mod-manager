@@ -44,6 +44,36 @@ it("commit_records_a_version", async () => {
   expect(Math.abs(body.versions[0].published_at - nowSeconds())).toBeLessThan(10);
 });
 
+it("commit_answers_the_stored_published_at", async () => {
+  const token = await signIn("u1");
+  const res = await publish(token, "1.0");
+  const body = (await res.json()) as { ok: boolean; published_at: number };
+  expect(body.ok).toBe(true);
+  const row = await env.DB.prepare("select published_at as p from packs where id = 'pack-a'").first<{ p: number }>();
+  expect(body.published_at).toBe(row!.p);
+  expect((await changelog(token)).body.versions[0].published_at).toBe(body.published_at);
+});
+
+it("lost_commit_race_writes_no_version_rows", async () => {
+  const token = await signIn("u1");
+  const begun = await post("/packs/pack-a/publish/begin", { name: "Pack", version: "2.0", blobs: [] }, token);
+  const { publish_id } = (await begun.json()) as { publish_id: string };
+  const manifest = { format: 2, pack_id: "pack-a", name: "Pack", version: "2.0", status: "ok", published_at: 1, mods: [] };
+  const history = [{ version: "0.1", published_at: 10, notes: "old" }];
+  const go = (notes: string) => post(`/publishes/${publish_id}/commit`, { manifest, notes, history }, token);
+  const [a, b] = await Promise.all([go("a"), go("b")]);
+  expect([a.status, b.status].filter((s) => s === 200)).toHaveLength(1);
+  const winner = a.status === 200 ? "a" : "b";
+  const rows = await env.DB.prepare("select version, notes from pack_versions order by id").all<{ version: string; notes: string }>();
+  expect(rows.results).toEqual([
+    { version: "0.1", notes: "old" },
+    { version: "2.0", notes: winner },
+  ]);
+  const late = await go("c");
+  expect(late.status).not.toBe(200);
+  expect(await count("select count(*) as n from pack_versions")).toBe(2);
+});
+
 it("commit_without_notes_still_works", async () => {
   const token = await signIn("u1");
   expect((await publish(token, "1.0")).status).toBe(200);
@@ -95,6 +125,7 @@ it("oversized_notes_refused_before_writing", async () => {
     { history: [{ version: "v", published_at: 1, notes: "x".repeat(1000001) }] },
     { history: [{ version: "v", published_at: 1.5, notes: "" }] },
     { notes: 5 },
+    { history: [{ version: "v".repeat(201), published_at: 1, notes: "" }] },
   ];
   for (const extra of bad) {
     const res = await publish(token, "1.0", extra);
@@ -103,7 +134,7 @@ it("oversized_notes_refused_before_writing", async () => {
   }
   expect(await count("select count(*) as n from pack_versions")).toBe(0);
   expect(await count("select count(*) as n from packs where manifest is not null")).toBe(0);
-  expect(await count("select count(*) as n from publishes")).toBe(5);
+  expect(await count("select count(*) as n from publishes")).toBe(6);
 });
 
 it("viewer_can_read_stranger_cannot", async () => {
