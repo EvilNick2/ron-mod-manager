@@ -123,13 +123,18 @@ You need a Cloudflare account, Node.js, and a Discord account. Run all commands 
 
 Each user is limited to 300 requests per 60 seconds through the `USER_LIMIT` binding.
 
-TODO (Nick): confirm whether the rate limiting binding works on Workers Free, then record the result here. If it does not, `USER_LIMIT` and its check must be removed.
+The binding works on Workers Free. Wrangler 4.152.0 deployed it to a Free account without complaint (checked 2026-10-26).
 
 ## Presigned upload checks
 
 Uploads go straight to R2 through presigned PUT URLs. The server also verifies blob sizes before a publish commits, and the app checks hashes on download.
 
-TODO (Nick): record the results of the live checks after deploying. Does R2 refuse a presigned PUT with a wrong `Content-Length`? Does R2 refuse one with a wrong checksum?
+R2 enforces both signed headers. Checked live on 2026-10-26:
+
+- A body longer than the signed `Content-Length` is refused with 403 `SignatureDoesNotMatch`.
+- A body of the right length with different bytes is refused with 400 `BadDigest`.
+
+So an object stored under `blobs/<sha256>` always has the bytes that hash names.
 
 ## Cleanup
 
