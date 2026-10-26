@@ -412,7 +412,9 @@ export async function publishPack(pack: PackManifest): Promise<boolean> {
       if (failed?.error !== CANCELLED) await alertFailure("Failed to publish: ", failed?.error);
       return false;
     }
-    if (outcome.kind === "Published") {
+    if (outcome.kind === "Published" && pack.published?.server) {
+      await showAlert(`Published ${pack.name} ${outcome.version}.`);
+    } else if (outcome.kind === "Published") {
       const copy = await showConfirm(`Published ${pack.name} ${outcome.version}. Share the invite link with your players.`, {
         confirmLabel: "Copy invite link",
         cancelLabel: "Close",
