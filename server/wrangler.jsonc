@@ -4,22 +4,23 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-01-15",
   "compatibility_flags": ["nodejs_compat"],
+  "routes": [{ "pattern": "packs.evilnick.net", "custom_domain": true }],
   "triggers": { "crons": ["*/15 * * * *"] },
   "vars": {
-    "OWNER_DISCORD_ID": "REPLACE_ME",
-    "DISCORD_CLIENT_ID": "REPLACE_ME",
-    "PUBLIC_URL": "https://packs.example.com",
+    "OWNER_DISCORD_ID": "391839189160951808",
+    "DISCORD_CLIENT_ID": "1564087255948070942",
+    "PUBLIC_URL": "https://packs.evilnick.net",
     "STORAGE_CAP_BYTES": "20000000000",
     "MAX_USERS": "30",
     "OP_BUDGET": "900000",
-    "R2_ACCOUNT_ID": "REPLACE_ME",
+    "R2_ACCOUNT_ID": "c87261db825e26bcb5ecc42cabb44402",
     "R2_BUCKET_NAME": "ron-packs"
   },
   "d1_databases": [
     {
       "binding": "DB",
       "database_name": "ron-packs",
-      "database_id": "00000000-0000-0000-0000-000000000000",
+      "database_id": "fa514595-4523-4165-87e9-854d21c0500d",
       "migrations_dir": "migrations"
     }
   ],
