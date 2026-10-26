@@ -3,7 +3,7 @@ import { onMounted, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { store, type PackProgress, type CloseBlocked } from "./store";
-import { loadGoogleStatus, checkPackUpdates, hasVisibleOps } from "./packActions";
+import { loadServers, checkPackUpdates, hasVisibleOps } from "./packActions";
 
 import Sidebar from "./components/Sidebar.vue";
 import ModGrid from "./components/ModGrid.vue";
@@ -14,6 +14,8 @@ import UpdateModal from "./components/UpdateModal.vue";
 import CloseGuardModal from "./components/CloseGuardModal.vue";
 import ProgressModal from "./components/ProgressModal.vue";
 import DialogModal from "./components/DialogModal.vue";
+import PackAccessModal from "./components/PackAccessModal.vue";
+import ServerAdminModal from "./components/ServerAdminModal.vue";
 
 const isDragging = ref(false);
 
@@ -73,11 +75,7 @@ onMounted(async () => {
     console.error("Failed to load config on startup:", error);
   }
 
-  try {
-    await loadGoogleStatus();
-  } catch (e) {
-    console.error("Failed to load Google status:", e);
-  }
+  await loadServers();
   checkPackUpdates();
 
   try {
@@ -121,7 +119,7 @@ onMounted(async () => {
     <h2>Drop Mod Archive Here</h2>
   </div>
 
-  <div class="app-layout" :class="{ 'modal-open': store.isSettingsOpen || store.installingModPath || store.postInstallModId || store.isUpdateModalOpen || store.closeBlocked || hasVisibleOps() || store.dialogs.length > 0, 'blur-enabled': store.isBlurEnabled }">
+  <div class="app-layout" :class="{ 'modal-open': store.isSettingsOpen || store.installingModPath || store.postInstallModId || store.isUpdateModalOpen || store.closeBlocked || store.packAccessFor || store.serverAdminFor || hasVisibleOps() || store.dialogs.length > 0, 'blur-enabled': store.isBlurEnabled }">
     <Sidebar />
     <ModGrid />
     <RightPanel />
@@ -138,6 +136,14 @@ onMounted(async () => {
 
     <transition name="fade">
       <CloseGuardModal v-if="store.closeBlocked" />
+    </transition>
+
+    <transition name="fade">
+      <PackAccessModal v-if="store.packAccessFor" />
+    </transition>
+
+    <transition name="fade">
+      <ServerAdminModal v-if="store.serverAdminFor" />
     </transition>
 
     <ProgressModal />

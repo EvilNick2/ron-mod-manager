@@ -3,8 +3,9 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 import { invoke } from "@tauri-apps/api/core";
 import { store, type PackManifest } from "../store";
 import {
-  applyPack, loadPacks, loadPresets, refreshMods, publishPack, copyText, folderLink, progressLine, packLabel,
-  importArchive, addPackFromLink, updatePack, verifyPack, forkPack, updateLine, canCancel, cancelPackOp
+  applyPack, loadPacks, loadPresets, refreshMods, publishPack, copyInviteLink, progressLine, packLabel,
+  importArchive, addPackFromLink, updatePack, verifyPack, forkPack, leavePack, updateLine, updateStatusLine,
+  canCancel, cancelPackOp, canPublish, SIGN_IN_PREFIX
 } from "../packActions";
 import { showAlert, showConfirm, showPrompt } from "../dialogs";
 import { 
@@ -74,12 +75,13 @@ async function exportPreset(name: string) {
 }
 
 const orphanProgress = computed(() =>
-  Object.values(store.packProgress).filter((p) => !store.packs.some((pack) => pack.pack_id === p.pack_id))
+  Object.values(store.packProgress).filter(
+    (p) => !p.pack_id.startsWith(SIGN_IN_PREFIX) && !store.packs.some((pack) => pack.pack_id === p.pack_id)
+  )
 );
 
-async function onCopyLink(pack: PackManifest) {
-  if (!pack.published) return;
-  await copyText(folderLink(pack.published.folder_id));
+async function manageAccess(pack: PackManifest) {
+  store.packAccessFor = pack.pack_id;
 }
 
 function versionLabel(version: string | null) {
@@ -348,18 +350,18 @@ async function launchGame() {
                 <Upload :size="13" color="#f59e0b" />
               </button>
               <button
-                v-if="store.google.email && !pack.source"
+                v-if="canPublish() && !pack.source"
                 class="pack-icon-btn"
                 @click.stop="publishPack(pack)"
                 :disabled="!!store.inFlight[pack.pack_id]"
-                title="Publish Modpack to Google Drive"
+                title="Publish modpack"
               >
                 <CloudUpload :size="13" color="#3b82f6" />
               </button>
-              <button v-if="pack.published" class="pack-icon-btn" @click.stop="onCopyLink(pack)" title="Copy share link">
+              <button v-if="pack.published?.server" class="pack-icon-btn" @click.stop="copyInviteLink(pack)" title="Copy invite link">
                 <Link :size="13" color="#a1a1aa" />
               </button>
-              <div v-if="pack.source" class="pack-menu-anchor" :data-menu-anchor="pack.pack_id">
+              <div v-if="pack.source || pack.published?.server" class="pack-menu-anchor" :data-menu-anchor="pack.pack_id">
                 <button
                   class="pack-icon-btn"
                   @click.stop="toggleMenu(pack)"
@@ -369,8 +371,12 @@ async function launchGame() {
                   <MoreHorizontal :size="13" color="#a1a1aa" />
                 </button>
                 <div v-if="openMenu === pack.pack_id" class="pack-menu" @click.stop>
-                  <button class="pack-menu-item" @click="fromMenu(verifyPack, pack)">Verify files</button>
-                  <button class="pack-menu-item" @click="fromMenu(forkPack, pack)">Fork</button>
+                  <template v-if="pack.source">
+                    <button class="pack-menu-item" @click="fromMenu(verifyPack, pack)">Verify files</button>
+                    <button class="pack-menu-item" @click="fromMenu(forkPack, pack)">Fork</button>
+                    <button class="pack-menu-item" @click="fromMenu(leavePack, pack)">Leave pack</button>
+                  </template>
+                  <button v-if="pack.published?.server" class="pack-menu-item" @click="fromMenu(manageAccess, pack)">Manage access</button>
                 </div>
               </div>
               <button
@@ -392,7 +398,7 @@ async function launchGame() {
               :disabled="!!store.inFlight[pack.pack_id]"
             >Update</button>
           </div>
-          <span v-else-if="store.packUpdates[pack.pack_id]?.status === 'updating'" class="pack-update-text">Being updated by its creator</span>
+          <span v-else-if="updateStatusLine(store.packUpdates[pack.pack_id])" class="pack-update-text">{{ updateStatusLine(store.packUpdates[pack.pack_id]) }}</span>
           <div v-if="store.packProgress[pack.pack_id]" class="pack-progress-row">
             <p class="pack-progress">{{ progressLine(store.packProgress[pack.pack_id]) }}</p>
             <button
@@ -406,7 +412,6 @@ async function launchGame() {
       </div>
       <p v-else class="preset-empty">No modpacks imported yet.</p>
       <button
-        v-if="store.google.linksAvailable"
         class="full-btn secondary-btn preset-save-btn add-link-btn"
         @click="onAddFromLink"
         :disabled="addingFromLink"

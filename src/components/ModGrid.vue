@@ -2,8 +2,8 @@
 import { store } from "../store";
 import { sectionMods, LOOSE_ID, type Section } from "../modSections";
 import {
-  applyPack, refreshMods as rescanMods, publishPack, copyText, folderLink, progressLine, checkPackUpdates, updatePack,
-  updateLine, isLinked
+  applyPack, refreshMods as rescanMods, publishPack, copyInviteLink, progressLine, checkPackUpdates, updatePack,
+  updateStatusLine, isLinked, canPublish
 } from "../packActions";
 import { showAlert, showConfirm } from "../dialogs";
 import { invoke } from "@tauri-apps/api/core";
@@ -187,7 +187,7 @@ function packOf(section: Section) {
 
 async function copySectionLink(section: Section) {
   const pack = packOf(section);
-  if (pack?.published) await copyText(folderLink(pack.published.folder_id));
+  if (pack) await copyInviteLink(pack);
 }
 
 async function applySectionPack(section: Section) {
@@ -453,19 +453,19 @@ async function refreshModsFromButton() {
           <span v-if="packOf(section)?.published?.dirty" class="section-dirty-tag">Changes not uploaded</span>
           <span class="section-count">{{ sectionCount(section) }}</span>
           <template v-if="packOf(section) && store.packUpdates[section.id]">
-            <span v-if="store.packUpdates[section.id].status === 'available'" class="section-update-tag">{{ updateLine(store.packUpdates[section.id]) }}</span>
-            <span v-else-if="store.packUpdates[section.id].status === 'updating'" class="section-update-tag">Being updated by its creator</span>
+            <span v-if="updateStatusLine(store.packUpdates[section.id])" class="section-update-tag">{{ updateStatusLine(store.packUpdates[section.id]) }}</span>
           </template>
           <span v-if="store.packProgress[section.id]" class="section-progress">{{ progressLine(store.packProgress[section.id]) }}</span>
           <div class="section-actions">
             <template v-if="packOf(section)">
               <button
-                v-if="store.google.email && !packOf(section)!.source"
+                v-if="canPublish() && !packOf(section)!.source"
                 class="section-btn"
+                title="Publish modpack"
                 @click="publishPack(packOf(section)!)"
                 :disabled="!!store.inFlight[section.id]"
               >Publish</button>
-              <button v-if="packOf(section)!.published" class="section-btn" @click="copySectionLink(section)">Copy link</button>
+              <button v-if="packOf(section)!.published?.server" class="section-btn" @click="copySectionLink(section)">Copy invite link</button>
               <button
                 v-if="store.packUpdates[section.id]?.status === 'available'"
                 class="section-btn"

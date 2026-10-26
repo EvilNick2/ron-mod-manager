@@ -6,9 +6,28 @@ export interface PackManifest {
   version: string | null;
   mod_ids: string[];
   imported_at: number;
-  source?: { kind: string; folder_id: string; resource_key: string | null };
+  source?: {
+    kind: string;
+    server?: string;
+    folder_id?: string;
+    resource_key?: string;
+    invite?: string;
+    uploader?: string;
+  };
   installed_hashes?: Record<string, { hash: string; files: Record<string, string> }>;
-  published?: { folder_id: string; dirty: boolean };
+  published?: { server: string | null; dirty: boolean };
+}
+
+export interface ServerUser {
+  id: string;
+  name: string;
+  role: string | null;
+}
+
+export interface ServerStatus {
+  base: string;
+  signed_in: boolean;
+  user: ServerUser | null;
 }
 
 export interface PackRef {
@@ -39,13 +58,14 @@ export interface ModRef {
 
 export interface UpdateCheck {
   pack_id: string;
-  status: "current" | "available" | "updating";
+  status: "current" | "available" | "error" | "unsupported";
   installed_version: string | null;
   remote_version: string | null;
   added: ModRef[];
   changed: ModRef[];
   removed: ModRef[];
   download_bytes: number;
+  error: string | null;
 }
 
 export interface CloseBlocked {
@@ -56,7 +76,7 @@ export interface CloseBlocked {
 
 export interface DialogRequest {
   id: number;
-  kind: "alert" | "confirm" | "prompt" | "copy";
+  kind: "alert" | "confirm" | "prompt" | "copy" | "choice";
   title: string;
   message: string;
   value: string;
@@ -64,6 +84,7 @@ export interface DialogRequest {
   cancelLabel: string;
   danger: boolean;
   validate?: (v: string) => string | null;
+  choices?: { label: string; value: string }[];
   resolve: (result: boolean | string | null) => void;
 }
 
@@ -103,7 +124,9 @@ export const store = reactive({
   awaitingDropForId: null as string | null,
   postInstallModId: null as string | null,
 
-  google: { signInAvailable: false, linksAvailable: false, email: null as string | null },
+  servers: [] as ServerStatus[],
+  packAccessFor: null as string | null,
+  serverAdminFor: null as string | null,
   packProgress: {} as Record<string, PackProgress>,
   inFlight: {} as Record<string, true>,
   opNames: {} as Record<string, string>,
