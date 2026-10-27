@@ -207,6 +207,34 @@ pub async fn scan_local_mods(app_handle: tauri::AppHandle) -> Result<Vec<ModInfo
     Ok(scan_dir(&mods_dir))
 }
 
+// Nexus's version is the latest one, so `version` keeps what is installed
+fn merge_update_check(existing: &Value, fresh: Value, mod_id: u32) -> Value {
+    let text = |v: Option<&Value>| v.and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string);
+    let latest = text(fresh.get("version"));
+    let installed = text(existing.get("installed_version"))
+        .or_else(|| text(existing.get("version")))
+        .or_else(|| latest.clone());
+    let mut merged = fresh;
+    if let Some(obj) = merged.as_object_mut() {
+        for key in ["enabled", "addons"] {
+            if let Some(value) = existing.get(key) {
+                obj.insert(key.to_string(), value.clone());
+            }
+        }
+        if let Some(installed) = &installed {
+            obj.insert("version".to_string(), Value::String(installed.clone()));
+            obj.insert("installed_version".to_string(), Value::String(installed.clone()));
+        }
+        if let Some(latest) = &latest {
+            obj.insert("latest_version".to_string(), Value::String(latest.clone()));
+        }
+        let update_available = matches!((&installed, &latest), (Some(i), Some(l)) if i != l);
+        obj.insert("update_available".to_string(), Value::Bool(update_available));
+        obj.insert("mod_id".to_string(), Value::Number(serde_json::Number::from(mod_id)));
+    }
+    merged
+}
+
 #[tauri::command]
 pub async fn refresh_installed_mod_updates(app_handle: tauri::AppHandle) -> Result<usize, String> {
     let Some(_api_key) = crate::config::get_api_key()? else {
@@ -247,41 +275,7 @@ pub async fn refresh_installed_mod_updates(app_handle: tauri::AppHandle) -> Resu
             .and_then(|c| serde_json::from_str::<Value>(&c).ok())
             .unwrap_or(Value::Object(serde_json::Map::new()));
 
-        let preserved_enabled = existing.get("enabled").cloned();
-        let preserved_addons = existing.get("addons").cloned();
-        let installed_version = existing.get("installed_version")
-            .or_else(|| existing.get("version"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let latest_version = existing.get("version")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let update_available = !installed_version.is_empty()
-            && !latest_version.is_empty()
-            && installed_version != latest_version;
-        let mut merged = fresh;
-
-        if let Some(obj) = merged.as_object_mut() {
-            if let Some(enabled) = preserved_enabled {
-                obj.insert("enabled".to_string(), enabled);
-            }
-            if let Some(addons) = preserved_addons {
-                obj.insert("addons".to_string(), addons);
-            }
-            obj.insert(
-                "installed_version".to_string(),
-                Value::String(if installed_version.is_empty() {
-                    latest_version.clone()
-                } else {
-                    installed_version.clone()
-                }),
-            );
-            obj.insert("latest_version".to_string(), Value::String(latest_version));
-            obj.insert("update_available".to_string(), Value::Bool(update_available));
-            obj.insert("mod_id".to_string(), Value::Number(serde_json::Number::from(mod_id)));
-        }
+        let merged = merge_update_check(&existing, fresh, mod_id);
 
         if let Ok(json_str) = serde_json::to_string_pretty(&merged) {
             if fs::write(&metadata_path, json_str).is_ok() {
@@ -3131,6 +3125,32 @@ mod tests {
         assert!(!m.join(".no-game-path").exists());
         assert_eq!(names(&m), ["7000", "CS"]);
         assert!(flag_enabled(&m.join("7000")));
+    }
+
+    #[test]
+    fn update_check_keeps_the_installed_version() {
+        let existing = serde_json::json!({"version": "1.2", "installed_version": "1.2", "enabled": true, "addons": {"a.pak": {"enabled": false}}});
+        let fresh = serde_json::json!({"name": "Speed", "version": "1.5"});
+        let merged = merge_update_check(&existing, fresh, 5489);
+        assert_eq!(merged["name"], "Speed");
+        assert_eq!((merged["version"].as_str(), merged["installed_version"].as_str()), (Some("1.2"), Some("1.2")));
+        assert_eq!(merged["latest_version"], "1.5");
+        assert_eq!(merged["update_available"], true);
+        assert_eq!(merged["enabled"], true);
+        assert_eq!(merged["addons"], existing["addons"]);
+        assert_eq!(merged["mod_id"], 5489);
+
+        let again = merge_update_check(&merged, serde_json::json!({"version": "1.5"}), 5489);
+        assert_eq!((again["version"].as_str(), again["update_available"].as_bool()), (Some("1.2"), Some(true)));
+    }
+
+    #[test]
+    fn update_check_on_a_current_mod_finds_no_update() {
+        let merged = merge_update_check(&serde_json::json!({"version": "1.5"}), serde_json::json!({"version": "1.5"}), 5489);
+        assert_eq!((merged["installed_version"].as_str(), merged["update_available"].as_bool()), (Some("1.5"), Some(false)));
+
+        let bare = merge_update_check(&serde_json::json!({}), serde_json::json!({"version": "2.0"}), 7);
+        assert_eq!((bare["version"].as_str(), bare["update_available"].as_bool()), (Some("2.0"), Some(false)));
     }
 
     #[test]
