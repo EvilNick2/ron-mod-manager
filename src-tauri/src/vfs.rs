@@ -317,51 +317,26 @@ fn extract_rar(archive: &Path, dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
-pub async fn install_mod_archive(app_handle: tauri::AppHandle, archive_path: String, mod_id: String) -> Result<(), String> {
-    let mods_dir = get_mods_dir(&app_handle)?;
-    if !matches!(parse_key(&mod_id)?, KeyKind::Loose(_)) {
-        return Err(format!("Archives can only be installed to a loose mod, not {}", mod_id));
-    }
-    let target_dir = resolve_key(&mods_dir, &mod_id)?;
-    let paks_dir = get_paks_dir(&app_handle).ok();
-
-    let was_enabled = fs::read_to_string(target_dir.join("metadata.json"))
-        .ok()
-        .and_then(|c| serde_json::from_str::<Value>(&c).ok())
-        .and_then(|v| v.get("enabled").and_then(Value::as_bool))
-        .unwrap_or(false);
-    if let Some(paks_dir) = &paks_dir {
-        unlink_mod(paks_dir, &mod_id)?;
-    }
-
-    if target_dir.exists() {
-        std::fs::remove_dir_all(&target_dir).map_err(|e| format!("Failed to remove the old copy of {}: {}", mod_id, e))?;
-    }
-    std::fs::create_dir_all(&target_dir).map_err(|e| format!("Failed to create mod directory: {}", e))?;
-    
-    let path = std::path::Path::new(&archive_path);
+// Extracts a .pak, .rar or .zip into dest
+fn extract_mod_archive(path: &Path, dest: &Path) -> Result<(), String> {
     let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
 
     if extension == "pak" {
         // Just copy the pak file directly
         let file_name = path.file_name().ok_or("Invalid file name")?;
-        let outpath = target_dir.join(file_name);
-        std::fs::copy(&archive_path, &outpath).map_err(|e| format!("Failed to copy .pak file: {}", e))?;
+        let outpath = dest.join(file_name);
+        std::fs::copy(path, &outpath).map_err(|e| format!("Failed to copy .pak file: {}", e))?;
     } else if extension == "rar" {
-        let (a, d) = (path.to_path_buf(), target_dir.clone());
-        tauri::async_runtime::spawn_blocking(move || extract_rar(&a, &d))
-            .await
-            .map_err(|e| e.to_string())??;
+        extract_rar(path, dest)?;
     } else {
         // Assume it's a zip and extract
-        let file = std::fs::File::open(&archive_path).map_err(|e| format!("Failed to open archive: {}", e))?;
+        let file = std::fs::File::open(path).map_err(|e| format!("Failed to open archive: {}", e))?;
         let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("Invalid zip archive: {}", e))?;
         
         for i in 0..archive.len() {
             let mut file = archive.by_index(i).map_err(|e| e.to_string())?;
             let outpath = match file.enclosed_name() {
-                Some(path) => target_dir.join(path),
+                Some(path) => dest.join(path),
                 None => continue,
             };
             
@@ -376,7 +351,77 @@ pub async fn install_mod_archive(app_handle: tauri::AppHandle, archive_path: Str
             }
         }
     }
-    
+    Ok(())
+}
+
+// Extracts into staging and swaps the result in, so a bad archive leaves the installed copy as it was
+fn replace_from_archive(mods_dir: &Path, paks_dir: Option<&Path>, mod_id: &str, target_dir: &Path, archive: &Path, was_enabled: bool) -> Result<(), String> {
+    let staging = mods_dir.join(format!(".import-{}", uuid::Uuid::new_v4()));
+    let staged = staging.join("new");
+    let extracted = fs::create_dir_all(&staged)
+        .map_err(|e| format!("Failed to create staging folder: {}", e))
+        .and_then(|_| extract_mod_archive(archive, &staged));
+    if let Err(e) = extracted {
+        return Err(abandon_staging(&staging, e));
+    }
+    if let Some(paks_dir) = paks_dir {
+        if let Err(e) = unlink_mod(paks_dir, mod_id) {
+            return Err(abandon_staging(&staging, e));
+        }
+    }
+    let aside = staging.join("old");
+    let swapped = if target_dir.exists() {
+        fs::rename(target_dir, &aside).map_err(|e| format!("Failed to move the old copy of {} aside: {}", mod_id, e))
+    } else {
+        Ok(())
+    }
+    .and_then(|_| {
+        fs::rename(&staged, target_dir).map_err(|e| {
+            let err = format!("Failed to install {}: {}", mod_id, e);
+            match aside.exists().then(|| fs::rename(&aside, target_dir)) {
+                Some(Err(back)) => format!("{}. The old copy is kept in {}: {}", err, aside.display(), back),
+                _ => err,
+            }
+        })
+    });
+    if let Err(e) = swapped {
+        if aside.exists() {
+            return Err(e);
+        }
+        if was_enabled {
+            if let Some(paks_dir) = paks_dir {
+                if let Err(relink) = enable_key(mods_dir, paks_dir, mod_id) {
+                    eprintln!("[VFS] Could not re-enable {} after a failed install: {}", mod_id, relink);
+                }
+            }
+        }
+        return Err(abandon_staging(&staging, e));
+    }
+    if let Err(e) = fs::remove_dir_all(&staging) {
+        eprintln!("[VFS] Could not remove {}: {}", staging.display(), e);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn install_mod_archive(app_handle: tauri::AppHandle, archive_path: String, mod_id: String) -> Result<(), String> {
+    let mods_dir = get_mods_dir(&app_handle)?;
+    if !matches!(parse_key(&mod_id)?, KeyKind::Loose(_)) {
+        return Err(format!("Archives can only be installed to a loose mod, not {}", mod_id));
+    }
+    let target_dir = resolve_key(&mods_dir, &mod_id)?;
+    let paks_dir = get_paks_dir(&app_handle).ok();
+
+    let was_enabled = fs::read_to_string(target_dir.join("metadata.json"))
+        .ok()
+        .and_then(|c| serde_json::from_str::<Value>(&c).ok())
+        .and_then(|v| v.get("enabled").and_then(Value::as_bool))
+        .unwrap_or(false);
+    let (m, p, k, t, a) = (mods_dir.clone(), paks_dir.clone(), mod_id.clone(), target_dir.clone(), PathBuf::from(&archive_path));
+    tauri::async_runtime::spawn_blocking(move || replace_from_archive(&m, p.as_deref(), &k, &t, &a, was_enabled))
+        .await
+        .map_err(|e| e.to_string())??;
+
     if let Ok(mod_id_num) = mod_id.parse::<u32>() {
         if let Ok(metadata) = crate::api::fetch_mod_metadata("readyornot".to_string(), mod_id_num).await {
             let meta_path = target_dir.join("metadata.json");
@@ -1946,6 +1991,56 @@ mod tests {
         fs::write(&junk, b"not a rar").unwrap();
         let err = extract_rar(&junk, &dir.join("out")).unwrap_err();
         assert!(err.starts_with("Failed to open RAR"), "{err}");
+    }
+
+    fn write_zip(path: &Path, files: &[(&str, &[u8])]) {
+        let mut zip = zip::ZipWriter::new(fs::File::create(path).unwrap());
+        for (name, data) in files {
+            zip.start_file(*name, zip::write::SimpleFileOptions::default()).unwrap();
+            std::io::Write::write_all(&mut zip, data).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn bad_archive_keeps_the_installed_copy() {
+        let mods = scratch("replace-bad");
+        let target = mods.join("5543");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("old.pak"), b"old").unwrap();
+        let junk = mods.join("junk.zip");
+        fs::write(&junk, b"not a zip").unwrap();
+
+        let err = replace_from_archive(&mods, None, "5543", &target, &junk, false).unwrap_err();
+        assert!(err.starts_with("Invalid zip archive"), "{err}");
+        assert_eq!(fs::read(target.join("old.pak")).unwrap(), b"old");
+        assert!(leftover_staging(&mods).is_empty());
+    }
+
+    #[test]
+    fn archive_replaces_the_installed_copy() {
+        let mods = scratch("replace-good");
+        let target = mods.join("5543");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("old.pak"), b"old").unwrap();
+        let archive = mods.join("mod.zip");
+        write_zip(&archive, &[("Mod/new.pak", b"new")]);
+
+        replace_from_archive(&mods, None, "5543", &target, &archive, false).unwrap();
+        assert!(!target.join("old.pak").exists());
+        assert_eq!(fs::read(target.join("Mod/new.pak")).unwrap(), b"new");
+        assert!(leftover_staging(&mods).is_empty());
+    }
+
+    #[test]
+    fn archive_installs_a_new_mod() {
+        let mods = scratch("replace-new");
+        let pak = mods.join("solo.pak");
+        fs::write(&pak, b"pak").unwrap();
+
+        replace_from_archive(&mods, None, "5543", &mods.join("5543"), &pak, false).unwrap();
+        assert_eq!(fs::read(mods.join("5543/solo.pak")).unwrap(), b"pak");
+        assert!(leftover_staging(&mods).is_empty());
     }
 
     #[test]
