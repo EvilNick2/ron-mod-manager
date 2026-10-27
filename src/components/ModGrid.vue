@@ -416,7 +416,7 @@ async function refreshModsFromButton() {
         <input type="text" placeholder="Search mods..." class="search-bar" v-model="searchQuery" />
       </div>
       
-      <button class="btn add-mod-btn" @click="manualPickArchive" title="Install from .zip, .rar, or .pak archive">
+      <button class="btn add-mod-btn" @click="manualPickArchive" title="Install from .zip, .7z, .rar or .pak archive">
         <Plus :size="18" color="#22c55e" /> Add Mod
       </button>
 
@@ -434,7 +434,7 @@ async function refreshModsFromButton() {
       <div v-else-if="filteredMods.length === 0" style="grid-column: 1/-1; text-align: center; color: var(--text-muted); margin-top: 2rem;">
         <h3 v-if="store.currentMode === 'Installed' && store.mods.length === 0">No mods detected in local storage.</h3>
         <h3 v-else>No mods match your current search filters.</h3>
-        <p v-if="store.currentMode === 'Installed' && store.mods.length === 0">Drop a .zip, .rar, or .pak file anywhere to install a new mod!</p>
+        <p v-if="store.currentMode === 'Installed' && store.mods.length === 0">Drop a .zip, .7z, .rar or .pak file anywhere to install a new mod!</p>
       </div>
       
       <section

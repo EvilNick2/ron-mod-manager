@@ -317,41 +317,67 @@ fn extract_rar(archive: &Path, dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
-// Extracts a .pak, .rar or .zip into dest
-fn extract_mod_archive(path: &Path, dest: &Path) -> Result<(), String> {
-    let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+fn extract_7z(archive: &Path, dest: &Path) -> Result<(), String> {
+    fs::create_dir_all(dest).map_err(|e| format!("Failed to create directory: {}", e))?;
+    sevenz_rust2::decompress_file(archive, dest).map_err(|e| format!("Failed to extract 7z: {}", e))
+}
 
-    if extension == "pak" {
-        // Just copy the pak file directly
-        let file_name = path.file_name().ok_or("Invalid file name")?;
-        let outpath = dest.join(file_name);
-        std::fs::copy(path, &outpath).map_err(|e| format!("Failed to copy .pak file: {}", e))?;
-    } else if extension == "rar" {
-        extract_rar(path, dest)?;
-    } else {
-        // Assume it's a zip and extract
-        let file = std::fs::File::open(path).map_err(|e| format!("Failed to open archive: {}", e))?;
-        let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("Invalid zip archive: {}", e))?;
+#[derive(Debug, PartialEq)]
+enum ArchiveKind {
+    Zip,
+    Rar,
+    SevenZip,
+}
+
+// By content, since Nexus downloads are saved as .zip whatever their real format
+fn archive_kind(path: &Path) -> Result<ArchiveKind, String> {
+    let mut magic = [0u8; 6];
+    let mut file = fs::File::open(path).map_err(|e| format!("Failed to open archive: {}", e))?;
+    let read = std::io::Read::read(&mut file, &mut magic).map_err(|e| format!("Failed to read archive: {}", e))?;
+    Ok(match &magic[..read] {
+        m if m.starts_with(b"Rar!\x1a\x07") => ArchiveKind::Rar,
+        m if m.starts_with(b"7z\xbc\xaf\x27\x1c") => ArchiveKind::SevenZip,
+        _ => ArchiveKind::Zip,
+    })
+}
+
+fn extract_zip(path: &Path, dest: &Path) -> Result<(), String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("Failed to open archive: {}", e))?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("Invalid zip archive: {}", e))?;
+    
+    for i in 0..archive.len() {
+        let mut file = archive.by_index(i).map_err(|e| e.to_string())?;
+        let outpath = match file.enclosed_name() {
+            Some(path) => dest.join(path),
+            None => continue,
+        };
         
-        for i in 0..archive.len() {
-            let mut file = archive.by_index(i).map_err(|e| e.to_string())?;
-            let outpath = match file.enclosed_name() {
-                Some(path) => dest.join(path),
-                None => continue,
-            };
-            
-            if file.is_dir() {
-                std::fs::create_dir_all(&outpath).ok();
-            } else {
-                if let Some(p) = outpath.parent() {
-                    std::fs::create_dir_all(p).ok();
-                }
-                let mut outfile = std::fs::File::create(&outpath).map_err(|_| "Failed to create extracted file")?;
-                std::io::copy(&mut file, &mut outfile).map_err(|_| "Failed to write extracted file")?;
+        if file.is_dir() {
+            std::fs::create_dir_all(&outpath).ok();
+        } else {
+            if let Some(p) = outpath.parent() {
+                std::fs::create_dir_all(p).ok();
             }
+            let mut outfile = std::fs::File::create(&outpath).map_err(|_| "Failed to create extracted file")?;
+            std::io::copy(&mut file, &mut outfile).map_err(|_| "Failed to write extracted file")?;
         }
     }
     Ok(())
+}
+
+// Extracts a .pak, .rar, .7z or .zip into dest
+fn extract_mod_archive(path: &Path, dest: &Path) -> Result<(), String> {
+    let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    if extension == "pak" {
+        let file_name = path.file_name().ok_or("Invalid file name")?;
+        std::fs::copy(path, dest.join(file_name)).map_err(|e| format!("Failed to copy .pak file: {}", e))?;
+        return Ok(());
+    }
+    match archive_kind(path)? {
+        ArchiveKind::Rar => extract_rar(path, dest),
+        ArchiveKind::SevenZip => extract_7z(path, dest),
+        ArchiveKind::Zip => extract_zip(path, dest),
+    }
 }
 
 // Extracts into staging and swaps the result in, so a bad archive leaves the installed copy as it was
@@ -698,8 +724,8 @@ pub async fn toggle_mod(app_handle: tauri::AppHandle, mod_id: String, enable: bo
 #[tauri::command]
 pub async fn pick_mod_archive() -> Result<Option<String>, String> {
     let result = rfd::AsyncFileDialog::new()
-        .set_title("Select Mod Archive (.zip, .pak, .rar)")
-        .add_filter("Mod Archives", &["zip", "pak", "rar"])
+        .set_title("Select Mod Archive (.zip, .7z, .rar, .pak)")
+        .add_filter("Mod Archives", &["zip", "7z", "rar", "pak"])
         .pick_file()
         .await;
         
@@ -1824,9 +1850,10 @@ pub async fn install_addon(app_handle: tauri::AppHandle, mod_id: String, archive
                 }
             }
         }
-    } else if extension == "rar" {
+    } else if extension == "rar" || extension == "7z" {
         let (a, d) = (std::path::PathBuf::from(&archive_path), addons_dir.clone());
-        tauri::async_runtime::spawn_blocking(move || extract_rar(&a, &d))
+        let extract = if extension == "rar" { extract_rar } else { extract_7z };
+        tauri::async_runtime::spawn_blocking(move || extract(&a, &d))
             .await
             .map_err(|e| e.to_string())??;
 
@@ -1991,6 +2018,42 @@ mod tests {
         fs::write(&junk, b"not a rar").unwrap();
         let err = extract_rar(&junk, &dir.join("out")).unwrap_err();
         assert!(err.starts_with("Failed to open RAR"), "{err}");
+    }
+
+    #[test]
+    fn extract_7z_keeps_folders() {
+        let dest = scratch("7z");
+        let archive = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata").join("7z_small.7z");
+        extract_7z(&archive, &dest).unwrap();
+        assert_eq!(fs::read(dest.join("Mod/a.pak")).unwrap(), b"pak-a ".repeat(200));
+        assert_eq!(fs::read(dest.join("Mod/a.ucas")).unwrap(), b"ucas-a ".repeat(200));
+        assert_eq!(fs::read(dest.join("Mod/sub/b.utoc")).unwrap(), b"utoc-b ".repeat(50));
+    }
+
+    #[test]
+    fn extract_7z_rejects_a_non_7z_file() {
+        let dir = scratch("7z-junk");
+        let junk = dir.join("junk.7z");
+        fs::write(&junk, b"not a 7z").unwrap();
+        let err = extract_7z(&junk, &dir.join("out")).unwrap_err();
+        assert!(err.starts_with("Failed to extract 7z"), "{err}");
+    }
+
+    #[test]
+    fn archives_are_recognised_by_content_not_name() {
+        let mods = scratch("by-content");
+        let zip = mods.join("real.zip");
+        write_zip(&zip, &[("Mod/z.pak", b"z")]);
+        for (fixture, kind) in [("7z_small.7z", ArchiveKind::SevenZip), ("rar5_small.rar", ArchiveKind::Rar)] {
+            let saved_as_zip = mods.join(format!("downloaded-{}.zip", fixture));
+            fs::copy(Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata").join(fixture), &saved_as_zip).unwrap();
+            assert_eq!(archive_kind(&saved_as_zip).unwrap(), kind);
+
+            let target = mods.join("5543");
+            replace_from_archive(&mods, None, "5543", &target, &saved_as_zip, false).unwrap();
+            assert_eq!(fs::read(target.join("Mod/a.pak")).unwrap(), b"pak-a ".repeat(200));
+        }
+        assert_eq!(archive_kind(&zip).unwrap(), ArchiveKind::Zip);
     }
 
     fn write_zip(path: &Path, files: &[(&str, &[u8])]) {
