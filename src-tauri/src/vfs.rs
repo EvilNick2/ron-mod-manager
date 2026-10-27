@@ -1094,6 +1094,86 @@ fn write_fork_changelog(pack_dir: &Path, source: &PackManifest, staged: &Path) {
     }
 }
 
+// The pack id for a new pack called name, refused when a folder already uses it
+fn free_pack_id(mods_dir: &Path, name: &str) -> Result<String, String> {
+    let id = crate::packs::slugify(name);
+    let taken = crate::subscribe::is_reserved_name(&id)
+        || fs::read_dir(mods_dir)
+            .map_err(|e| format!("Failed to read {}: {}", mods_dir.display(), e))?
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().eq_ignore_ascii_case(&id));
+    if taken {
+        return Err(format!("A modpack called {} already exists", id));
+    }
+    Ok(id)
+}
+
+#[derive(Serialize, Debug)]
+pub struct CreatedPack {
+    pub pack: PackManifest,
+    pub warnings: Vec<String>,
+}
+
+// Makes an empty local pack, then moves the given loose mods into it.
+// A mod that fails to move stays loose and is reported as a warning.
+fn create_pack_dir(mods_dir: &Path, paks_dir: Option<&Path>, name: &str, keys: &[String]) -> Result<(CreatedPack, Vec<(String, String)>), String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("Enter a name for the modpack".to_string());
+    }
+    let pack_id = free_pack_id(mods_dir, name)?;
+    let staging = mods_dir.join(format!(".import-{}", uuid::Uuid::new_v4()));
+    let manifest = PackManifest {
+        pack_id: pack_id.clone(),
+        name: name.to_string(),
+        imported_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        ..Default::default()
+    };
+    let made = fs::create_dir_all(&staging)
+        .map_err(|e| format!("Failed to create staging folder: {}", e))
+        .and_then(|_| write_manifest(&staging, &manifest))
+        .and_then(|_| fs::rename(&staging, mods_dir.join(&pack_id)).map_err(|e| format!("Failed to create the modpack: {}", e)));
+    if let Err(e) = made {
+        return Err(abandon_staging(&staging, e));
+    }
+
+    let mut warnings = Vec::new();
+    let mut moved = Vec::new();
+    for key in keys {
+        match move_into_pack(mods_dir, paks_dir, key, &pack_id) {
+            Ok((new_key, warning)) => {
+                warnings.extend(warning.map(|w| format!("{}: {}", key, w)));
+                moved.push((key.clone(), new_key));
+            }
+            Err(e) => warnings.push(format!("{}: {}", key, e)),
+        }
+    }
+    let pack = read_manifest(&mods_dir.join(&pack_id)).unwrap_or(manifest);
+    Ok((CreatedPack { pack, warnings }, moved))
+}
+
+#[tauri::command]
+pub async fn create_pack(app_handle: tauri::AppHandle, name: String, keys: Vec<String>) -> Result<CreatedPack, String> {
+    let mods_dir = get_mods_dir(&app_handle)?;
+    let paks_dir = get_paks_dir(&app_handle).ok();
+    let (mut created, moved) = create_pack_dir(&mods_dir, paks_dir.as_deref(), &name, &keys)?;
+    if !moved.is_empty() {
+        let saved = crate::config::load_config(app_handle.clone()).and_then(|mut config| {
+            for (old, new) in &moved {
+                crate::config::rename_key_in_presets(&mut config, old, new);
+            }
+            crate::config::save_config(app_handle, config)
+        });
+        if let Err(e) = saved {
+            created.warnings.push(format!("Saved presets were not updated: {}", e));
+        }
+    }
+    Ok(created)
+}
+
 // Copies the pack into a staging folder and renames it into place, so a failure leaves nothing behind.
 fn fork_pack_dir(mods_dir: &Path, pack_id: &str, new_name: &str) -> Result<PackManifest, String> {
     let pack_dir = mods_dir.join(pack_id);
@@ -1106,15 +1186,7 @@ fn fork_pack_dir(mods_dir: &Path, pack_id: &str, new_name: &str) -> Result<PackM
     if name.is_empty() {
         return Err("Enter a name for the fork".to_string());
     }
-    let new_id = crate::packs::slugify(name);
-    let taken = crate::subscribe::is_reserved_name(&new_id)
-        || fs::read_dir(mods_dir)
-            .map_err(|e| format!("Failed to read {}: {}", mods_dir.display(), e))?
-            .filter_map(|e| e.ok())
-            .any(|e| e.file_name().to_string_lossy().eq_ignore_ascii_case(&new_id));
-    if taken {
-        return Err(format!("A modpack called {} already exists", new_id));
-    }
+    let new_id = free_pack_id(mods_dir, name)?;
 
     let staging = mods_dir.join(format!(".fork-{}", uuid::Uuid::new_v4()));
     let build = || -> Result<PackManifest, String> {
@@ -2783,6 +2855,45 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn create_pack_makes_an_empty_local_pack() {
+        let m = scratch("create-empty");
+        let (created, moved) = create_pack_dir(&m, None, "  R2 Test Pack ", &[]).unwrap();
+        assert!(created.warnings.is_empty() && moved.is_empty());
+        let on_disk = read_manifest(&m.join("R2-Test-Pack")).unwrap();
+        assert_eq!((on_disk.name.as_str(), on_disk.version.as_deref()), ("R2 Test Pack", None));
+        assert!(on_disk.mod_ids.is_empty() && on_disk.source.is_none() && on_disk.published.is_none());
+        assert!(leftover_staging(&m).is_empty());
+    }
+
+    #[test]
+    fn create_pack_moves_mods_and_keeps_them_enabled() {
+        let m = scratch("create-move-mods");
+        let p = scratch("create-move-paks");
+        put(&m, "7000/a.pak", b"a");
+        put(&m, "7001/b.pak", b"b");
+        enable_key(&m, &p, "7000").unwrap();
+
+        let keys = ["7000".to_string(), "7001".to_string(), "9999".to_string()];
+        let (created, moved) = create_pack_dir(&m, Some(&p), "Test", &keys).unwrap();
+        assert_eq!(created.pack.mod_ids, ["7000", "7001"]);
+        assert_eq!(moved, [("7000".to_string(), "Test/7000".to_string()), ("7001".to_string(), "Test/7001".to_string())]);
+        assert_eq!(created.warnings.len(), 1);
+        assert!(created.warnings[0].starts_with("9999: "), "{:?}", created.warnings);
+        assert!(names(&p).iter().any(|n| n.starts_with("Test.7000_")));
+        assert!(names(&p).iter().all(|n| !n.starts_with("Test.7001_")));
+    }
+
+    #[test]
+    fn create_pack_refuses_a_taken_name() {
+        let m = scratch("create-taken");
+        put(&m, "CS/3063/b.pak", b"b");
+        manifest(&m, &["3063"]);
+        let err = create_pack_dir(&m, None, "cs", &[]).unwrap_err();
+        assert_eq!(err, "A modpack called cs already exists");
+        assert_eq!(create_pack_dir(&m, None, "   ", &[]).unwrap_err(), "Enter a name for the modpack");
+    }
+
     #[test]
     fn move_into_pack_moves_and_relinks() {
         let m = scratch("mv-in-mods");

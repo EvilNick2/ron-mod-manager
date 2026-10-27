@@ -107,6 +107,7 @@ pub fn run() {
             vfs::load_packs,
             vfs::delete_pack,
             vfs::fork_pack,
+            vfs::create_pack,
             vfs::get_pack_size,
             vfs::export_preset,
             vfs::pick_preset_archive,

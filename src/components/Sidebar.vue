@@ -4,7 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { store, type PackManifest } from "../store";
 import {
   applyPack, loadPacks, loadPresets, refreshMods, publishPack, copyInviteLink, progressLine, packLabel,
-  importArchive, addPackFromLink, updatePack, verifyPack, forkPack, leavePack, updateLine, updateStatusLine,
+  importArchive, addPackFromLink, createPack, updatePack, verifyPack, forkPack, leavePack, updateLine, updateStatusLine,
   canCancel, cancelPackOp, canPublish, SIGN_IN_PREFIX
 } from "../packActions";
 import { showAlert, showConfirm, showPrompt } from "../dialogs";
@@ -22,7 +22,8 @@ import {
   CloudUpload,
   Link,
   MoreHorizontal,
-  Info
+  Info,
+  Plus
 } from 'lucide-vue-next';
 
 async function loginNexus() {
@@ -412,7 +413,10 @@ async function launchGame() {
           </div>
         </div>
       </div>
-      <p v-else class="preset-empty">No modpacks imported yet.</p>
+      <p v-else class="preset-empty">No modpacks yet.</p>
+      <button class="full-btn secondary-btn preset-save-btn new-pack-btn" @click="createPack">
+        <Plus :size="16" color="#3b82f6" /> New modpack
+      </button>
       <button
         class="full-btn secondary-btn preset-save-btn add-link-btn"
         @click="onAddFromLink"
@@ -945,6 +949,11 @@ async function launchGame() {
 .pack-update-btn:disabled {
   opacity: 0.4;
   cursor: not-allowed;
+}
+
+.new-pack-btn {
+  width: 100%;
+  margin-bottom: 0.5rem;
 }
 
 .add-link-btn {

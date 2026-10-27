@@ -796,6 +796,37 @@ export async function verifyPack(pack: PackManifest): Promise<void> {
   );
 }
 
+export async function createPack(): Promise<void> {
+  const name = await showPrompt("Name for the new modpack:", "", {
+    title: "New modpack",
+    validate: (v) => (v.trim() ? null : "Enter a name for the modpack"),
+  });
+  if (name === null) return;
+  const enabled: string[] = store.mods.filter((m: any) => m.enabled && !m.pack && !m.is_online).map((m: any) => m.id);
+  let keys: string[] = [];
+  if (enabled.length) {
+    const count = enabled.length === 1 ? "the 1 enabled mod" : `the ${enabled.length} enabled mods`;
+    const choice = await showChoice(`Move ${count} that are not in a modpack into ${name.trim()}?`, [
+      { label: "Move enabled mods", value: "move" },
+      { label: "Start empty", value: "empty" },
+    ], { title: "New modpack" });
+    if (choice === null) return;
+    if (choice === "move") keys = enabled;
+  }
+  let warnings: string[] = [];
+  try {
+    const created = await invoke("create_pack", { name, keys }) as { pack: PackManifest; warnings: string[] };
+    warnings = created.warnings;
+  } catch (e) {
+    console.error("Failed to create the modpack:", e);
+    await showAlert("Failed to create the modpack: " + e);
+    return;
+  } finally {
+    await refreshMods().catch((e) => console.error("Failed to refresh mods:", e));
+  }
+  if (warnings.length) await showAlert("The modpack was created, but:\n" + warnings.join("\n"));
+}
+
 export async function forkPack(pack: PackManifest): Promise<void> {
   if (store.inFlight[pack.pack_id]) return;
   let size: number;
