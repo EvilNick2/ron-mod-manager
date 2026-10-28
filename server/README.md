@@ -85,6 +85,8 @@ You need a Cloudflare account, Node.js, and a Discord account. Run all commands 
 
    `EXTRA_BUCKET` is an optional second R2 binding. If you add it to `r2_buckets`, its size counts toward the storage cap. The binding name must be exactly `EXTRA_BUCKET`. Every publish lists that bucket to measure it, and those lists are Class A operations counted in `OP_BUDGET`. Leave it out if you do not need it.
 
+   The deployed server at packs.evilnick.net binds Orpheus's `downloads` bucket this way so the cap counts it. If you self-host, remove that entry from `r2_buckets` or point it at your own bucket.
+
 8. Set the three secrets. Each command asks for the value.
 
    ```

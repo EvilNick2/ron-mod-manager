@@ -24,7 +24,10 @@
       "migrations_dir": "migrations"
     }
   ],
-  "r2_buckets": [{ "binding": "PACKS", "bucket_name": "ron-packs" }],
+  "r2_buckets": [
+    { "binding": "PACKS", "bucket_name": "ron-packs" },
+    { "binding": "EXTRA_BUCKET", "bucket_name": "downloads" }
+  ],
   "ratelimits": [
     {
       "name": "USER_LIMIT",
