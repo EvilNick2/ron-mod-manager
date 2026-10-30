@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { invoke } from "@tauri-apps/api/core";
 import { store } from "../store";
-import { refreshMods, loadServers, signInServer, signOutServer, hostOf, checkPackUpdates } from "../packActions";
+import { refreshMods, loadServers, signInServer, signOutServer, hostOf, checkPackUpdates, acceptInvite } from "../packActions";
 import { showAlert } from "../dialogs";
 import { onMounted, ref } from "vue";
 import { X, Globe, Crosshair, Info } from 'lucide-vue-next';
@@ -187,6 +187,7 @@ async function toggleBlur(state: boolean) {
                 {{ serverBusy[server.base] === "in" ? "Waiting for Discord..." : "Sign in" }}
               </button>
             </div>
+            <button class="secondary-action-btn" style="margin-top: 0.75rem;" @click="acceptInvite()">Accept invite</button>
           </div>
 
           <div class="settings-section">

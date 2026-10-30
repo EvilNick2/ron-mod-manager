@@ -22,12 +22,12 @@ interface LinkInfo {
   kind: string;
   pack: InvitePack | null;
   signed_in: boolean;
-  installed: { version: string | null; from: string } | null;
+  installed: { version: string | null; from: string; clean_working: boolean } | null;
 }
 
 type AddOutcome =
   | { kind: "uploader"; base: string }
-  | { kind: "installed"; pack_id: string; version: string };
+  | { kind: "installed"; pack_id: string; version: string; editor: boolean };
 
 export interface ServerLink {
   url: string;
@@ -461,7 +461,7 @@ export function importQuestion(preview: ImportPreview, installed: PackManifest |
 }
 
 // Applies a freshly imported pack and tells the player. Sets the label first so a caller can name the pack in errors.
-async function finishImport(added: PackRef, failedDeletes: string[], imported: { label: string }): Promise<void> {
+async function finishImport(added: PackRef, failedDeletes: string[], imported: { label: string }, quiet = false): Promise<void> {
   imported.label = packLabel(added.name, added.version);
   await loadPresets();
   await loadPacks();
@@ -469,6 +469,7 @@ async function finishImport(added: PackRef, failedDeletes: string[], imported: {
   if (pack) await applyPack(pack);
   else await refreshMods();
 
+  if (quiet && failedDeletes.length === 0) return;
   let message = `${imported.label} installed${pack ? " and active" : ""}.`;
   if (failedDeletes.length > 0) {
     message += `\nThese folders could not be deleted: ${failedDeletes.join(", ")}`;
@@ -555,6 +556,72 @@ async function acceptUploaderInvite(link: string, info: LinkInfo): Promise<void>
   await showAlert(`You can now publish packs to ${host}.`);
 }
 
+// Inspects the link and signs in to its server first when needed. Null when the user stopped.
+async function inspectSignedIn(link: string, switchFrom?: string): Promise<LinkInfo | null> {
+  let info = await inspectLink(link, switchFrom);
+  if (info.signed_in) return info;
+  if (!(await showConfirm(`Sign in to ${hostOf(info.base)} with Discord to continue?`))) return null;
+  if (!(await signInServer(info.base))) return null;
+  checkPackUpdates();
+  info = await inspectLink(link, switchFrom);
+  return info.signed_in ? info : null;
+}
+
+// Installs the pack an invite points at and applies it. Returns false when the user or a busy pack stopped it.
+async function installFromInvite(
+  link: string, info: LinkInfo, question: (installed: PackManifest | undefined, name: string, version: string) => string,
+  imported: { label: string }, quiet = false,
+): Promise<boolean> {
+  if (!info.pack) throw new Error("That invite has no pack");
+  const { id: packId, name, version } = info.pack;
+  const busy = `${name} is busy, try again when it finishes`;
+  if (store.inFlight[packId]) {
+    await showAlert(busy);
+    return false;
+  }
+  if (!(await showConfirm(question(store.packs.find((p) => p.pack_id === packId), name, version)))) return false;
+  if (store.inFlight[packId]) {
+    await showAlert(busy);
+    return false;
+  }
+
+  beginOp(packId, name);
+  let outcome: AddOutcome;
+  try {
+    outcome = await invoke("add_pack_from_link", { link }) as AddOutcome;
+  } finally {
+    endOp(packId);
+  }
+  if (outcome.kind === "installed") {
+    await finishImport({ pack_id: outcome.pack_id, name, version: outcome.version || null }, [], imported, quiet);
+  }
+  return true;
+}
+
+async function reportInviteFailure(e: unknown, imported: { label: string }, action: string): Promise<void> {
+  if (imported.label) {
+    console.error("Add from link follow-up failed:", e);
+    await showAlert(`${imported.label} was imported, but the next step failed: ${e}`);
+  } else if (e !== CANCELLED) {
+    console.error(`Failed to ${action}:`, e);
+    await alertFailure(`Failed to ${action}: `, e);
+  }
+}
+
+const PUBLISH_INVITE = "This is an invite to publish. Use Accept invite in Settings.";
+// Matches server::describe for invite_gone
+const INVITE_GONE = "This invite link has expired or was reset. Ask for a new one.";
+const EDITOR_INVITE_USED = "This editor link was already used. Ask the pack's creator for a new one.";
+
+// What becoming an editor does to the installed copy, which is replaced unless it is a clean working copy
+function editorQuestion(info: LinkInfo, name: string, version: string): string {
+  const installed = info.installed;
+  if (!installed) return `Become an editor of ${name} and install it?`;
+  if (installed.clean_working) return `Become an editor of ${name} and reinstall it?`;
+  const local = packLabel(name, installed.version);
+  return `This replaces your installed ${local} with the server's ${version}. Mods that differ will be replaced and local changes lost. Become an editor and continue?`;
+}
+
 export async function addPackFromLink(): Promise<void> {
   const input = await showPrompt("Paste the invite link:", "", { title: "Add Modpack" });
   if (!input || !input.trim()) return;
@@ -562,56 +629,55 @@ export async function addPackFromLink(): Promise<void> {
   const imported = { label: "" };
   try {
     await loadPacks();
-    let info = await inspectLink(link);
-    if (!info.signed_in) {
-      if (!(await showConfirm(`Sign in to ${hostOf(info.base)} with Discord to continue?`))) return;
-      if (!(await signInServer(info.base))) return;
-      checkPackUpdates();
-      info = await inspectLink(link);
-      if (!info.signed_in) return;
+    const info = await inspectSignedIn(link);
+    if (!info) return;
+    if (info.kind !== "viewer") {
+      await showAlert(PUBLISH_INVITE);
+      return;
     }
+    await installFromInvite(link, info, (installed, name, version) => {
+      if (installed?.version === version) return `Reinstall ${packLabel(name, version)}?`;
+      if (installed) {
+        const from = installed.version ? ` from ${installed.version}` : "";
+        return `Update ${name}${from} to ${version}?`;
+      }
+      return `Install ${packLabel(name, version)}?`;
+    }, imported);
+  } catch (e) {
+    await reportInviteFailure(e, imported, "add the modpack");
+  }
+  if (imported.label) await checkPackUpdates();
+}
+
+export async function acceptInvite(): Promise<void> {
+  const input = await showPrompt("Paste the invite link:", "", { title: "Accept Invite" });
+  if (!input || !input.trim()) return;
+  const link = input.trim();
+  const imported = { label: "" };
+  let kind = "";
+  try {
+    await loadPacks();
+    const info = await inspectSignedIn(link);
+    if (!info) return;
+    kind = info.kind;
     if (info.kind === "uploader") {
       await acceptUploaderInvite(link, info);
       return;
     }
-    if (!info.pack) throw new Error("That invite has no pack");
-    const { id: packId, name, version } = info.pack;
-    const busy = `${name} is busy, try again when it finishes`;
-    if (store.inFlight[packId]) {
-      await showAlert(busy);
+    if (info.kind !== "editor") {
+      await showAlert("This link adds a modpack. Use Add from link under Modpacks.");
       return;
     }
-    const installed = store.packs.find((p) => p.pack_id === packId);
-    let question = `Install ${packLabel(name, version)}?`;
-    if (installed?.version === version) {
-      question = `Reinstall ${packLabel(name, version)}?`;
-    } else if (installed) {
-      const from = installed.version ? ` from ${installed.version}` : "";
-      question = `Update ${name}${from} to ${version}?`;
-    }
-    if (!(await showConfirm(question))) return;
-    if (store.inFlight[packId]) {
-      await showAlert(busy);
-      return;
-    }
-
-    beginOp(packId, name);
-    let outcome: AddOutcome;
-    try {
-      outcome = await invoke("add_pack_from_link", { link }) as AddOutcome;
-    } finally {
-      endOp(packId);
-    }
-    if (outcome.kind === "installed") {
-      await finishImport({ pack_id: outcome.pack_id, name, version: outcome.version || null }, [], imported);
-    }
-  } catch (e: any) {
-    if (imported.label) {
-      console.error("Add from link follow-up failed:", e);
-      await showAlert(`${imported.label} was imported, but the next step failed: ${e}`);
-    } else if (e !== CANCELLED) {
-      console.error("Failed to add the modpack:", e);
-      await alertFailure("Failed to add the modpack: ", e);
+    const name = info.pack?.name ?? "";
+    const done = await installFromInvite(link, info, (_installed, packName, version) => editorQuestion(info, packName, version), imported, true);
+    if (done) await showAlert(`You can now publish updates to ${name}.`);
+  } catch (e) {
+    if (!imported.label && String(e) === INVITE_GONE) {
+      // A used editor link fails before its kind is known, so the hint covers that case too
+      const text = kind === "editor" ? EDITOR_INVITE_USED : `${INVITE_GONE} An editor link works once. If you already used it, ask the pack's creator for a new one.`;
+      await showAlert(`Failed to accept the invite: ${text}`);
+    } else {
+      await reportInviteFailure(e, imported, "accept the invite");
     }
   }
   if (imported.label) await checkPackUpdates();
@@ -652,12 +718,11 @@ async function runSwitch(pack: PackManifest): Promise<void> {
   const link = input.trim();
   const busy = (name: string) => `${name} is busy, try again when it finishes`;
   try {
-    const info = await inspectLink(link, oldId);
-    if (!info.signed_in) {
-      if (!(await showConfirm(`Sign in to ${hostOf(info.base)} with Discord to continue?`))) return;
-      if (!(await signInServer(info.base))) return;
-      checkPackUpdates();
-      if (!(await inspectLink(link, oldId)).signed_in) return;
+    const info = await inspectSignedIn(link, oldId);
+    if (!info) return;
+    if (info.kind !== "viewer") {
+      await showAlert(PUBLISH_INVITE);
+      return;
     }
     if (store.inFlight[oldId]) {
       await showAlert(busy(pack.name));
@@ -760,6 +825,10 @@ export function closePackChangelog(update: boolean): void {
 export async function updatePack(pack: PackManifest): Promise<void> {
   const check = store.packUpdates[pack.pack_id];
   if (check?.status !== "available" || store.inFlight[pack.pack_id]) return;
+  if (pack.published?.dirty) {
+    const by = check.remote_publisher ? `${check.remote_publisher}'s` : "the server's";
+    if (!(await showConfirm(`You have changes you have not published. Updating will replace them with ${by} version.`))) return;
+  }
   const summary = `${check.added.length} mods added, ${check.changed.length} updated, ${check.removed.length} removed and deleted from disk. Downloads ${formatSize(check.download_bytes)}.`;
   if (!(await openPackChangelog(pack.pack_id, "update", summary))) return;
   if (store.inFlight[pack.pack_id]) return;

@@ -352,7 +352,7 @@ async function launchGame() {
                 <Check :size="13" color="#22c55e" />
               </button>
               <button
-                v-if="canPublish() && !pack.source"
+                v-if="canPublish() && pack.source?.kind !== 'server'"
                 class="pack-icon-btn"
                 @click.stop="publishPack(pack)"
                 :disabled="!!store.inFlight[pack.pack_id]"

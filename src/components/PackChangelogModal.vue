@@ -10,6 +10,7 @@ interface VersionEntry {
   version: string;
   published_at: number;
   notes: string;
+  publisher?: string | null;
 }
 
 interface PackChangelog {
@@ -39,7 +40,7 @@ const shown = computed<ReleaseNotesEntry[]>(() => {
   }
   return list.map((e, i) => ({
     version: e.version.replace(/^[vV]/, ""),
-    publishedAt: new Date(e.published_at * 1000).toLocaleDateString(),
+    publishedAt: new Date(e.published_at * 1000).toLocaleDateString() + (e.publisher ? ` by ${e.publisher}` : ""),
     notes: e.notes,
     latest: i === 0,
   }));

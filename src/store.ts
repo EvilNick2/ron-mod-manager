@@ -66,6 +66,7 @@ export interface UpdateCheck {
   removed: ModRef[];
   download_bytes: number;
   error: string | null;
+  remote_publisher: string | null;
 }
 
 export interface CloseBlocked {

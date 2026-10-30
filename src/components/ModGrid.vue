@@ -459,7 +459,7 @@ async function refreshModsFromButton() {
           <div class="section-actions">
             <template v-if="packOf(section)">
               <button
-                v-if="canPublish() && !packOf(section)!.source"
+                v-if="canPublish() && packOf(section)!.source?.kind !== 'server'"
                 class="section-btn"
                 title="Publish modpack"
                 @click="publishPack(packOf(section)!)"

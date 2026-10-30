@@ -4,7 +4,7 @@ import { computed, ref, watch } from "vue";
 import { Copy, FileText, Link, Repeat, Users } from "lucide-vue-next";
 import { store } from "../store";
 import {
-  copyInviteLink, copyText, formatSize, hostOf, openPackChangelog, switchPackLink, updateLine
+  canPublish, copyInviteLink, copyText, formatSize, hostOf, openPackChangelog, switchPackLink, updateLine
 } from "../packActions";
 
 // Matches subscribe::DRIVE_GONE, shown before the first update check comes back
@@ -35,7 +35,10 @@ const checkText = computed(() => {
   return c.error ?? "";
 });
 
-const driveText = computed(() => (check.value?.status === "unsupported" && check.value.error) || DRIVE_GONE);
+const driveText = computed(() => {
+  const text = (check.value?.status === "unsupported" && check.value.error) || DRIVE_GONE;
+  return canPublish() ? `${text} Publish it to a pack server to keep it going.` : text;
+});
 
 // The pack disappears when it is deleted or switched to another pack
 watch(pack, (p) => {

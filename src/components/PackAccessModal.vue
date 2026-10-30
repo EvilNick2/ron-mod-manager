@@ -6,7 +6,7 @@ import { store } from "../store";
 import {
   alertFailure, beginOp, copyInviteLink, copyText, endOp, hostOf, refreshMods, type ServerLink
 } from "../packActions";
-import { showAlert, showConfirm } from "../dialogs";
+import { showAlert, showConfirm, showCopy } from "../dialogs";
 
 interface Viewer {
   id: string;
@@ -16,6 +16,11 @@ interface Viewer {
 const pack = computed(() => store.packs.find((p) => p.pack_id === store.packAccessFor) ?? null);
 const base = computed(() => pack.value?.published?.server ?? "");
 const viewers = ref<Viewer[]>([]);
+const editors = ref<Viewer[]>([]);
+const access = ref<string | null>(null);
+const isEditor = computed(() => access.value === "editor");
+const isCreator = computed(() => access.value === "uploader" || access.value === "owner");
+const canManage = computed(() => isCreator.value || isEditor.value);
 const loading = ref(true);
 const busy = ref(false);
 
@@ -34,8 +39,19 @@ async function load() {
     return;
   }
   loading.value = true;
+  const packId = pack.value.pack_id;
   try {
-    viewers.value = await invoke("pack_viewers", { base: base.value, packId: pack.value.pack_id }) as Viewer[];
+    access.value = await invoke("pack_access", { base: base.value, packId }) as string | null;
+  } catch (e) {
+    console.error("Failed to load access:", e);
+    access.value = null;
+    await alertFailure("Failed to load access: ", e);
+  }
+  try {
+    viewers.value = await invoke("pack_viewers", { base: base.value, packId }) as Viewer[];
+    editors.value = isCreator.value
+      ? await invoke("pack_editors", { base: base.value, packId }) as Viewer[]
+      : [];
   } catch (e) {
     console.error("Failed to load viewers:", e);
     await alertFailure("Failed to load viewers: ", e);
@@ -67,6 +83,52 @@ async function removeViewer(viewer: Viewer) {
 
 async function copyLink() {
   if (pack.value) await copyInviteLink(pack.value);
+}
+
+async function removeEditor(editor: Viewer) {
+  const p = pack.value;
+  if (!p) return;
+  if (!(await showConfirm(`Remove ${editor.name} as an editor of ${p.name}?`, { danger: true, confirmLabel: "Remove" }))) return;
+  busy.value = true;
+  try {
+    await invoke("remove_pack_editor", { base: base.value, packId: p.pack_id, userId: editor.id });
+  } catch (e) {
+    console.error("Failed to remove the editor:", e);
+    await alertFailure("Failed to remove the editor: ", e);
+  } finally {
+    busy.value = false;
+  }
+  await load();
+}
+
+async function copyEditorLink() {
+  const p = pack.value;
+  if (!p) return;
+  busy.value = true;
+  try {
+    const link = await invoke("pack_editor_invite_link", { base: base.value, packId: p.pack_id }) as ServerLink;
+    await showCopy(link.url);
+  } catch (e) {
+    console.error("Failed to get the editor invite link:", e);
+    await alertFailure("Failed to get the editor invite link: ", e);
+  } finally {
+    busy.value = false;
+  }
+}
+
+async function clearHold() {
+  const p = pack.value;
+  if (!p) return;
+  busy.value = true;
+  try {
+    const cleared = await invoke("clear_publish_hold", { base: base.value, packId: p.pack_id }) as number;
+    await showAlert(cleared > 0 ? "Cleared the publish hold." : "Nothing was publishing.");
+  } catch (e) {
+    console.error("Failed to clear the publish hold:", e);
+    await alertFailure("Failed to clear the publish hold: ", e);
+  } finally {
+    busy.value = false;
+  }
 }
 
 async function resetInvite() {
@@ -122,8 +184,8 @@ onMounted(load);
       <h2 class="modal-title">Manage access</h2>
       <p class="access-desc">{{ pack.name }} on {{ hostOf(base) }}</p>
       <div class="access-actions">
-        <button class="action-btn" @click="copyLink" :disabled="busy">Copy invite link</button>
-        <button class="secondary-action-btn" @click="resetInvite" :disabled="busy">Reset invite link</button>
+        <button v-if="canManage" class="action-btn" @click="copyLink" :disabled="busy">Copy invite link</button>
+        <button v-if="isCreator" class="secondary-action-btn" @click="resetInvite" :disabled="busy">Reset invite link</button>
       </div>
       <h3 class="list-label">Players with access</h3>
       <p v-if="loading" class="list-empty">Loading...</p>
@@ -131,11 +193,25 @@ onMounted(load);
       <div v-else class="viewer-list">
         <div v-for="viewer in viewers" :key="viewer.id" class="viewer-row">
           <span class="viewer-name">{{ viewer.name }}</span>
-          <button class="remove-btn" @click="removeViewer(viewer)" :disabled="busy">Remove</button>
+          <button v-if="canManage" class="remove-btn" @click="removeViewer(viewer)" :disabled="busy">Remove</button>
         </div>
       </div>
+      <template v-if="isCreator && !loading">
+        <h3 class="list-label">Editors</h3>
+        <p v-if="editors.length === 0" class="list-empty">No editors yet.</p>
+        <div v-else class="viewer-list">
+          <div v-for="editor in editors" :key="editor.id" class="viewer-row">
+            <span class="viewer-name">{{ editor.name }}</span>
+            <button class="remove-btn" @click="removeEditor(editor)" :disabled="busy">Remove</button>
+          </div>
+        </div>
+        <div class="access-actions editor-actions">
+          <button class="secondary-action-btn" @click="copyEditorLink" :disabled="busy">Copy editor invite link</button>
+          <button class="secondary-action-btn" @click="clearHold" :disabled="busy">Clear publish hold</button>
+        </div>
+      </template>
       <div class="modal-actions">
-        <button class="danger-btn" @click="deleteFromServer" :disabled="busy">Delete from server</button>
+        <button v-if="isCreator" class="danger-btn" @click="deleteFromServer" :disabled="busy">Delete from server</button>
         <button class="secondary-btn" @click="close">Close</button>
       </div>
     </div>
@@ -198,6 +274,10 @@ onMounted(load);
 .access-actions {
   display: flex;
   gap: 0.75rem;
+}
+
+.editor-actions {
+  margin-top: 0.75rem;
 }
 
 .action-btn {
@@ -300,6 +380,7 @@ onMounted(load);
 }
 
 .secondary-btn {
+  margin-left: auto;
   padding: 0.75rem 1.75rem;
   border-radius: 8px;
   font-weight: 700;
