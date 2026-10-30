@@ -72,10 +72,10 @@ export async function getChangelog(req: Request, env: Env, packId: string): Prom
     .first();
   if (!row) throw gone;
   const rows = await env.DB.prepare(
-    "select version, published_at, notes from pack_versions where pack_id = ? order by id desc",
+    "select version, published_at, notes, publisher from pack_versions where pack_id = ? order by id desc",
   )
     .bind(packId)
-    .all<{ version: string; published_at: number; notes: string }>();
+    .all<{ version: string; published_at: number; notes: string; publisher: string | null }>();
   return json({ versions: rows.results });
 }
 

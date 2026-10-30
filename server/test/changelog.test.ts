@@ -16,11 +16,17 @@ beforeEach(async () => {
 const post = (path: string, body: unknown, token: string) =>
   api(path, { method: "POST", body: JSON.stringify(body) }, token);
 
-type Entry = { version: string; published_at: number; notes: string };
+type Entry = { version: string; published_at: number; notes: string; publisher: string | null };
+
+const currentVersion = async (pack: string) =>
+  (await env.DB.prepare("select version from packs where id = ? and published_at is not null").bind(pack).first<{
+    version: string;
+  }>())?.version ?? null;
 
 // An empty publish has no blobs, so it needs no uploads before commit.
 async function publish(token: string, version: string, extra: Record<string, unknown> = {}, pack = "pack-a") {
-  const begun = await post(`/packs/${pack}/publish/begin`, { name: "Pack", version, blobs: [] }, token);
+  const base = await currentVersion(pack);
+  const begun = await post(`/packs/${pack}/publish/begin`, { name: "Pack", version, blobs: [], base }, token);
   expect(begun.status).toBe(200);
   const { publish_id } = (await begun.json()) as { publish_id: string };
   const manifest = { format: 2, pack_id: pack, name: "Pack", version, status: "ok", published_at: 1, mods: [] };
@@ -99,7 +105,7 @@ it("history_only_seeds_an_empty_pack", async () => {
   await publish(token, "1.0", { notes: "n", history });
   let { body } = await changelog(token);
   expect(body.versions.map((v) => v.version)).toEqual(["1.0", "0.2", "0.1"]);
-  expect(body.versions[2]).toEqual(history[0]);
+  expect(body.versions[2]).toEqual({ ...history[0], publisher: null });
   await publish(token, "1.1", { history: [{ version: "x", published_at: 1, notes: "" }] });
   ({ body } = await changelog(token));
   expect(body.versions.map((v) => v.version)).toEqual(["1.1", "1.0", "0.2", "0.1"]);
@@ -171,4 +177,13 @@ it("deleting_pack_deletes_versions", async () => {
   await cleanup(env, nowSeconds());
   expect(await count("select count(*) as n from packs where id = 'ghost'")).toBe(0);
   expect(await count("select count(*) as n from pack_versions")).toBe(0);
+});
+
+it("changelog records who published", async () => {
+  const token = await signIn("u1", "Una");
+  expect((await publish(token, "1.0", { notes: "First" })).status).toBe(200);
+  const { body } = await changelog(token);
+  expect(body.versions[0].publisher).toBe("Una");
+  const row = await env.DB.prepare("select manifest from packs where id = 'pack-a'").first<{ manifest: string }>();
+  expect(JSON.parse(row!.manifest).published_by).toBe("Una");
 });

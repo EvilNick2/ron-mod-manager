@@ -222,3 +222,12 @@ export async function removeUser(req: Request, env: Env, id: string): Promise<Re
   ]);
   return json({ ok: true });
 }
+
+export async function clearHold(req: Request, env: Env, id: string): Promise<Response> {
+  const { packId } = await creatorPack(req, env, id);
+  const now = nowSeconds();
+  const res = await env.DB.prepare("update publishes set expires_at = ? where pack_id = ? and expires_at > ?")
+    .bind(cancelledExpiry(now), packId, now)
+    .run();
+  return json({ cleared: res.meta.changes });
+}

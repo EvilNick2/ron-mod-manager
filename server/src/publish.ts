@@ -28,25 +28,42 @@ interface PublishRow {
   user_id: string;
   name: string;
   version: string;
+  base_version: string | null;
 }
 
 const badRequest = (msg: string) => new HttpError(400, "bad_request", msg);
 const gone = () => new HttpError(404, "publish_gone", "This publish is no longer available");
 
-async function requireUploader(req: Request, env: Env): Promise<User> {
-  const user = await requireUser(req, env);
-  if (!user.role) throw new HttpError(403, "forbidden", "Only uploaders can publish");
-  return user;
+// Creator or editor of the pack. Binds: user id, user id.
+const MAY_PUBLISH = `(uploader_id = ? or exists (select 1 from pack_editors e where e.pack_id = packs.id and e.user_id = ?))`;
+
+const pending = (name: string) =>
+  new HttpError(409, "pack_busy", `${name} is publishing this pack right now. Try again once it is done.`);
+const behind = () =>
+  new HttpError(409, "pack_behind", "The pack has a newer version. Update your copy before publishing.");
+
+async function mayPublish(env: Env, packId: string, userId: string): Promise<boolean> {
+  const row = await env.DB.prepare(`select 1 as x from packs where id = ? and ${MAY_PUBLISH}`)
+    .bind(packId, userId, userId)
+    .first();
+  return !!row;
 }
 
 async function ownPublish(env: Env, user: User, id: string): Promise<PublishRow> {
   const row = await env.DB.prepare(
-    "select id, pack_id, user_id, name, version from publishes where id = ? and user_id = ? and expires_at > ?",
+    "select id, pack_id, user_id, name, version, base_version from publishes where id = ? and user_id = ? and expires_at > ?",
   )
     .bind(id, user.id, nowSeconds())
     .first<PublishRow>();
   if (!row) throw gone();
   return row;
+}
+
+async function extendPublish(env: Env, id: string): Promise<void> {
+  const now = nowSeconds();
+  await env.DB.prepare("update publishes set expires_at = ? where id = ? and expires_at > ?")
+    .bind(now + PUBLISH_LIFETIME, id, now)
+    .run();
 }
 
 function hashList(value: unknown): string[] {
@@ -69,13 +86,17 @@ function inPublish(known: Map<string, number>, hashes: string[]): void {
 }
 
 export async function beginPublish(req: Request, env: Env, packId: string): Promise<Response> {
-  const user = await requireUploader(req, env);
-  const body = await readJson<{ name?: unknown; version?: unknown; blobs?: unknown }>(req);
+  const user = await requireUser(req, env);
+  const body = await readJson<{ name?: unknown; version?: unknown; blobs?: unknown; base?: unknown }>(req);
   if (!PACK_ID.test(packId) || /^[0-9]+$/.test(packId)) throw badRequest("Bad pack id");
   for (const v of [body.name, body.version]) {
     if (typeof v !== "string" || v.length < 1 || v.length > 200) {
       throw badRequest("Name and version must be 1 to 200 characters");
     }
+  }
+  const base = body.base ?? null;
+  if (base !== null && (typeof base !== "string" || base.length < 1 || base.length > 200)) {
+    throw badRequest("Base must be null or 1 to 200 characters");
   }
   if (!Array.isArray(body.blobs) || body.blobs.length > MAX_BLOBS) {
     throw badRequest(`Blobs must be a list of at most ${MAX_BLOBS}`);
@@ -89,12 +110,14 @@ export async function beginPublish(req: Request, env: Env, packId: string): Prom
     wanted.set(b.sha256, b.size);
   }
 
-  const pack = await env.DB.prepare("select uploader_id from packs where id = ?")
+  const pack = await env.DB.prepare("select version, published_at from packs where id = ?")
     .bind(packId)
-    .first<{ uploader_id: string }>();
-  if (pack && pack.uploader_id !== user.id) {
+    .first<{ version: string; published_at: number | null }>();
+  if (!pack && !user.role) throw new HttpError(403, "forbidden", "Only uploaders can publish");
+  if (pack && !(await mayPublish(env, packId, user.id))) {
     throw new HttpError(409, "pack_taken", "Another uploader owns this pack id");
   }
+  if (pack && pack.published_at !== null && base !== pack.version) throw behind();
 
   const hashes = [...wanted.keys()];
   const listJson = JSON.stringify(hashes);
@@ -126,13 +149,18 @@ export async function beginPublish(req: Request, env: Env, packId: string): Prom
   const publishId = randomToken();
   const rows = JSON.stringify(hashes.map((h) => ({ h, s: wanted.get(h)! })));
   const live = "exists (select 1 from publishes where id = ?)";
+  const now = nowSeconds();
   const results = await env.DB.batch([
+    env.DB.prepare("update publishes set expires_at = ? where pack_id = ? and user_id = ? and expires_at > ?").bind(
+      cancelledExpiry(now), packId, user.id, now,
+    ),
     env.DB.prepare(
-      `insert into publishes (id, pack_id, user_id, name, version, expires_at)
-       select ?, ?, ?, ?, ?, ? where ${DB_BYTES_SQL} + ? <= ?`,
+      `insert into publishes (id, pack_id, user_id, name, version, expires_at, base_version)
+       select ?, ?, ?, ?, ?, ?, ? where ${DB_BYTES_SQL} + ? <= ?
+       and not exists (select 1 from publishes where pack_id = ? and user_id != ? and expires_at > ?)`,
     ).bind(
       publishId, packId, user.id, body.name, body.version,
-      nowSeconds() + PUBLISH_LIFETIME, extra + newBytes, cap,
+      now + PUBLISH_LIFETIME, base, extra + newBytes, cap, packId, user.id, now,
     ),
     env.DB.prepare(
       `insert or ignore into packs (id, uploader_id, name, version)
@@ -144,13 +172,17 @@ export async function beginPublish(req: Request, env: Env, packId: string): Prom
        from json_each(?) where ${live}`,
     ).bind(publishId, rows, publishId),
   ]);
-  if (results[0].meta.changes !== 1) {
+  if (results[1].meta.changes !== 1) {
+    const other = await env.DB.prepare(
+      `select u.name from publishes p join users u on u.id = p.user_id
+       where p.pack_id = ? and p.user_id != ? and p.expires_at > ? limit 1`,
+    )
+      .bind(packId, user.id, nowSeconds())
+      .first<{ name: string }>();
+    if (other) throw pending(other.name);
     throw new HttpError(507, "storage_full", "The server has no room for this pack");
   }
-  const owner = await env.DB.prepare("select uploader_id from packs where id = ?")
-    .bind(packId)
-    .first<{ uploader_id: string }>();
-  if (owner?.uploader_id !== user.id) {
+  if (!(await mayPublish(env, packId, user.id))) {
     await dropPublish(env, publishId);
     throw new HttpError(409, "pack_taken", "Another uploader owns this pack id");
   }
@@ -175,8 +207,9 @@ async function storedHashes(env: Env, hashes: string[]): Promise<Set<string>> {
 }
 
 export async function publishUrls(req: Request, env: Env, pid: string): Promise<Response> {
-  const user = await requireUploader(req, env);
+  const user = await requireUser(req, env);
   const publish = await ownPublish(env, user, pid);
+  await extendPublish(env, publish.id);
   const body = await readJson<{ blobs?: unknown }>(req);
   const hashes = hashList(body.blobs);
   const known = await declared(env, publish.id);
@@ -195,8 +228,9 @@ export async function publishUrls(req: Request, env: Env, pid: string): Promise<
 }
 
 export async function verifyPublish(req: Request, env: Env, pid: string): Promise<Response> {
-  const user = await requireUploader(req, env);
+  const user = await requireUser(req, env);
   const publish = await ownPublish(env, user, pid);
+  await extendPublish(env, publish.id);
   const body = await readJson<{ blobs?: unknown }>(req);
   const hashes = hashList(body.blobs);
   const known = await declared(env, publish.id);
@@ -260,7 +294,7 @@ function changelogInput(body: { notes?: unknown; history?: unknown }): { notes: 
 }
 
 export async function commitPublish(req: Request, env: Env, pid: string): Promise<Response> {
-  const user = await requireUploader(req, env);
+  const user = await requireUser(req, env);
   const publish = await ownPublish(env, user, pid);
   const body = await readJson<{ manifest?: any; notes?: unknown; history?: unknown }>(req);
   const { notes, history } = changelogInput(body);
@@ -281,10 +315,7 @@ export async function commitPublish(req: Request, env: Env, pid: string): Promis
     throw new HttpError(409, "not_uploaded", "Some blobs have not been uploaded and verified");
   }
 
-  const owner = await env.DB.prepare("select uploader_id from packs where id = ?")
-    .bind(publish.pack_id)
-    .first<{ uploader_id: string }>();
-  if (owner?.uploader_id !== user.id) {
+  if (!(await mayPublish(env, publish.pack_id, user.id))) {
     throw new HttpError(409, "pack_taken", "Another uploader owns this pack id");
   }
 
@@ -294,11 +325,13 @@ export async function commitPublish(req: Request, env: Env, pid: string): Promis
     name: publish.name,
     version: publish.version,
     published_at: publishedAt,
+    published_by: user.name,
   });
   const rows = JSON.stringify([...known].map(([h, size]) => ({ h, s: size })));
-  const live = `exists (select 1 from publishes where id = ? and expires_at > ?)
-    and exists (select 1 from packs where id = ? and uploader_id = ?)`;
-  const guard = [publish.id, publishedAt, publish.pack_id, user.id];
+  const open = "exists (select 1 from publishes where id = ? and expires_at > ?)";
+  const live = `${open}
+    and exists (select 1 from packs where id = ? and ${MAY_PUBLISH} and (published_at is null or version = ?))`;
+  const guard = [publish.id, publishedAt, publish.pack_id, user.id, user.id, publish.base_version];
   const seed = JSON.stringify(
     history.map((e: any) => ({ v: e.version, p: e.published_at, n: e.notes })),
   );
@@ -314,33 +347,47 @@ export async function commitPublish(req: Request, env: Env, pid: string): Promis
        select ?, json_extract(value, '$.h') from json_each(?) where ${live}`,
     ).bind(publish.pack_id, rows, ...guard),
     env.DB.prepare(
-      `update packs set manifest = ?, name = ?, version = ?, published_at = ?
-       where id = ? and uploader_id = ? and ${live}`,
-    ).bind(stored, publish.name, publish.version, publishedAt, publish.pack_id, user.id, ...guard),
-    env.DB.prepare(
       `insert into pack_versions (pack_id, version, published_at, notes)
        select ?, json_extract(value, '$.v'), json_extract(value, '$.p'), json_extract(value, '$.n')
        from json_each(?)
        where not exists (select 1 from pack_versions where pack_id = ?) and ${live}`,
     ).bind(publish.pack_id, seed, publish.pack_id, ...guard),
     env.DB.prepare(
-      `insert into pack_versions (pack_id, version, published_at, notes)
-       select ?, ?, ?, ? where ${live}`,
-    ).bind(publish.pack_id, publish.version, publishedAt, notes, ...guard),
+      `insert into pack_versions (pack_id, version, published_at, notes, publisher)
+       select ?, ?, ?, ?, ? where ${live}`,
+    ).bind(publish.pack_id, publish.version, publishedAt, notes, user.name, ...guard),
     env.DB.prepare(
       `delete from pack_versions where pack_id = ? and ${live}
        and id not in (select id from pack_versions where pack_id = ? order by id desc limit ?)`,
     ).bind(publish.pack_id, ...guard, publish.pack_id, KEEP_VERSIONS),
     env.DB.prepare(`delete from publish_blobs where publish_id = ? and ${live}`).bind(publish.id, ...guard),
-    env.DB.prepare(`delete from publishes where id = ? and ${live}`).bind(publish.id, ...guard),
+    env.DB.prepare(
+      `update packs set manifest = ?, name = ?, version = ?, published_at = ?
+       where id = ? and ${live}`,
+    ).bind(stored, publish.name, publish.version, publishedAt, publish.pack_id, ...guard),
+    env.DB.prepare(
+      `delete from publishes where id = ? and ${open}
+       and exists (select 1 from packs where id = ? and manifest = ?)`,
+    ).bind(publish.id, publish.id, publishedAt, publish.pack_id, stored),
   ];
   const results = await env.DB.batch(stmts);
-  if (results[3].meta.changes !== 1 || results[8].meta.changes !== 1) throw gone();
+  if (results[7].meta.changes !== 1 || results[8].meta.changes !== 1) {
+    const pack = await env.DB.prepare(
+      `select version, published_at from packs where id = ? and ${MAY_PUBLISH}`,
+    )
+      .bind(publish.pack_id, user.id, user.id)
+      .first<{ version: string; published_at: number | null }>();
+    const stillOpen = await env.DB.prepare("select 1 as x from publishes where id = ? and expires_at > ?")
+      .bind(publish.id, nowSeconds())
+      .first();
+    if (pack && stillOpen && pack.published_at !== null && pack.version !== publish.base_version) throw behind();
+    throw gone();
+  }
   return json({ ok: true, published_at: publishedAt });
 }
 
 export async function cancelPublish(req: Request, env: Env, pid: string): Promise<Response> {
-  const user = await requireUploader(req, env);
+  const user = await requireUser(req, env);
   const publish = await ownPublish(env, user, pid);
   await env.DB.prepare("update publishes set expires_at = ? where id = ?")
     .bind(cancelledExpiry(nowSeconds()), publish.id)

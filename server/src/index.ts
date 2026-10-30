@@ -20,6 +20,7 @@ import {
   removeUser,
   removeViewer,
   resetPackInvite,
+  clearHold,
 } from "./manage";
 import { getBlob, getChangelog, getManifest, me } from "./packs";
 import {
@@ -65,6 +66,7 @@ const dynamicRoutes: { method: string; pattern: RegExp; handler: CodeHandler }[]
   { method: "POST", pattern: /^\/packs\/([^/]+)\/editor-invite$/, handler: editorInvite },
   { method: "GET", pattern: /^\/packs\/([^/]+)\/editors$/, handler: listEditors },
   { method: "DELETE", pattern: /^\/packs\/([^/]+)\/editors\/([^/]+)$/, handler: removeEditor },
+  { method: "DELETE", pattern: /^\/packs\/([^/]+)\/hold$/, handler: clearHold },
   { method: "DELETE", pattern: /^\/packs\/([^/]+)\/membership$/, handler: leavePack },
   { method: "DELETE", pattern: /^\/packs\/([^/]+)$/, handler: removePack },
   { method: "DELETE", pattern: /^\/admin\/users\/([^/]+)$/, handler: removeUser },

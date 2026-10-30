@@ -1,5 +1,5 @@
 import { env } from "cloudflare:workers";
-import { afterEach, beforeEach, expect, it } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { nowSeconds } from "../src/auth";
 import { cleanup } from "../src/cleanup";
 import { api, signIn } from "./helpers";
@@ -13,6 +13,7 @@ const setVar = (name: "STORAGE_CAP_BYTES" | "OP_BUDGET", v: string) => {
 beforeEach(async () => {
   for (const t of [
     "users", "sessions", "packs", "blobs", "pack_blobs", "publishes", "publish_blobs", "op_counts",
+    "pack_editors", "pack_versions",
   ]) {
     await env.DB.prepare(`delete from ${t}`).run();
   }
@@ -23,6 +24,7 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   setVar("STORAGE_CAP_BYTES", realCap);
   setVar("OP_BUDGET", realBudget);
 });
@@ -39,7 +41,12 @@ const begin = (
   blobs: { sha256: string; size: number }[],
   token: string,
   version = "1.0",
-) => post(`/packs/${pack}/publish/begin`, { name: "Pack", version, blobs }, token);
+) => currentBase(pack).then((base) => post(`/packs/${pack}/publish/begin`, { name: "Pack", version, blobs, base }, token));
+
+const currentBase = async (pack: string) =>
+  (await env.DB.prepare("select version from packs where id = ? and published_at is not null").bind(pack).first<{
+    version: string;
+  }>())?.version ?? null;
 
 async function started(
   pack: string,
@@ -476,4 +483,127 @@ it("begin refuses a blob too large for one upload", async () => {
   const res = await begin("pack-a", [{ sha256: hash("a"), size: 5 * 1024 ** 3 + 1 }], token);
   expect(res.status).toBe(400);
   expect((await begin("pack-a", [{ sha256: hash("a"), size: 5 * 1024 ** 3 }], token)).status).toBe(200);
+});
+
+const beginAs = (pack: string, token: string, base: string | null, version = "2.0") =>
+  post(`/packs/${pack}/publish/begin`, { name: "Pack", version, blobs: [], base }, token);
+
+const emptyManifest = (pack: string, version: string) => manifest(pack, [], version);
+
+const commitOf = (id: string, pack: string, version: string, token: string) =>
+  post(`/publishes/${id}/commit`, { manifest: emptyManifest(pack, version) }, token);
+
+async function publishedPack(version = "1.0.0") {
+  const creator = await signIn("c1", "Cora");
+  const editor = await signIn("e1", "Eddie", null);
+  await env.DB.prepare(
+    "insert into packs (id, uploader_id, name, version, manifest, published_at) values ('pack-h', 'c1', 'Pack', ?, '{}', ?)",
+  )
+    .bind(version, nowSeconds())
+    .run();
+  await env.DB.prepare("insert into pack_editors (pack_id, user_id) values ('pack-h', 'e1')").run();
+  return { creator, editor };
+}
+
+const errCode = async (res: Response) => ((await res.json()) as { error: string }).error;
+
+it("an editor can publish to the pack", async () => {
+  const { editor } = await publishedPack();
+  const res = await beginAs("pack-h", editor, "1.0.0", "1.1.0");
+  expect(res.status).toBe(200);
+  const { publish_id } = (await res.json()) as { publish_id: string };
+  expect((await commitOf(publish_id, "pack-h", "1.1.0", editor)).status).toBe(200);
+  const row = await env.DB.prepare("select version from packs where id = 'pack-h'").first<{ version: string }>();
+  expect(row!.version).toBe("1.1.0");
+});
+
+it("begin refuses a stale base", async () => {
+  const { editor } = await publishedPack("1.1.0");
+  const res = await beginAs("pack-h", editor, "1.0.0");
+  expect(res.status).toBe(409);
+  expect(await errCode(res)).toBe("pack_behind");
+});
+
+it("begin refuses a missing base for a published pack", async () => {
+  const { creator } = await publishedPack();
+  const res = await beginAs("pack-h", creator, null);
+  expect(res.status).toBe(409);
+  expect(await errCode(res)).toBe("pack_behind");
+  const first = await signIn("u9");
+  expect((await beginAs("fresh", first, null, "1.0.0")).status).toBe(200);
+});
+
+it("commit refuses a publish whose base moved", async () => {
+  const { editor } = await publishedPack("1.0.0");
+  const blobs = [{ sha256: hash("a"), size: 3 }];
+  const res = await post(
+    "/packs/pack-h/publish/begin",
+    { name: "Pack", version: "2.0.0", blobs, base: "1.0.0" },
+    editor,
+  );
+  const { publish_id } = (await res.json()) as { publish_id: string };
+  await put(hash("a"), 3);
+  await post(`/publishes/${publish_id}/verify`, { blobs: [hash("a")] }, editor);
+  await env.DB.prepare("update packs set version = '1.1.0' where id = 'pack-h'").run();
+  const c = await post(`/publishes/${publish_id}/commit`, { manifest: manifest("pack-h", blobs, "2.0.0") }, editor);
+  expect(c.status).toBe(409);
+  expect(await errCode(c)).toBe("pack_behind");
+  const row = await env.DB.prepare("select version from packs where id = 'pack-h'").first<{ version: string }>();
+  expect(row!.version).toBe("1.1.0");
+  const n = await env.DB.prepare("select count(*) as n from pack_blobs").first<{ n: number }>();
+  expect(n!.n).toBe(0);
+});
+
+it("a second person is refused while a publish is open", async () => {
+  const { creator, editor } = await publishedPack();
+  expect((await beginAs("pack-h", editor, "1.0.0")).status).toBe(200);
+  const res = await beginAs("pack-h", creator, "1.0.0");
+  expect(res.status).toBe(409);
+  const body = (await res.json()) as { error: string; message: string };
+  expect(body.error).toBe("pack_busy");
+  expect(body.message).toContain("Eddie");
+});
+
+it("same user begin takes over their own open publish", async () => {
+  const { editor } = await publishedPack();
+  const a = (await (await beginAs("pack-h", editor, "1.0.0")).json()) as { publish_id: string };
+  const b = await beginAs("pack-h", editor, "1.0.0");
+  expect(b.status).toBe(200);
+  const c = await commitOf(a.publish_id, "pack-h", "2.0", editor);
+  expect(c.status).toBe(404);
+  expect(await errCode(c)).toBe("publish_gone");
+});
+
+it("the hold ends when the publish expires", async () => {
+  const { creator, editor } = await publishedPack();
+  await beginAs("pack-h", editor, "1.0.0");
+  await env.DB.prepare("update publishes set expires_at = ?").bind(nowSeconds() - 1).run();
+  expect((await beginAs("pack-h", creator, "1.0.0")).status).toBe(200);
+});
+
+it("urls and verify push the expiry back", async () => {
+  const { creator, editor } = await publishedPack();
+  const start = nowSeconds();
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(start * 1000);
+  const { publish_id } = (await (await beginAs("pack-h", editor, "1.0.0")).json()) as { publish_id: string };
+  vi.setSystemTime((start + 3000) * 1000);
+  expect((await post(`/publishes/${publish_id}/urls`, { blobs: [] }, editor)).status).toBe(200);
+  vi.setSystemTime((start + 3700) * 1000);
+  expect((await beginAs("pack-h", creator, "1.0.0")).status).toBe(409);
+  vi.setSystemTime((start + 6000) * 1000);
+  expect((await post(`/publishes/${publish_id}/verify`, { blobs: [] }, editor)).status).toBe(200);
+  vi.setSystemTime((start + 9000) * 1000);
+  expect((await beginAs("pack-h", creator, "1.0.0")).status).toBe(409);
+});
+
+it("clearing the hold frees the pack", async () => {
+  const { creator, editor } = await publishedPack();
+  const { publish_id } = (await (await beginAs("pack-h", editor, "1.0.0")).json()) as { publish_id: string };
+  expect((await api("/packs/pack-h/hold", { method: "DELETE" }, editor)).status).toBe(403);
+  const res = await api("/packs/pack-h/hold", { method: "DELETE" }, creator);
+  expect(res.status).toBe(200);
+  expect(await res.json()).toEqual({ cleared: 1 });
+  expect((await beginAs("pack-h", creator, "1.0.0")).status).toBe(200);
+  expect((await commitOf(publish_id, "pack-h", "2.0", editor)).status).toBe(404);
 });
