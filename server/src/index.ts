@@ -9,10 +9,13 @@ import {
   showInvite,
 } from "./invites";
 import {
+  editorInvite,
   leavePack,
+  listEditors,
   listUsers,
   listViewers,
   packInvite,
+  removeEditor,
   removePack,
   removeUser,
   removeViewer,
@@ -59,6 +62,9 @@ const dynamicRoutes: { method: string; pattern: RegExp; handler: CodeHandler }[]
   { method: "POST", pattern: /^\/packs\/([^/]+)\/invite\/reset$/, handler: resetPackInvite },
   { method: "GET", pattern: /^\/packs\/([^/]+)\/viewers$/, handler: listViewers },
   { method: "DELETE", pattern: /^\/packs\/([^/]+)\/viewers\/([^/]+)$/, handler: removeViewer },
+  { method: "POST", pattern: /^\/packs\/([^/]+)\/editor-invite$/, handler: editorInvite },
+  { method: "GET", pattern: /^\/packs\/([^/]+)\/editors$/, handler: listEditors },
+  { method: "DELETE", pattern: /^\/packs\/([^/]+)\/editors\/([^/]+)$/, handler: removeEditor },
   { method: "DELETE", pattern: /^\/packs\/([^/]+)\/membership$/, handler: leavePack },
   { method: "DELETE", pattern: /^\/packs\/([^/]+)$/, handler: removePack },
   { method: "DELETE", pattern: /^\/admin\/users\/([^/]+)$/, handler: removeUser },

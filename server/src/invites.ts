@@ -4,7 +4,7 @@ import { HttpError, json } from "./http";
 
 interface InviteRow {
   code: string;
-  kind: "uploader" | "viewer";
+  kind: "uploader" | "viewer" | "editor";
   pack_id: string | null;
   expires_at: number;
 }
@@ -66,27 +66,47 @@ async function requireRoom(env: Env, user: User): Promise<void> {
   }
 }
 
+async function claim(env: Env, code: string): Promise<void> {
+  const res = await env.DB.prepare(
+    "update invites set used_at = ? where code = ? and used_at is null and expires_at > ?",
+  )
+    .bind(nowSeconds(), code, nowSeconds())
+    .run();
+  if (res.meta.changes !== 1) throw gone();
+}
+
 export async function acceptInvite(
   env: Env,
   user: User,
   code: string,
-): Promise<{ kind: "uploader" | "viewer"; pack_id: string | null }> {
+): Promise<{ kind: InviteRow["kind"]; pack_id: string | null }> {
   const invite = await findInvite(env, code);
-  const pack = invite.kind === "viewer" ? await findPack(env, invite.pack_id) : null;
+  const pack = invite.kind === "uploader" ? null : await findPack(env, invite.pack_id);
   await requireRoom(env, user);
 
   if (!pack) {
     if (user.role) return { kind: "uploader", pack_id: null };
-    const claim = await env.DB.prepare(
-      "update invites set used_at = ? where code = ? and used_at is null and expires_at > ?",
-    )
-      .bind(nowSeconds(), code, nowSeconds())
-      .run();
-    if (claim.meta.changes !== 1) throw gone();
+    await claim(env, code);
     await env.DB.prepare("update users set role = 'uploader' where id = ? and role is null")
       .bind(user.id)
       .run();
     return { kind: "uploader", pack_id: null };
+  }
+
+  if (invite.kind === "editor") {
+    const editing = await env.DB.prepare("select 1 as x from pack_editors where pack_id = ? and user_id = ?")
+      .bind(pack.id, user.id)
+      .first();
+    if (user.role === "owner" || user.id === pack.uploader_id || editing) {
+      return { kind: "editor", pack_id: pack.id };
+    }
+    await claim(env, code);
+    await env.DB.batch([
+      env.DB.prepare("update users set role = 'uploader' where id = ? and role is null").bind(user.id),
+      env.DB.prepare("insert or ignore into pack_editors (pack_id, user_id) values (?, ?)").bind(pack.id, user.id),
+      env.DB.prepare("delete from pack_viewers where pack_id = ? and user_id = ?").bind(pack.id, user.id),
+    ]);
+    return { kind: "editor", pack_id: pack.id };
   }
 
   if (user.role !== "owner" && user.id !== pack.uploader_id) {
@@ -114,7 +134,7 @@ export async function showInvite(req: Request, env: Env, code: string): Promise<
   await requireUser(req, env);
   const invite = await findInvite(env, code);
   let pack = null;
-  if (invite.kind === "viewer") {
+  if (invite.kind !== "uploader") {
     const row = await findPack(env, invite.pack_id);
     pack = {
       id: row.id,

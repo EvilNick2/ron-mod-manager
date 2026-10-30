@@ -5,9 +5,10 @@ import { HttpError, json } from "./http";
 const PACK_ID = /^[A-Za-z0-9-]{1,64}$/;
 const HASH = /^[0-9a-f]{64}$/;
 
-// Binds: owner flag, user id, user id. Applies to a `packs p` row.
+// Binds: owner flag, user id, user id, user id. Applies to a `packs p` row.
 const VISIBLE = `p.manifest is not null and p.published_at is not null and (
   ? = 1 or p.uploader_id = ?
+  or exists (select 1 from pack_editors e where e.pack_id = p.id and e.user_id = ?)
   or exists (select 1 from pack_viewers v where v.pack_id = p.id and v.user_id = ?))`;
 
 const isOwner = (role: User["role"]) => (role === "owner" ? 1 : 0);
@@ -15,17 +16,19 @@ const isOwner = (role: User["role"]) => (role === "owner" ? 1 : 0);
 export async function visiblePacks(env: Env, user: User) {
   const rows = await env.DB.prepare(
     `select p.id, p.name, p.version, p.uploader_id, u.name as uploader_name,
+            exists (select 1 from pack_editors e where e.pack_id = p.id and e.user_id = ?) as editing,
             exists (select 1 from pack_viewers v where v.pack_id = p.id and v.user_id = ?) as viewing
      from packs p left join users u on u.id = p.uploader_id
      where ${VISIBLE} order by p.name, p.id`,
   )
-    .bind(user.id, isOwner(user.role), user.id, user.id)
+    .bind(user.id, user.id, isOwner(user.role), user.id, user.id, user.id)
     .all<{
       id: string;
       name: string;
       version: string;
       uploader_id: string;
       uploader_name: string | null;
+      editing: number;
       viewing: number;
     }>();
   return rows.results.map((r) => ({
@@ -36,9 +39,11 @@ export async function visiblePacks(env: Env, user: User) {
     access:
       r.uploader_id === user.id
         ? ("uploader" as const)
-        : r.viewing
-          ? ("viewer" as const)
-          : ("owner" as const),
+        : r.editing
+          ? ("editor" as const)
+          : r.viewing
+            ? ("viewer" as const)
+            : ("owner" as const),
   }));
 }
 
@@ -52,7 +57,7 @@ export async function getManifest(req: Request, env: Env, packId: string): Promi
   const gone = new HttpError(404, "pack_gone", "This pack is not available");
   if (!PACK_ID.test(packId) || /^[0-9]+$/.test(packId)) throw gone;
   const row = await env.DB.prepare(`select p.manifest from packs p where p.id = ? and ${VISIBLE}`)
-    .bind(packId, isOwner(user.role), user.id, user.id)
+    .bind(packId, isOwner(user.role), user.id, user.id, user.id)
     .first<{ manifest: string }>();
   if (!row) throw gone;
   return new Response(row.manifest, { headers: { "content-type": "application/json" } });
@@ -63,7 +68,7 @@ export async function getChangelog(req: Request, env: Env, packId: string): Prom
   const gone = new HttpError(404, "pack_gone", "This pack is not available");
   if (!PACK_ID.test(packId) || /^[0-9]+$/.test(packId)) throw gone;
   const row = await env.DB.prepare(`select p.id from packs p where p.id = ? and ${VISIBLE}`)
-    .bind(packId, isOwner(user.role), user.id, user.id)
+    .bind(packId, isOwner(user.role), user.id, user.id, user.id)
     .first();
   if (!row) throw gone;
   const rows = await env.DB.prepare(
@@ -91,7 +96,7 @@ export async function getBlob(req: Request, env: Env, sha: string): Promise<Resp
      join blobs bl on bl.sha256 = b.sha256
      where b.sha256 = ? and ${VISIBLE} limit 1`,
   )
-    .bind(sha, isOwner(user.role), user.id, user.id)
+    .bind(sha, isOwner(user.role), user.id, user.id, user.id)
     .first<{ size: number }>();
   if (!row) throw gone();
   if (!rangeSatisfiable(req.headers.get("range"), row.size)) {

@@ -14,6 +14,7 @@ function packStatements(env: Env, ids: string, arg: string): D1PreparedStatement
   const run = (sql: string) => env.DB.prepare(sql).bind(arg);
   return [
     run(`delete from pack_viewers where pack_id in (${ids})`),
+    run(`delete from pack_editors where pack_id in (${ids})`),
     run(`delete from pack_blobs where pack_id in (${ids})`),
     run(`delete from invites where pack_id in (${ids})`),
     run(`delete from pack_versions where pack_id in (${ids})`),
@@ -38,11 +39,24 @@ async function loadPack(env: Env, id: string): Promise<{ id: string; uploader_id
   return pack;
 }
 
+// Creator, editor or owner.
 async function managedPack(req: Request, env: Env, id: string): Promise<{ user: User; packId: string }> {
   const user = await requireUser(req, env);
   const pack = await loadPack(env, id);
   if (user.role !== "owner" && pack.uploader_id !== user.id) {
-    throw new HttpError(403, "forbidden", "Only the pack's uploader can do this");
+    const editor = await env.DB.prepare("select 1 as x from pack_editors where pack_id = ? and user_id = ?")
+      .bind(pack.id, user.id)
+      .first();
+    if (!editor) throw new HttpError(403, "forbidden", "Only the pack's creator or an editor can do this");
+  }
+  return { user, packId: pack.id };
+}
+
+async function creatorPack(req: Request, env: Env, id: string): Promise<{ user: User; packId: string }> {
+  const user = await requireUser(req, env);
+  const pack = await loadPack(env, id);
+  if (user.role !== "owner" && pack.uploader_id !== user.id) {
+    throw new HttpError(403, "forbidden", "Only the pack's creator can do this");
   }
   return { user, packId: pack.id };
 }
@@ -72,7 +86,7 @@ export async function packInvite(req: Request, env: Env, id: string): Promise<Re
 }
 
 export async function resetPackInvite(req: Request, env: Env, id: string): Promise<Response> {
-  const { user, packId } = await managedPack(req, env, id);
+  const { user, packId } = await creatorPack(req, env, id);
   await env.DB.prepare("delete from invites where kind = 'viewer' and pack_id = ?").bind(packId).run();
   return mintViewerInvite(env, packId, user.id);
 }
@@ -102,8 +116,48 @@ export async function removeViewer(req: Request, env: Env, id: string, userId: s
 }
 
 export async function removePack(req: Request, env: Env, id: string): Promise<Response> {
-  const { packId } = await managedPack(req, env, id);
+  const { packId } = await creatorPack(req, env, id);
   await deletePack(env, packId);
+  return json({ ok: true });
+}
+
+export async function editorInvite(req: Request, env: Env, id: string): Promise<Response> {
+  const { user, packId } = await creatorPack(req, env, id);
+  const code = randomToken();
+  const expiresAt = nowSeconds() + DAY;
+  await env.DB.prepare(
+    "insert into invites (code, kind, pack_id, created_by, expires_at) values (?, 'editor', ?, ?, ?)",
+  )
+    .bind(code, packId, user.id, expiresAt)
+    .run();
+  return json({ url: inviteUrl(env, code), expires_at: expiresAt });
+}
+
+export async function listEditors(req: Request, env: Env, id: string): Promise<Response> {
+  const { packId } = await creatorPack(req, env, id);
+  const rows = await env.DB.prepare(
+    `select u.id, u.name from pack_editors e join users u on u.id = e.user_id
+     where e.pack_id = ? order by u.name, u.id`,
+  )
+    .bind(packId)
+    .all<{ id: string; name: string }>();
+  return json(rows.results);
+}
+
+// The removed editor stays on as a viewer. Their open publishes of the pack are expired, not deleted.
+export async function removeEditor(req: Request, env: Env, id: string, userId: string): Promise<Response> {
+  const { packId } = await creatorPack(req, env, id);
+  const isEditor = "exists (select 1 from pack_editors where pack_id = ? and user_id = ?)";
+  const [, , res] = await env.DB.batch([
+    env.DB.prepare(
+      `insert or ignore into pack_viewers (pack_id, user_id) select ?, ? where ${isEditor}`,
+    ).bind(packId, userId, packId, userId),
+    env.DB.prepare(
+      `update publishes set expires_at = min(expires_at, ?) where pack_id = ? and user_id = ? and ${isEditor}`,
+    ).bind(cancelledExpiry(nowSeconds()), packId, userId, packId, userId),
+    env.DB.prepare("delete from pack_editors where pack_id = ? and user_id = ?").bind(packId, userId),
+  ]);
+  if (res.meta.changes !== 1) throw userGone();
   return json({ ok: true });
 }
 
@@ -113,10 +167,15 @@ export async function leavePack(req: Request, env: Env, id: string): Promise<Res
   if (pack.uploader_id === user.id) {
     throw new HttpError(400, "own_pack", "You cannot leave your own pack");
   }
-  const res = await env.DB.prepare("delete from pack_viewers where pack_id = ? and user_id = ?")
-    .bind(pack.id, user.id)
-    .run();
-  if (res.meta.changes !== 1) throw packGone();
+  const [, editor, viewer] = await env.DB.batch([
+    env.DB.prepare(
+      `update publishes set expires_at = min(expires_at, ?) where pack_id = ? and user_id = ?
+       and exists (select 1 from pack_editors where pack_id = ? and user_id = ?)`,
+    ).bind(cancelledExpiry(nowSeconds()), pack.id, user.id, pack.id, user.id),
+    env.DB.prepare("delete from pack_editors where pack_id = ? and user_id = ?").bind(pack.id, user.id),
+    env.DB.prepare("delete from pack_viewers where pack_id = ? and user_id = ?").bind(pack.id, user.id),
+  ]);
+  if (editor.meta.changes + viewer.meta.changes === 0) throw packGone();
   return json({ ok: true });
 }
 
@@ -149,7 +208,10 @@ export async function removeUser(req: Request, env: Env, id: string): Promise<Re
     ...packStatements(env, "select id from packs where uploader_id = ?", id),
     run(`delete from invites where kind = 'viewer'
          and pack_id in (select pack_id from pack_viewers where user_id = ?)`),
+    run(`delete from invites where kind = 'viewer'
+         and pack_id in (select pack_id from pack_editors where user_id = ?)`),
     run("delete from pack_viewers where user_id = ?"),
+    run("delete from pack_editors where user_id = ?"),
     run("delete from sessions where user_id = ?"),
     run("delete from invites where created_by = ?"),
     env.DB.prepare("update publishes set expires_at = min(expires_at, ?) where user_id = ?").bind(
