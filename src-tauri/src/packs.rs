@@ -3,9 +3,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
-use crate::server::VersionEntry;
+use crate::server::{RemoteManifest, VersionEntry};
 
 const MANIFEST_FILE: &str = "pack.json";
+const SERVER_KIND: &str = "server";
 pub const CHANGELOG_FILE: &str = "changelog.json";
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -136,6 +137,27 @@ pub fn ensure_pack_editable(mods_dir: &Path, pack_id: &str) -> Result<(), String
         }
         _ => Ok(()),
     }
+}
+
+// A Drive link or no link can publish. A link to a creator on a server cannot.
+pub fn ensure_pack_publishable(mods_dir: &Path, pack_id: &str) -> Result<(), String> {
+    match read_manifest(&mods_dir.join(pack_id)) {
+        Some(m) if m.source.as_ref().is_some_and(|s| s.kind == SERVER_KIND) => {
+            Err(format!("{} is linked to its creator. Fork it to make changes.", m.name))
+        }
+        _ => Ok(()),
+    }
+}
+
+pub fn installed_from(manifest: &RemoteManifest) -> BTreeMap<String, InstalledMod> {
+    manifest
+        .mods
+        .iter()
+        .map(|m| {
+            let files = m.files.iter().map(|f| (f.path.clone(), f.sha256.to_ascii_lowercase())).collect();
+            (m.id.clone(), InstalledMod { hash: m.hash.clone(), files })
+        })
+        .collect()
 }
 
 pub fn ensure_editable(mods_dir: &Path, key: &str) -> Result<(), String> {

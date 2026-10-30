@@ -62,6 +62,11 @@ fn remove_viewer(conn: &Conn, pack_id: &str, user_id: &str) -> Result<RemovedVie
     conn.text(conn.server().remove_viewer(pack_id, user_id))
 }
 
+fn access_of(conn: &Conn, pack_id: &str) -> Result<Option<String>, String> {
+    let me = conn.text(conn.server().me())?;
+    Ok(me.packs.into_iter().find(|p| p.id == pack_id).map(|p| p.access))
+}
+
 #[tauri::command]
 pub async fn pack_invite_link(base: String, pack_id: String) -> Result<Link, String> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -95,6 +100,53 @@ pub async fn pack_viewers(base: String, pack_id: String) -> Result<Vec<Viewer>, 
 #[tauri::command]
 pub async fn remove_pack_viewer(base: String, pack_id: String, user_id: String) -> Result<RemovedViewer, String> {
     tauri::async_runtime::spawn_blocking(move || remove_viewer(&live(&base)?, &pack_id, &user_id))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn pack_editor_invite_link(base: String, pack_id: String) -> Result<Link, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = live(&base)?;
+        conn.text(conn.server().editor_invite(&pack_id))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn pack_editors(base: String, pack_id: String) -> Result<Vec<Viewer>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = live(&base)?;
+        conn.text(conn.server().editors(&pack_id))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn remove_pack_editor(base: String, pack_id: String, user_id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = live(&base)?;
+        conn.text(conn.server().remove_editor(&pack_id, &user_id))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn clear_publish_hold(base: String, pack_id: String) -> Result<u32, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = live(&base)?;
+        conn.text(conn.server().clear_hold(&pack_id))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn pack_access(base: String, pack_id: String) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || access_of(&live(&base)?, &pack_id))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -301,6 +353,14 @@ mod tests {
 
         let again = remove_viewer(&owner, PACK, VIEWER).unwrap_err();
         assert_eq!(again, "This person is not on the server");
+    }
+
+    #[test]
+    fn access_reports_role_or_none() {
+        let w = World::new();
+        assert_eq!(access_of(&w.conn(OWNER), PACK).unwrap().as_deref(), Some("uploader"));
+        assert_eq!(access_of(&w.conn(VIEWER), PACK).unwrap().as_deref(), Some("viewer"));
+        assert_eq!(access_of(&w.conn(VIEWER), "Other-Pack").unwrap(), None);
     }
 
     #[test]

@@ -176,13 +176,15 @@ fn set_dirty(pack_dir: &Path, dirty: bool) -> Result<(), String> {
 }
 
 // Keeps the dirty flag on disk for an already published pack, so edits made during the publish survive
-fn mark_published(pack_dir: &Path, server: &str, version: &str) -> Result<(), String> {
+fn mark_published(pack_dir: &Path, server: &str, remote: &RemoteManifest) -> Result<(), String> {
     let mut manifest = packs::read_manifest(pack_dir).ok_or("Could not read pack.json")?;
     match manifest.published.as_mut() {
         Some(p) => p.server = Some(server.to_string()),
         None => manifest.published = Some(Published { server: Some(server.to_string()), dirty: false }),
     }
-    manifest.version = Some(version.to_string());
+    manifest.version = Some(remote.version.clone());
+    manifest.installed_hashes = packs::installed_from(remote);
+    manifest.source = None;
     packs::write_manifest(pack_dir, &manifest)
 }
 
@@ -478,7 +480,7 @@ pub fn publish_pack(
     let manifest = packs::read_manifest(pack_dir).ok_or_else(|| format!("Could not read {}", pack_dir.join("pack.json").display()))?;
     let op = OpGuard::begin_named(pack_dir, OpKind::Publish, &manifest.name)?;
     let mods_dir = pack_dir.parent().ok_or("The pack folder has no parent")?;
-    packs::ensure_pack_editable(mods_dir, &manifest.pack_id)?;
+    packs::ensure_pack_publishable(mods_dir, &manifest.pack_id)?;
     let was_dirty = manifest.published.as_ref().is_some_and(|p| p.dirty);
     if was_dirty {
         set_dirty(pack_dir, false)?;
@@ -493,11 +495,11 @@ pub fn publish_pack(
     result
 }
 
-// The owner and viewers can see another uploader's pack, which begin would refuse as pack_taken.
+// The owner and viewers can see another's pack, which begin would refuse as pack_taken.
 // True when me() fails, so begin decides.
 fn uploads_pack(conn: &Conn, pack_id: &str) -> bool {
     match conn.call(conn.server().me()) {
-        Ok(me) => me.packs.iter().find(|p| p.id == pack_id).is_none_or(|p| p.access == "uploader"),
+        Ok(me) => me.packs.iter().find(|p| p.id == pack_id).is_none_or(|p| p.access == "uploader" || p.access == "editor"),
         Err(_) => true,
     }
 }
@@ -525,6 +527,7 @@ fn run_publish(
     if remote.is_some() && manifest.published.as_ref().and_then(|p| p.server.as_deref()).is_none() && !uploads_pack(conn, pack_id) {
         return Err(ServerError::new("pack_taken", "").text(&base));
     }
+    let installed = manifest.published.as_ref().filter(|p| p.server.is_some()).and(manifest.version.as_deref());
     if let Some(old) = &remote {
         if old.format > FORMAT {
             return Err("Update RON Mod Manager to publish this pack".to_string());
@@ -536,10 +539,13 @@ fn run_publish(
         }
         if old.version == version {
             if same_mods(&remote_states(old), &local_states(&local)) {
-                mark_published(pack_dir, &base, &old.version)?;
+                mark_published(pack_dir, &base, old)?;
                 return Ok(PublishOutcome::NothingToPublish { server: base });
             }
             return Err(format!("Version {} is already published. Enter a new version.", version));
+        }
+        if installed.is_some_and(|v| v != old.version) {
+            return Err(ServerError::new("pack_behind", "").text(&base));
         }
     }
 
@@ -571,7 +577,7 @@ fn run_publish(
         server: conn.server(),
         pack_dir,
         pack_id,
-        base: manifest.published.as_ref().filter(|p| p.server.is_some()).and(manifest.version.as_deref()),
+        base: installed,
         blobs: &blobs,
         cancel,
         progress,
@@ -590,7 +596,7 @@ fn run_publish(
     let published_at = conn.text(result)?.unwrap_or(now);
     let uploaded = up.put.len();
 
-    mark_published(pack_dir, &base, version)?;
+    mark_published(pack_dir, &base, &ready)?;
     let mut log = packs::read_changelog(pack_dir);
     log.entries.insert(0, VersionEntry { version: version.to_string(), published_at, notes, publisher: None });
     log.base = None;
@@ -714,7 +720,7 @@ mod tests {
     const A_PAK: &str = "pakchunk999-Mods_AVP_BetterVestsRemastared_P.pak";
     const B_PAK: &str = "pakchunk9999-Mods_CazanusVisceralBlud_P.pak";
     const W_PAK: &str = "pakchunk9999-Mods_wound_P.pak";
-    const TAKEN: &str = "Another uploader on this server already uses this pack id. Rename the pack and try again.";
+    const TAKEN: &str = "Someone else already has a pack with this id on the server. Rename the pack, or ask its creator to add you as an editor.";
 
     type ModSpec<'a> = (&'a str, Vec<(&'a str, String)>);
 
@@ -945,6 +951,18 @@ mod tests {
         assert_eq!(out, published(BASE, "1.0.0", 5, 0));
         assert_eq!(w.remote().version, "1.0.0");
         assert_eq!(w.versions().len(), 1);
+    }
+
+    #[test]
+    fn cleared_publish_does_not_start_over() {
+        let pack_dir = pack_fixture("cleared", &base_mods());
+        let w = World::new();
+        w.owner.clear_hold_before_commit();
+        let e = publish(&w, &pack_dir, "1.0.0").unwrap_err();
+        assert_eq!(e, "The pack's creator stopped this publish.");
+        assert_eq!(w.owner.begins(), 1);
+        assert_eq!(w.owner.open_publishes(), 0);
+        assert!(packs::read_manifest(&pack_dir).unwrap().published.is_none());
     }
 
     #[test]
@@ -1396,6 +1414,165 @@ mod tests {
             "Casual Shitters is linked to its creator. Fork it to make changes."
         );
         assert_eq!(w.owner.begins(), 0);
+    }
+
+    const BEHIND: &str = "A newer version of this pack is on the server. Update to it, make your changes again and publish.";
+
+    // A copy of the creator's pack as an editor or a stale creator would hold it
+    fn working_copy(name: &str, version: &str) -> PathBuf {
+        let pack_dir = pack_fixture(name, &base_mods());
+        let mut man = packs::read_manifest(&pack_dir).unwrap();
+        man.version = Some(version.into());
+        man.published = Some(Published { server: Some(BASE.into()), dirty: true });
+        packs::write_manifest(&pack_dir, &man).unwrap();
+        pack_dir
+    }
+
+    fn change_vests(pack_dir: &Path, body: &str) {
+        fs::write(pack_dir.join("3063").join(A_PAK), body).unwrap();
+    }
+
+    #[test]
+    fn publish_sends_the_installed_version_as_base() {
+        let creator = pack_fixture("base-first", &base_mods());
+        let w = World::new();
+        // The fake accepts a new pack without a base and an existing one only with a matching base
+        publish(&w, &creator, "1.0.0").unwrap();
+        change_vests(&creator, "vests-v2");
+        publish(&w, &creator, "1.1.0").unwrap();
+        assert_eq!(w.remote().version, "1.1.0");
+        assert_eq!(w.versions().len(), 2);
+    }
+
+    #[test]
+    fn publish_refuses_when_behind() {
+        let creator = pack_fixture("behind", &base_mods());
+        let w = World::new();
+        publish(&w, &creator, "1.0.0").unwrap();
+        let stale = working_copy("behind-stale", "1.0.0");
+        change_vests(&creator, "vests-v2");
+        publish(&w, &creator, "1.1.0").unwrap();
+
+        let (begins, puts) = (w.owner.begins(), w.owner.puts());
+        change_vests(&stale, "vests-v3");
+        assert_eq!(publish(&w, &stale, "1.2.0").unwrap_err(), BEHIND);
+        assert_eq!((w.owner.begins(), w.owner.puts()), (begins, puts));
+        assert_eq!(w.remote().version, "1.1.0");
+        let man = packs::read_manifest(&stale).unwrap();
+        assert_eq!(man.version.as_deref(), Some("1.0.0"));
+        assert!(man.published.unwrap().dirty);
+    }
+
+    #[test]
+    fn editor_can_publish() {
+        let creator = pack_fixture("editor-creator", &base_mods());
+        let w = World::new();
+        publish(&w, &creator, "1.0.0").unwrap();
+        w.owner.add_user("ed", "Editor", None);
+        w.owner.add_editor(PACK, "ed");
+        let copy = working_copy("editor-copy", "1.0.0");
+        change_vests(&copy, "vests-editor");
+
+        let conn = Conn::new(w.owner.as_user("ed"), w.store.clone());
+        let out = publish_pack(&conn, &copy, "1.1.0", NOW, None, &mut no_progress()).unwrap();
+        assert!(matches!(out, PublishOutcome::Published { .. }), "{:?}", out);
+        assert_eq!(w.remote().version, "1.1.0");
+        assert_eq!(packs::read_manifest(&copy).unwrap().version.as_deref(), Some("1.1.0"));
+    }
+
+    #[test]
+    fn viewer_cannot_publish_a_working_copy() {
+        let creator = pack_fixture("viewer-creator", &base_mods());
+        let w = World::new();
+        publish(&w, &creator, "1.0.0").unwrap();
+        w.owner.add_user("vw", "Viewer", None);
+        w.owner.add_viewer(PACK, "vw");
+        let copy = working_copy("viewer-copy", "1.0.0");
+        let conn = Conn::new(w.owner.as_user("vw"), w.store.clone());
+        let err = publish_pack(&conn, &copy, "1.1.0", NOW, None, &mut no_progress()).unwrap_err();
+        assert_eq!(err, TAKEN);
+        assert_eq!(w.remote().version, "1.0.0");
+    }
+
+    #[test]
+    fn publish_records_installed_hashes() {
+        let pack_dir = pack_fixture("hashes", &base_mods());
+        let w = World::new();
+        publish(&w, &pack_dir, "1.0.0").unwrap();
+        let man = packs::read_manifest(&pack_dir).unwrap();
+        assert!(!man.installed_hashes.is_empty());
+        assert_eq!(man.installed_hashes, packs::installed_from(&w.remote()));
+    }
+
+    #[test]
+    fn drive_pack_publishes_under_its_own_id() {
+        let pack_dir = pack_fixture("drive-pack", &base_mods());
+        let mut man = packs::read_manifest(&pack_dir).unwrap();
+        man.source = Some(PackSource { kind: "drive".into(), folder_id: Some("F".into()), ..Default::default() });
+        packs::write_manifest(&pack_dir, &man).unwrap();
+        let w = World::new();
+        let out = publish(&w, &pack_dir, "1.0.0").unwrap();
+        assert_eq!(out, published(BASE, "1.0.0", 5, 0));
+        assert_eq!(w.remote().pack_id, PACK);
+        let man = packs::read_manifest(&pack_dir).unwrap();
+        assert_eq!(man.source, None);
+        assert_eq!(man.published, Some(Published { server: Some(BASE.into()), dirty: false }));
+        assert_eq!(man.installed_hashes, packs::installed_from(&w.remote()));
+    }
+
+    #[test]
+    fn drive_pack_with_a_taken_id_says_pack_taken() {
+        let pack_dir = pack_fixture("drive-taken", &base_mods());
+        let mut man = packs::read_manifest(&pack_dir).unwrap();
+        man.source = Some(PackSource { kind: "drive".into(), folder_id: Some("F".into()), ..Default::default() });
+        packs::write_manifest(&pack_dir, &man).unwrap();
+        let w = World::new();
+        w.owner.add_user("other", "Other", Some("uploader"));
+        let theirs = RemoteManifest {
+            format: FORMAT,
+            pack_id: PACK.into(),
+            name: "Theirs".into(),
+            version: "0.5.0".into(),
+            status: "ready".into(),
+            published_at: 1,
+            published_by: None,
+            mods: Vec::new(),
+        };
+        w.owner.seed_pack("other", &theirs, "Theirs");
+        assert_eq!(publish(&w, &pack_dir, "1.0.0").unwrap_err(), TAKEN);
+        assert_eq!(w.owner.puts(), 0);
+        assert_eq!(w.remote().version, "0.5.0");
+    }
+
+    #[test]
+    fn server_linked_pack_still_cannot_publish() {
+        let pack_dir = pack_fixture("server-linked", &base_mods());
+        let mut man = packs::read_manifest(&pack_dir).unwrap();
+        man.source = Some(PackSource { kind: "server".into(), server: Some(BASE.into()), ..Default::default() });
+        packs::write_manifest(&pack_dir, &man).unwrap();
+        let w = World::new();
+        assert_eq!(
+            publish(&w, &pack_dir, "1.0.0").unwrap_err(),
+            "Casual Shitters is linked to its creator. Fork it to make changes."
+        );
+        assert_eq!(w.owner.begins(), 0);
+    }
+
+    #[test]
+    fn pack_busy_text_is_passed_through() {
+        let creator = pack_fixture("busy-creator", &base_mods());
+        let w = World::new();
+        publish(&w, &creator, "1.0.0").unwrap();
+        w.owner.add_user("ed", "Editor", None);
+        w.owner.add_editor(PACK, "ed");
+        w.owner.as_user(UPLOADER).begin(PACK, "Casual Shitters", "1.1.0", Some("1.0.0"), &[]).unwrap();
+
+        let copy = working_copy("busy-copy", "1.0.0");
+        change_vests(&copy, "vests-editor");
+        let conn = Conn::new(w.owner.as_user("ed"), w.store.clone());
+        let err = publish_pack(&conn, &copy, "1.2.0", NOW, None, &mut no_progress()).unwrap_err();
+        assert_eq!(err, "Uploader is publishing this pack right now. Try again once it is done.");
+        assert_eq!(w.owner.puts(), 5);
     }
 
     #[test]

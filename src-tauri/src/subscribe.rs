@@ -11,7 +11,7 @@ use tauri::Emitter;
 
 use crate::accounts::Conn;
 use crate::hashing;
-use crate::packs::{self, InstalledMod, PackManifest, PackRef, PackSource};
+use crate::packs::{self, InstalledMod, PackManifest, PackRef, PackSource, Published};
 use crate::publish::{progress_event, Throttle};
 use crate::server::{
     nap, parse_invite, InvitePack, Progress, RemoteFileEntry, RemoteManifest, RemoteMod, ServerError, VersionEntry, CANCELLED, FORMAT,
@@ -124,10 +124,12 @@ fn pack_archive(manifest: &RemoteManifest) -> PackArchive {
 }
 
 
-// Refuses the creator's own pack, a pack from another server, or a folder that differs only in case
-fn check_target(mods_dir: &Path, pack_id: &str, base: &str) -> Result<(), String> {
+// Refuses a working copy, unless an editor invite reinstalls it, a pack from another server, or a folder
+// that differs only in case
+fn check_target(mods_dir: &Path, pack_id: &str, base: &str, editor: bool) -> Result<(), String> {
     if let Some(existing) = packs::read_manifest(&mods_dir.join(pack_id)) {
-        if existing.published.as_ref().is_some_and(|p| p.server.is_some()) {
+        let published_to = existing.published.as_ref().and_then(|p| p.server.as_deref());
+        if published_to.is_some() && !(editor && published_to == Some(base)) {
             return Err(format!("{} is your own published pack. Fork or delete it before adding it from a link.", existing.name));
         }
         if existing.source.as_ref().is_some_and(|s| s.kind == SERVER_KIND && s.server.as_deref() != Some(base)) {
@@ -152,6 +154,8 @@ pub struct InstalledInfo {
     pub version: Option<String>,
     /// "server", "drive" or "local"
     pub from: String,
+    /// A working copy of this server with nothing unpublished, which an editor invite reinstalls without loss
+    pub clean_working: bool,
 }
 
 #[derive(Serialize, Debug)]
@@ -164,14 +168,15 @@ pub struct LinkInfo {
     pub installed: Option<InstalledInfo>,
 }
 
-fn installed_info(mods_dir: &Path, pack_id: &str) -> Option<InstalledInfo> {
+fn installed_info(mods_dir: &Path, pack_id: &str, base: &str) -> Option<InstalledInfo> {
     let local = packs::read_manifest(&mods_dir.join(pack_id))?;
+    let clean_working = working_server(&local) == Some(base) && !local.published.as_ref().is_some_and(|p| p.dirty);
     let from = match local.source.map(|s| s.kind) {
         Some(kind) if kind == SERVER_KIND => "server",
         Some(_) => "drive",
         None => "local",
     };
-    Some(InstalledInfo { version: local.version, from: from.to_string() })
+    Some(InstalledInfo { version: local.version, from: from.to_string(), clean_working })
 }
 
 /// What an invite holds, without accepting it. Signed out, it only names the server.
@@ -196,9 +201,9 @@ pub fn inspect_invite(conn: &Conn, code: &str, mods_dir: &Path, switch_from: Opt
     if let Some(pack) = &invite.pack {
         validate_pack_id(&pack.id)?;
         if switch_from != Some(pack.id.as_str()) {
-            check_target(mods_dir, &pack.id, conn.base())?;
+            check_target(mods_dir, &pack.id, conn.base(), invite.kind == "editor")?;
         }
-        info.installed = installed_info(mods_dir, &pack.id);
+        info.installed = installed_info(mods_dir, &pack.id, conn.base());
     }
     info.signed_in = true;
     info.kind = invite.kind;
@@ -300,7 +305,7 @@ pub fn cancel_pack_op(app_handle: tauri::AppHandle, pack_id: String) -> Result<(
 fn stage_remote(
     conn: &Conn,
     manifest: &RemoteManifest,
-    source: PackSource,
+    tie: Tie,
     mod_ids: Vec<String>,
     staged: &Path,
     cache: &Path,
@@ -322,7 +327,7 @@ fn stage_remote(
     for m in &manifest.mods {
         reset_downloaded_mod(&staged.join(&m.id), m)?;
     }
-    write_staged_manifest(manifest, source, mod_ids, staged)
+    write_staged_manifest(manifest, tie, mod_ids, staged)
 }
 
 const HASH_MISMATCH: &str = "The download did not match its expected hash";
@@ -523,15 +528,25 @@ fn reset_downloaded_mod(dir: &Path, m: &RemoteMod) -> Result<(), String> {
     Ok(())
 }
 
-fn write_staged_manifest(manifest: &RemoteManifest, source: PackSource, mod_ids: Vec<String>, staged: &Path) -> Result<(), String> {
-    let installed_hashes = manifest
-        .mods
-        .iter()
-        .map(|m| {
-            let files = m.files.iter().map(|f| (f.path.clone(), f.sha256.to_ascii_lowercase())).collect();
-            (m.id.clone(), InstalledMod { hash: m.hash.clone(), files })
-        })
-        .collect();
+// How an installed pack relates to its server
+enum Tie {
+    // A locked copy of someone's pack
+    Linked(PackSource),
+    // The creator's or an editor's copy, which can publish. Holds the server.
+    Working(String),
+}
+
+impl Tie {
+    fn parts(self) -> (Option<PackSource>, Option<Published>) {
+        match self {
+            Tie::Linked(source) => (Some(source), None),
+            Tie::Working(server) => (None, Some(Published { server: Some(server), dirty: false })),
+        }
+    }
+}
+
+fn write_staged_manifest(manifest: &RemoteManifest, tie: Tie, mod_ids: Vec<String>, staged: &Path) -> Result<(), String> {
+    let (source, published) = tie.parts();
     let imported_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
     packs::write_manifest(
         staged,
@@ -541,9 +556,9 @@ fn write_staged_manifest(manifest: &RemoteManifest, source: PackSource, mod_ids:
             version: Some(manifest.version.clone()),
             mod_ids,
             imported_at,
-            source: Some(source),
-            installed_hashes,
-            published: None,
+            source,
+            installed_hashes: packs::installed_from(manifest),
+            published,
             local_hashes: BTreeMap::new(),
         },
     )
@@ -588,20 +603,23 @@ fn uploader_name(conn: &Conn, pack_id: &str) -> Option<String> {
 }
 
 /// Installs the server's current version of a pack, replacing an installed copy in place
+#[allow(clippy::too_many_arguments)]
 pub fn install_pack(
     conn: &Conn,
     pack_id: &str,
     invite: Option<&str>,
     uploader: Option<String>,
+    working: bool,
     mods_dir: &Path,
     paks_dir: &Path,
     progress: &mut dyn FnMut(Progress),
 ) -> Result<ImportSummary, String> {
-    install_seeded(conn, pack_id, invite, uploader, None, mods_dir, paks_dir, progress)
+    install_seeded(conn, pack_id, invite, uploader, None, working, mods_dir, paks_dir, progress)
 }
 
 // install_pack, reusing the files of the pack at seed_from, or else of the copy it replaces.
 // A switch passes seed_from and has checked its target with check_switch_target.
+// `working` installs the pack as the editor's working copy, not a locked one.
 #[allow(clippy::too_many_arguments)]
 fn install_seeded(
     conn: &Conn,
@@ -609,13 +627,14 @@ fn install_seeded(
     invite: Option<&str>,
     uploader: Option<String>,
     seed_from: Option<&Path>,
+    working: bool,
     mods_dir: &Path,
     paks_dir: &Path,
     progress: &mut dyn FnMut(Progress),
 ) -> Result<ImportSummary, String> {
     let manifest = fetch_remote(conn, pack_id)?;
     if seed_from.is_none() {
-        check_target(mods_dir, pack_id, conn.base())?;
+        check_target(mods_dir, pack_id, conn.base(), working)?;
     }
     let archive = pack_archive(&manifest);
     let plan = vfs::plan_import(&archive, mods_dir)?;
@@ -628,12 +647,16 @@ fn install_seeded(
         .and_then(packs::read_manifest)
         .and_then(|m| m.source)
         .filter(|s| s.kind == SERVER_KIND && s.server.as_deref() == Some(conn.base()));
-    let source = PackSource {
-        kind: SERVER_KIND.to_string(),
-        server: Some(conn.base().to_string()),
-        invite: invite.map(str::to_string).or_else(|| previous.as_ref().and_then(|s| s.invite.clone())),
-        uploader: uploader.or_else(|| previous.and_then(|s| s.uploader)),
-        ..Default::default()
+    let tie = if working {
+        Tie::Working(conn.base().to_string())
+    } else {
+        Tie::Linked(PackSource {
+            kind: SERVER_KIND.to_string(),
+            server: Some(conn.base().to_string()),
+            invite: invite.map(str::to_string).or_else(|| previous.as_ref().and_then(|s| s.invite.clone())),
+            uploader: uploader.or_else(|| previous.and_then(|s| s.uploader)),
+            ..Default::default()
+        })
     };
 
     let staging = mods_dir.join(format!(".import-{}", uuid::Uuid::new_v4()));
@@ -644,7 +667,7 @@ fn install_seeded(
         if let Some(from) = seed_from.or(plan.installed.as_deref()) {
             seed_cache(from, mods_dir, pack_id, &manifest);
         }
-        stage_remote(conn, &manifest, source, mod_ids, &staged, &cache, &|| op.cancelled(), progress)?;
+        stage_remote(conn, &manifest, tie, mod_ids, &staged, &cache, &|| op.cancelled(), progress)?;
         match &plan.installed {
             Some(old) => carry_changelog(old, &staged),
             None => Ok(()),
@@ -667,6 +690,13 @@ fn install_seeded(
     Ok(summary)
 }
 
+#[derive(Debug)]
+pub struct Added {
+    pub summary: ImportSummary,
+    /// The invite made the user an editor, so the install is a working copy
+    pub editor: bool,
+}
+
 /// Accepts an invite link. An uploader invite installs nothing and gives None.
 pub fn add_from_invite(
     conn: &Conn,
@@ -674,7 +704,7 @@ pub fn add_from_invite(
     mods_dir: &Path,
     paks_dir: &Path,
     progress: &mut dyn FnMut(Progress),
-) -> Result<Option<ImportSummary>, String> {
+) -> Result<Option<Added>, String> {
     let (_, code) = parse_invite(link)?;
     let accepted = conn.text(conn.server().accept_invite(&code))?;
     crate::accounts::remember_server(conn.base());
@@ -686,8 +716,10 @@ pub fn add_from_invite(
     }
     let pack_id = accepted.pack_id.ok_or_else(|| "That invite has no pack".to_string())?;
     validate_pack_id(&pack_id)?;
+    let editor = accepted.kind == "editor";
     let uploader = uploader_name(conn, &pack_id);
-    install_pack(conn, &pack_id, Some(link.trim()), uploader, mods_dir, paks_dir, progress).map(Some)
+    let summary = install_pack(conn, &pack_id, Some(link.trim()), uploader, editor, mods_dir, paks_dir, progress)?;
+    Ok(Some(Added { summary, editor }))
 }
 
 const OWN_PUBLISH: &str = "You publish this pack. Fork it to follow another pack.";
@@ -728,7 +760,7 @@ fn check_switch_target(mods_dir: &Path, pack_id: &str, new_pack_id: &str, base: 
     if packs::read_manifest(&mods_dir.join(new_pack_id)).is_some() {
         return Err(format!("{} is already installed. Delete it first or update it instead.", new_pack_id));
     }
-    check_target(mods_dir, new_pack_id, base)
+    check_target(mods_dir, new_pack_id, base, false)
 }
 
 /// What switching pack_id to the pack behind link would reuse and download. Accepts the invite
@@ -810,7 +842,7 @@ pub fn switch_pack_with(
     let flags: BTreeMap<String, bool> =
         local.mod_ids.iter().map(|id| (id.clone(), vfs::flag_enabled(&old_dir.join(id)))).collect();
     let uploader = uploader_name(conn, new_pack_id);
-    let mut import = install_seeded(conn, new_pack_id, invite, uploader, Some(&old_dir), mods_dir, paks_dir, progress)?;
+    let mut import = install_seeded(conn, new_pack_id, invite, uploader, Some(&old_dir), false, mods_dir, paks_dir, progress)?;
     let paks = paks_dir.is_dir().then_some(paks_dir);
     if moving {
         if let Err(e) = save_config(&import) {
@@ -866,6 +898,8 @@ pub struct UpdateCheck {
     pub status: String,
     pub installed_version: Option<String>,
     pub remote_version: Option<String>,
+    /// Who published the remote version, when the server says
+    pub remote_publisher: Option<String>,
     pub added: Vec<ModRef>,
     pub changed: Vec<ModRef>,
     pub removed: Vec<ModRef>,
@@ -880,6 +914,7 @@ impl UpdateCheck {
             status: status.to_string(),
             installed_version: local.version.clone(),
             remote_version: None,
+            remote_publisher: None,
             added: Vec::new(),
             changed: Vec::new(),
             removed: Vec::new(),
@@ -898,9 +933,16 @@ impl UpdateCheck {
 pub fn check_pack(conn: &Conn, pack_dir: &Path) -> Result<UpdateCheck, String> {
     let local = packs::read_manifest(pack_dir).ok_or_else(|| format!("Could not read {}", pack_dir.join("pack.json").display()))?;
     let remote = fetch_remote(conn, &local.pack_id)?;
-    let mut check = UpdateCheck { remote_version: Some(remote.version.clone()), ..UpdateCheck::new(&local, "current") };
+    let mut check = UpdateCheck {
+        remote_version: Some(remote.version.clone()),
+        remote_publisher: remote.published_by.clone(),
+        ..UpdateCheck::new(&local, "current")
+    };
     if local.version.as_deref() != Some(remote.version.as_str()) {
         check.status = "available".to_string();
+    } else if local.installed_hashes.is_empty() && working_server(&local).is_some() {
+        // Published before installed hashes were recorded, so there is nothing to compare mods against
+        return Ok(check);
     }
 
     let key = |id: &str| format!("{}/{}", local.pack_id, id);
@@ -931,6 +973,11 @@ pub fn check_pack(conn: &Conn, pack_dir: &Path) -> Result<UpdateCheck, String> {
     Ok(check)
 }
 
+// The server a working copy publishes to
+fn working_server(local: &PackManifest) -> Option<&str> {
+    local.source.is_none().then(|| local.published.as_ref().and_then(|p| p.server.as_deref())).flatten()
+}
+
 fn is_drive(local: &PackManifest) -> bool {
     local.source.as_ref().is_some_and(|s| s.kind != SERVER_KIND)
 }
@@ -939,7 +986,7 @@ fn is_drive(local: &PackManifest) -> bool {
 fn linked_base(local: &PackManifest) -> Result<String, String> {
     let unlinked = || format!("{} is not linked to a pack server", local.name);
     match &local.source {
-        None => Err(unlinked()),
+        None => working_server(local).map(str::to_string).ok_or_else(unlinked),
         Some(_) if is_drive(local) => Err(DRIVE_GONE.to_string()),
         Some(s) => s.server.clone().ok_or_else(unlinked),
     }
@@ -961,13 +1008,69 @@ fn refresh_uploader(pack_dir: &Path, local: &PackManifest, me: Option<&crate::se
     }
 }
 
-/// One entry for every linked pack, with the reason when it could not be checked
+// A locked copy of a pack the user can now edit, for example after an editor link went through a switch
+fn promote_linked_copy(pack_dir: &Path, local: &PackManifest, base: &str, me: Option<&crate::server::Me>) {
+    let can_edit = me
+        .and_then(|me| me.packs.iter().find(|p| p.id == local.pack_id))
+        .is_some_and(|p| p.access == "editor" || p.access == "uploader");
+    let same_server =
+        local.source.as_ref().is_some_and(|s| s.kind == SERVER_KIND && s.server.as_deref() == Some(base));
+    if !can_edit || !same_server || running().contains_key(pack_dir) {
+        return;
+    }
+    let mut updated = local.clone();
+    updated.source = None;
+    updated.published = Some(Published { server: Some(base.to_string()), dirty: false });
+    if let Err(e) = packs::write_manifest(pack_dir, &updated) {
+        eprintln!("[SUBSCRIBE] Could not make {} a working copy: {}", local.pack_id, e);
+    }
+}
+
+// A working copy whose owner lost editing rights becomes a locked copy of the pack, keeping its files
+fn demote_working_copy(pack_dir: &Path, local: &PackManifest, base: &str, me: Option<&crate::server::Me>) {
+    let Some(entry) = me.and_then(|me| me.packs.iter().find(|p| p.id == local.pack_id)).filter(|p| p.access == "viewer") else {
+        return;
+    };
+    if working_server(local).is_none() || running().contains_key(pack_dir) {
+        return;
+    }
+    let mut updated = local.clone();
+    updated.published = None;
+    updated.source = Some(PackSource {
+        kind: SERVER_KIND.to_string(),
+        server: Some(base.to_string()),
+        uploader: Some(entry.uploader.name.clone()),
+        ..Default::default()
+    });
+    if let Err(e) = packs::write_manifest(pack_dir, &updated) {
+        eprintln!("[SUBSCRIBE] Could not link {} to its creator: {}", local.pack_id, e);
+    }
+}
+
+// A working copy of a pack the server no longer lists for this user, for example one its creator deleted,
+// becomes a plain local pack with its files kept. True when it was unlinked.
+fn unlink_orphan_copy(pack_dir: &Path, local: &PackManifest, me: Option<&crate::server::Me>) -> bool {
+    let Some(me) = me else { return false };
+    if working_server(local).is_none() || me.packs.iter().any(|p| p.id == local.pack_id) || running().contains_key(pack_dir) {
+        return false;
+    }
+    let mut updated = local.clone();
+    updated.published = None;
+    updated.source = None;
+    if let Err(e) = packs::write_manifest(pack_dir, &updated) {
+        eprintln!("[SUBSCRIBE] Could not unlink {}: {}", local.pack_id, e);
+        return false;
+    }
+    true
+}
+
+/// One entry for every linked pack and working copy, with the reason when it could not be checked
 fn check_all(mods_dir: &Path, connect: &dyn Fn(&str) -> Conn) -> Vec<UpdateCheck> {
     let mut servers: BTreeMap<String, (Conn, Option<crate::server::Me>)> = BTreeMap::new();
     let mut out = Vec::new();
     for name in vfs::child_dirs(mods_dir).unwrap_or_default() {
         let pack_dir = mods_dir.join(&name);
-        let Some(local) = packs::read_manifest(&pack_dir).filter(|m| m.source.is_some()) else { continue };
+        let Some(local) = packs::read_manifest(&pack_dir).filter(|m| m.source.is_some() || working_server(m).is_some()) else { continue };
         let check = linked_base(&local).and_then(|base| {
             let (conn, me) = servers.entry(base.clone()).or_insert_with(|| {
                 let conn = connect(&base);
@@ -977,10 +1080,19 @@ fn check_all(mods_dir: &Path, connect: &dyn Fn(&str) -> Conn) -> Vec<UpdateCheck
                 }
                 (conn, me)
             });
+            if unlink_orphan_copy(&pack_dir, &local, me.as_ref()) {
+                return Ok(None);
+            }
             refresh_uploader(&pack_dir, &local, me.as_ref());
-            check_pack(conn, &pack_dir)
+            demote_working_copy(&pack_dir, &local, &base, me.as_ref());
+            promote_linked_copy(&pack_dir, &local, &base, me.as_ref());
+            check_pack(conn, &pack_dir).map(Some)
         });
-        out.push(check.unwrap_or_else(|e| UpdateCheck::failed(&local, e)));
+        match check {
+            Ok(Some(check)) => out.push(check),
+            Ok(None) => {}
+            Err(e) => out.push(UpdateCheck::failed(&local, e)),
+        }
     }
     out
 }
@@ -1022,7 +1134,16 @@ pub async fn inspect_pack_link(app_handle: tauri::AppHandle, link: String, switc
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AddOutcome {
     Uploader { base: String },
-    Installed { pack_id: String, version: String },
+    Installed { pack_id: String, version: String, editor: bool },
+}
+
+fn added_outcome(base: &str, added: Option<Added>) -> AddOutcome {
+    match added {
+        None => AddOutcome::Uploader { base: base.to_string() },
+        Some(Added { summary, editor }) => {
+            AddOutcome::Installed { pack_id: summary.pack.pack_id, version: summary.pack.version.unwrap_or_default(), editor }
+        }
+    }
 }
 
 #[tauri::command]
@@ -1040,13 +1161,13 @@ pub async fn add_pack_from_link(app_handle: tauri::AppHandle, link: String) -> R
     })
     .await
     .map_err(|e| e.to_string())??;
-    let Some(summary) = added else { return Ok(AddOutcome::Uploader { base }) };
+    let Some(Added { summary, .. }) = &added else { return Ok(added_outcome(&base, None)) };
 
     let mut config = crate::config::load_config(app_handle.clone())?;
     crate::config::tidy_presets_after_import(&mut config, &summary.pack.pack_id, &summary.superseded_ids, &summary.removed_keys);
     crate::config::save_config(app_handle, config)
         .map_err(|e| format!("The pack was added but saved presets could not be updated: {}", e))?;
-    Ok(AddOutcome::Installed { pack_id: summary.pack.pack_id, version: summary.pack.version.unwrap_or_default() })
+    Ok(added_outcome(&base, added))
 }
 
 #[tauri::command]
@@ -1227,7 +1348,7 @@ fn download_changes(
 fn assemble(
     moves: &mut Moves,
     manifest: &RemoteManifest,
-    source: PackSource,
+    tie: Tie,
     plans: &[(&RemoteMod, Stage)],
     pack_dir: &Path,
     staged: &Path,
@@ -1246,7 +1367,7 @@ fn assemble(
             }
         }
     }
-    write_staged_manifest(manifest, source, plans.iter().map(|(m, _)| m.id.clone()).collect(), staged)?;
+    write_staged_manifest(manifest, tie, plans.iter().map(|(m, _)| m.id.clone()).collect(), staged)?;
     carry_changelog(pack_dir, staged)?;
     for (m, stage) in plans {
         let dir = staged.join(&m.id);
@@ -1293,9 +1414,15 @@ pub fn update_pack(
     let manifest = &fetch_remote(conn, pack_id)?;
     let flags: BTreeMap<String, bool> =
         local.mod_ids.iter().map(|id| (id.clone(), vfs::flag_enabled(&pack_dir.join(id)))).collect();
+    let dirty = working_server(&local).is_some() && local.published.as_ref().is_some_and(|p| p.dirty);
     let plans: Vec<(&RemoteMod, Stage)> = sorted_mods(manifest)
         .into_iter()
-        .map(|m| (m, plan_mod(m, &local, &pack_dir.join(&m.id), force.contains(&m.id))))
+        .map(|m| {
+            let dir = pack_dir.join(&m.id);
+            // Edits to a mod the update does not change would otherwise be recorded as the remote's files
+            let edited = dirty && local.mod_ids.contains(&m.id) && !mod_intact(&dir, local.installed_hashes.get(&m.id));
+            (m, plan_mod(m, &local, &dir, edited || force.contains(&m.id)))
+        })
         .collect();
     let is_old = |id: &String| local.mod_ids.contains(id);
     let added = plans.iter().filter(|(m, _)| !is_old(&m.id)).count();
@@ -1322,7 +1449,11 @@ pub fn update_pack(
         }
     };
     let mut moves = Moves::default();
-    if let Err(e) = assemble(&mut moves, manifest, local.source.clone().unwrap_or_default(), &plans, &pack_dir, &staged, &flags, active) {
+    let tie = match working_server(&local) {
+        Some(server) => Tie::Working(server.to_string()),
+        None => Tie::Linked(local.source.clone().unwrap_or_default()),
+    };
+    if let Err(e) = assemble(&mut moves, manifest, tie, &plans, &pack_dir, &staged, &flags, active) {
         return Err(moves.undo(&staging, e).unwrap_or_else(|stranded| stranded));
     }
 
@@ -1599,7 +1730,7 @@ mod tests {
     }
 
     fn add_id(w: &World, pack_id: &str, mods: &Path, paks: &Path) -> Result<ImportSummary, String> {
-        install_pack(&w.conn(), pack_id, None, None, mods, paks, &mut |_| {})
+        install_pack(&w.conn(), pack_id, None, None, false, mods, paks, &mut |_| {})
     }
 
     #[test]
@@ -1671,7 +1802,7 @@ mod tests {
 
         add(&w, &mods, &mods.join("paks")).unwrap();
         let installed = inspect_invite(&w.conn(), &code, &mods, None).unwrap().installed.unwrap();
-        assert_eq!((installed.version.as_deref(), installed.from.as_str()), (Some("1.0"), "server"));
+        assert_eq!((installed.version.as_deref(), installed.from.as_str(), installed.clean_working), (Some("1.0"), "server", false));
 
         w.owner.expire_session();
         let info = inspect_invite(&w.conn(), &code, &mods, None).unwrap();
@@ -1686,7 +1817,7 @@ mod tests {
         let mods = scratch("sub-add");
         let paks = scratch("sub-add-paks");
         let mut events: Vec<Progress> = Vec::new();
-        let summary = install_pack(&w.conn(), PACK, None, None, &mods, &paks, &mut |p| events.push(p)).unwrap();
+        let summary = install_pack(&w.conn(), PACK, None, None, false, &mods, &paks, &mut |p| events.push(p)).unwrap();
         assert_eq!(summary.keys, ["Casual-Shitters/3063", "Casual-Shitters/3311"]);
         assert_eq!(summary.added, 2);
         let last = events.last().unwrap();
@@ -2373,7 +2504,7 @@ mod tests {
         let mods = scratch("sub-rate");
         w.owner.rate_limit_downloads(RATE_LIMIT_WAITS);
         let mut events: Vec<Progress> = Vec::new();
-        install_pack(&w.conn(), PACK, None, None, &mods, &mods.join("paks"), &mut |p| events.push(p)).unwrap();
+        install_pack(&w.conn(), PACK, None, None, false, &mods, &mods.join("paks"), &mut |p| events.push(p)).unwrap();
         assert_eq!(w.downloads(), 5);
         assert_eq!(events.iter().filter(|p| p.stage == "waiting").count(), RATE_LIMIT_WAITS);
         assert!(mods.join(PACK).join("3063").join(A_PAK).is_file());
@@ -2683,7 +2814,7 @@ mod tests {
         w.owner.add_user("friend", "Friend", None);
         let link = w.owner.as_user(UPLOADER).pack_invite(PACK).unwrap().url;
         let mods = scratch("sub-viewer-invite");
-        let summary = add_from_invite(&w.conn_as("friend"), &link, &mods, &mods.join("paks"), &mut |_| {}).unwrap().unwrap();
+        let summary = add_from_invite(&w.conn_as("friend"), &link, &mods, &mods.join("paks"), &mut |_| {}).unwrap().unwrap().summary;
         assert_eq!(summary.keys, ["Casual-Shitters/3063", "Casual-Shitters/3311"]);
         assert_eq!(summary.pack.version.as_deref(), Some("1.0"));
         assert_eq!(fs::read(mods.join(PACK).join("3063").join(A_PAK)).unwrap(), b"vests-v1");
@@ -3339,5 +3470,253 @@ mod tests {
         assert_eq!(fs::read(mods.join(FORK).join("3311/b.pak")).unwrap(), b"blood-v1");
         assert_ne!(inode(&mods.join(FORK).join("3311/b.pak")), inode(&outside.join("b.pak")));
         assert!(outside.join("b.pak").is_file());
+    }
+    const FRIEND: &str = "friend";
+
+    fn editor_link(w: &World) -> String {
+        w.owner.add_user(FRIEND, "Friend", None);
+        w.owner.as_user(UPLOADER).editor_invite(PACK).unwrap().url
+    }
+
+    fn accept_editor(w: &World, link: &str, mods: &Path, paks: &Path) -> Result<Added, String> {
+        add_from_invite(&w.conn_as(FRIEND), link, mods, paks, &mut |_| {}).map(|a| a.expect("an editor invite installs"))
+    }
+
+    // The creator's copy of version 1.0, the way publishing leaves it
+    fn creator_copy(w: &World, mods: &Path, paks: &Path) -> PathBuf {
+        add(w, mods, paks).unwrap();
+        let pack_dir = mods.join(PACK);
+        let mut man = packs::read_manifest(&pack_dir).unwrap();
+        man.source = None;
+        man.published = Some(packs::Published { server: Some(BASE.into()), dirty: false });
+        packs::write_manifest(&pack_dir, &man).unwrap();
+        pack_dir
+    }
+
+    // The friend, an editor, publishes 1.1.0 with a changed blood pak
+    fn editor_publishes(w: &World) {
+        let link = editor_link(w);
+        let (mods, paks) = (scratch("sub-editor-pub"), scratch("sub-editor-pub-paks"));
+        accept_editor(w, &link, &mods, &paks).unwrap();
+        fs::write(mods.join(PACK).join("3311").join(B_PAK), "blood-editor").unwrap();
+        crate::publish::publish_pack(&w.conn_as(FRIEND), &mods.join(PACK), "1.1.0", 0, None, &mut |_| {}).unwrap();
+    }
+
+    fn check_as(w: &World, mods: &Path, user: &str) -> Vec<UpdateCheck> {
+        check_all(mods, &|_: &str| w.conn_as(user))
+    }
+
+    #[test]
+    fn working_copy_gets_update_checks() {
+        let w = World::new();
+        remote_fixture(&w, &base_mods());
+        let (mods, paks) = (scratch("sub-wc-check"), scratch("sub-wc-check-paks"));
+        creator_copy(&w, &mods, &paks);
+        editor_publishes(&w);
+        let checks = check_as(&w, &mods, UPLOADER);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, "available");
+        assert_eq!(checks[0].remote_version.as_deref(), Some("1.1.0"));
+        assert_eq!(checks[0].remote_publisher.as_deref(), Some("Friend"));
+        assert_eq!(checks[0].changed.len(), 1);
+    }
+
+    #[test]
+    fn updating_a_working_copy_keeps_it_publishable() {
+        let w = World::new();
+        remote_fixture(&w, &base_mods());
+        let (mods, paks) = (scratch("sub-wc-update"), scratch("sub-wc-update-paks"));
+        let pack_dir = creator_copy(&w, &mods, &paks);
+        editor_publishes(&w);
+        update_pack(&w.conn_as(UPLOADER), &mods, &paks, PACK, false, &[], &mut |_| {}).unwrap();
+        let man = packs::read_manifest(&pack_dir).unwrap();
+        assert_eq!(man.source, None);
+        assert_eq!(man.published, Some(packs::Published { server: Some(BASE.into()), dirty: false }));
+        assert_eq!(man.version.as_deref(), Some("1.1.0"));
+        assert_eq!(fs::read(pack_dir.join("3311").join(B_PAK)).unwrap(), b"blood-editor");
+        assert_eq!(check_as(&w, &mods, UPLOADER)[0].status, "current");
+    }
+
+    #[test]
+    fn own_published_pack_without_installed_hashes_is_current() {
+        let w = World::new();
+        remote_fixture(&w, &base_mods());
+        let (mods, paks) = (scratch("sub-wc-nohash"), scratch("sub-wc-nohash-paks"));
+        let pack_dir = creator_copy(&w, &mods, &paks);
+        let mut man = packs::read_manifest(&pack_dir).unwrap();
+        man.installed_hashes.clear();
+        packs::write_manifest(&pack_dir, &man).unwrap();
+        let checks = check_as(&w, &mods, UPLOADER);
+        assert_eq!(checks[0].status, "current");
+        assert!(checks[0].changed.is_empty() && checks[0].added.is_empty() && checks[0].removed.is_empty());
+        assert_eq!(checks[0].download_bytes, 0);
+    }
+
+    #[test]
+    fn editor_invite_installs_a_working_copy() {
+        let w = World::new();
+        remote_fixture(&w, &base_mods());
+        let link = editor_link(&w);
+        let (mods, paks) = (scratch("sub-editor-invite"), scratch("sub-editor-invite-paks"));
+        let added = accept_editor(&w, &link, &mods, &paks).unwrap();
+        assert!(added.editor);
+        let man = packs::read_manifest(&mods.join(PACK)).unwrap();
+        assert_eq!(man.source, None);
+        assert_eq!(man.published, Some(packs::Published { server: Some(BASE.into()), dirty: false }));
+        assert_eq!(man.version.as_deref(), Some("1.0"));
+        assert!(!man.installed_hashes.is_empty());
+        let AddOutcome::Installed { editor, pack_id, .. } = added_outcome(BASE, Some(added)) else { panic!("not installed") };
+        assert!(editor);
+        assert_eq!(pack_id, PACK);
+        assert_eq!(w.owner.as_user(FRIEND).me().unwrap().packs[0].access, "editor");
+    }
+
+    #[test]
+    fn viewer_invite_is_not_an_editor_install() {
+        let w = World::new();
+        remote_fixture(&w, &base_mods());
+        w.owner.add_user(FRIEND, "Friend", None);
+        let link = invite(&w, PACK);
+        let mods = scratch("sub-viewer-not-editor");
+        let added = add_from_invite(&w.conn_as(FRIEND), &link, &mods, &mods.join("paks"), &mut |_| {}).unwrap().unwrap();
+        assert!(!added.editor);
+        assert_eq!(packs::read_manifest(&mods.join(PACK)).unwrap().source.unwrap().kind, "server");
+    }
+
+    #[test]
+    fn editor_invite_replaces_drive_folder_in_place() {
+        let w = World::new();
+        let manifest = remote_fixture(&w, &base_mods());
+        let (mods, paks) = (scratch("sub-editor-drive"), scratch("sub-editor-drive-paks"));
+        add(&w, &mods, &paks).unwrap();
+        let pack_dir = mods.join(PACK);
+        let mut man = packs::read_manifest(&pack_dir).unwrap();
+        man.source = Some(packs::PackSource { kind: "drive".into(), folder_id: Some("F".into()), ..Default::default() });
+        packs::write_manifest(&pack_dir, &man).unwrap();
+        bump(&w, &manifest);
+        let link = editor_link(&w);
+        let installed = inspect_invite(&w.conn_as(FRIEND), &parse_invite(&link).unwrap().1, &mods, None).unwrap().installed.unwrap();
+        assert_eq!((installed.version.as_deref(), installed.from.as_str(), installed.clean_working), (Some("1.0"), "drive", false));
+        let before = w.downloads();
+        accept_editor(&w, &link, &mods, &paks).unwrap();
+        // The changed pak and the two metadata files, which are always fetched
+        assert_eq!(w.downloads() - before, 3);
+        assert_eq!(fs::read(pack_dir.join("3311").join(B_PAK)).unwrap(), b"blood-v2");
+        assert_eq!(fs::read(pack_dir.join("3063").join(A_PAK)).unwrap(), b"vests-v1");
+        let man = packs::read_manifest(&pack_dir).unwrap();
+        assert_eq!((man.source, man.version.as_deref()), (None, Some("1.1")));
+        assert_eq!(man.published.unwrap().server.as_deref(), Some(BASE));
+    }
+
+    #[test]
+    fn removed_editor_copy_falls_back_to_linked() {
+        let w = World::new();
+        remote_fixture(&w, &base_mods());
+        let link = editor_link(&w);
+        let (mods, paks) = (scratch("sub-editor-removed"), scratch("sub-editor-removed-paks"));
+        accept_editor(&w, &link, &mods, &paks).unwrap();
+        let before = listing(&mods);
+        assert_eq!(check_as(&w, &mods, FRIEND)[0].status, "current");
+        assert!(packs::read_manifest(&mods.join(PACK)).unwrap().source.is_none());
+
+        w.owner.as_user(UPLOADER).remove_editor(PACK, FRIEND).unwrap();
+        let checks = check_as(&w, &mods, FRIEND);
+        assert_eq!(checks[0].status, "current");
+        let man = packs::read_manifest(&mods.join(PACK)).unwrap();
+        let source = man.source.unwrap();
+        assert_eq!((source.kind.as_str(), source.server.as_deref(), source.uploader.as_deref()), ("server", Some(BASE), Some("Uploader")));
+        assert_eq!(man.published, None);
+        assert!(!man.installed_hashes.is_empty());
+        assert_eq!(listing(&mods), before);
+        assert!(packs::ensure_pack_editable(&mods, PACK).is_err());
+        assert!(packs::ensure_pack_publishable(&mods, PACK).is_err());
+    }
+
+    #[test]
+    fn working_copy_of_a_deleted_pack_is_unlinked() {
+        let w = World::new();
+        remote_fixture(&w, &base_mods());
+        let link = editor_link(&w);
+        let (mods, paks) = (scratch("sub-editor-orphan"), scratch("sub-editor-orphan-paks"));
+        accept_editor(&w, &link, &mods, &paks).unwrap();
+        let before = listing(&mods);
+
+        w.owner.as_user(UPLOADER).delete_pack(PACK).unwrap();
+        assert!(check_as(&w, &mods, FRIEND).is_empty());
+        let man = packs::read_manifest(&mods.join(PACK)).unwrap();
+        assert_eq!((man.source, man.published), (None, None));
+        assert_eq!(listing(&mods), before);
+        assert!(packs::ensure_pack_editable(&mods, PACK).is_ok());
+    }
+
+    #[test]
+    fn editor_invite_over_a_working_copy_reinstalls_it() {
+        let w = World::new();
+        remote_fixture(&w, &base_mods());
+        let link = editor_link(&w);
+        let (mods, paks) = (scratch("sub-editor-again"), scratch("sub-editor-again-paks"));
+        accept_editor(&w, &link, &mods, &paks).unwrap();
+        let again = w.owner.as_user(UPLOADER).editor_invite(PACK).unwrap().url;
+        let info = inspect_invite(&w.conn_as(FRIEND), &parse_invite(&again).unwrap().1, &mods, None).unwrap();
+        assert_eq!(info.kind, "editor");
+        assert!(info.installed.as_ref().unwrap().clean_working);
+        packs::mark_pack_dirty(&mods, PACK);
+        let info = inspect_invite(&w.conn_as(FRIEND), &parse_invite(&again).unwrap().1, &mods, None).unwrap();
+        assert!(!info.installed.as_ref().unwrap().clean_working);
+        let downloads = w.downloads();
+        let added = accept_editor(&w, &again, &mods, &paks).unwrap();
+        assert!(added.editor);
+        assert_eq!(w.downloads() - downloads, 2);
+        let man = packs::read_manifest(&mods.join(PACK)).unwrap();
+        assert_eq!((man.source, man.published.unwrap().server.as_deref().map(str::to_string)), (None, Some(BASE.to_string())));
+    }
+
+    #[test]
+    fn viewer_link_over_a_working_copy_is_refused() {
+        let w = World::new();
+        remote_fixture(&w, &base_mods());
+        let link = editor_link(&w);
+        let (mods, paks) = (scratch("sub-viewer-over-wc"), scratch("sub-viewer-over-wc-paks"));
+        accept_editor(&w, &link, &mods, &paks).unwrap();
+        let before = listing(&mods);
+        let viewer = invite(&w, PACK);
+        let err = "Casual Shitters is your own published pack. Fork or delete it before adding it from a link.";
+        assert_eq!(add_from_invite(&w.conn_as(FRIEND), &viewer, &mods, &paks, &mut |_| {}).unwrap_err(), err);
+        assert_eq!(inspect_invite(&w.conn_as(FRIEND), &parse_invite(&viewer).unwrap().1, &mods, None).unwrap_err(), err);
+        assert_eq!(listing(&mods), before);
+    }
+
+    #[test]
+    fn updating_a_dirty_working_copy_drops_hidden_edits() {
+        let w = World::new();
+        remote_fixture(&w, &base_mods());
+        let (mods, paks) = (scratch("sub-wc-dirty"), scratch("sub-wc-dirty-paks"));
+        let pack_dir = creator_copy(&w, &mods, &paks);
+        editor_publishes(&w);
+        fs::write(pack_dir.join("3063").join(A_PAK), "local edit").unwrap();
+        let mut man = packs::read_manifest(&pack_dir).unwrap();
+        man.published.as_mut().unwrap().dirty = true;
+        packs::write_manifest(&pack_dir, &man).unwrap();
+        update_pack(&w.conn_as(UPLOADER), &mods, &paks, PACK, false, &[], &mut |_| {}).unwrap();
+        assert_eq!(fs::read(pack_dir.join("3063").join(A_PAK)).unwrap(), b"vests-v1");
+        let checks = check_as(&w, &mods, UPLOADER);
+        assert!(checks[0].status == "current" && checks[0].changed.is_empty());
+    }
+
+    #[test]
+    fn linked_copy_becomes_a_working_copy_when_made_editor() {
+        let w = World::new();
+        remote_fixture(&w, &base_mods());
+        let (mods, paks) = (scratch("sub-promote"), scratch("sub-promote-paks"));
+        add(&w, &mods, &paks).unwrap();
+        let before = listing(&mods);
+        assert!(packs::read_manifest(&mods.join(PACK)).unwrap().source.is_some());
+        w.owner.add_editor(PACK, VIEWER);
+        let checks = check_as(&w, &mods, VIEWER);
+        assert_eq!(checks[0].status, "current");
+        let man = packs::read_manifest(&mods.join(PACK)).unwrap();
+        assert_eq!(man.source, None);
+        assert_eq!(man.published, Some(packs::Published { server: Some(BASE.into()), dirty: false }));
+        assert_eq!(listing(&mods), before);
     }
 }

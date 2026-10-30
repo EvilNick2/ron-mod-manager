@@ -83,9 +83,10 @@ pub fn describe(code: &str, message: &str, base: &str) -> String {
         "server_full" => "This pack server is full.".into(),
         "storage_full" => "The pack server is out of space.".into(),
         "op_budget" => "The pack server's monthly upload budget is used up.".into(),
-        "pack_taken" => "Another uploader on this server already uses this pack id. Rename the pack and try again.".into(),
+        "pack_taken" => "Someone else already has a pack with this id on the server. Rename the pack, or ask its creator to add you as an editor.".into(),
         "pack_behind" => "A newer version of this pack is on the server. Update to it, make your changes again and publish.".into(),
         "blob_gone" => "The pack changed while downloading. Try again.".into(),
+        "publish_cleared" => "The pack's creator stopped this publish.".into(),
         _ => message.to_string(),
     }
 }
@@ -266,14 +267,10 @@ pub trait PackServer: Send + Sync {
     fn reset_invite(&self, pack_id: &str) -> Result<Link, ServerError>;
     fn viewers(&self, pack_id: &str) -> Result<Vec<Viewer>, ServerError>;
     fn remove_viewer(&self, pack_id: &str, user_id: &str) -> Result<RemovedViewer, ServerError>;
-    #[allow(dead_code)]
     fn editor_invite(&self, pack_id: &str) -> Result<Link, ServerError>;
-    #[allow(dead_code)]
     fn editors(&self, pack_id: &str) -> Result<Vec<Viewer>, ServerError>;
-    #[allow(dead_code)]
     fn remove_editor(&self, pack_id: &str, user_id: &str) -> Result<(), ServerError>;
     /// How many open publishes of the pack it expired
-    #[allow(dead_code)]
     fn clear_hold(&self, pack_id: &str) -> Result<u32, ServerError>;
     fn leave(&self, pack_id: &str) -> Result<(), ServerError>;
     fn delete_pack(&self, pack_id: &str) -> Result<(), ServerError>;
@@ -751,6 +748,7 @@ pub mod fake {
         expires_at: u64,
         blobs: BTreeMap<String, u64>,
         verified: BTreeSet<String>,
+        cleared: bool,
     }
 
     #[derive(Default)]
@@ -779,6 +777,7 @@ pub mod fake {
         cancel_hook: Option<(usize, Box<dyn Fn() + Send>)>,
         fail_puts_at: Option<usize>,
         expire_commit: bool,
+        clear_commit: bool,
         drop_before_commit: Option<String>,
         lost_puts: BTreeMap<String, usize>,
         stored_before_urls: Option<Vec<u8>>,
@@ -801,6 +800,10 @@ pub mod fake {
 
     fn publish_gone() -> ServerError {
         err("publish_gone", "This publish is no longer available")
+    }
+
+    fn publish_cleared() -> ServerError {
+        err("publish_cleared", "The pack's creator stopped this publish.")
     }
 
     fn bad_request(message: &str) -> ServerError {
@@ -856,6 +859,7 @@ pub mod fake {
         fn own_publish(&self, publish_id: &str, user: &str) -> Result<(), ServerError> {
             match self.publishes.get(publish_id) {
                 Some(p) if p.user == user && p.expires_at > self.clock => Ok(()),
+                Some(p) if p.user == user && p.cleared => Err(publish_cleared()),
                 _ => Err(publish_gone()),
             }
         }
@@ -1119,6 +1123,11 @@ pub mod fake {
             self.lock().expire_commit = true;
         }
 
+        /// The pack's creator clears the hold just before the next commit
+        pub fn clear_hold_before_commit(&self) {
+            self.lock().clear_commit = true;
+        }
+
         /// Before the next commit, `sha256`'s upload disappears and loses its verified mark
         pub fn drop_upload_before_commit(&self, sha256: &str) {
             self.lock().drop_before_commit = Some(sha256.to_string());
@@ -1256,7 +1265,7 @@ pub mod fake {
                     let pack = st.packs.get_mut(&id).ok_or_else(|| err("invite_gone", "This invite is no longer valid"))?;
                     let exempt = role.as_deref() == Some("owner") || pack.uploader == self.user;
                     if kind == "editor" {
-                        if !exempt && !pack.editors.contains(&self.user) {
+                        if pack.uploader != self.user && !pack.editors.contains(&self.user) {
                             pack.editors.insert(self.user.clone());
                             pack.viewers.remove(&self.user);
                             st.invites.iter_mut().filter(|i| i.code == code).for_each(|i| i.used = true);
@@ -1394,6 +1403,7 @@ pub mod fake {
                     expires_at: now + PUBLISH_LIFETIME,
                     blobs: wanted,
                     verified: BTreeSet::new(),
+                    cleared: false,
                 },
             );
             st.begins += 1;
@@ -1487,6 +1497,13 @@ pub mod fake {
 
         fn commit(&self, publish_id: &str, manifest: &RemoteManifest, notes: &str, history: &[VersionEntry]) -> Result<Option<u64>, ServerError> {
             let mut st = self.gate()?;
+            if std::mem::take(&mut st.clear_commit) {
+                let now = st.clock;
+                if let Some(p) = st.publishes.get_mut(publish_id) {
+                    p.cleared = true;
+                    p.expires_at = now;
+                }
+            }
             st.own_publish(publish_id, &self.user)?;
             if std::mem::take(&mut st.expire_commit) {
                 st.publishes.remove(publish_id);
@@ -1630,6 +1647,12 @@ pub mod fake {
         fn clear_hold(&self, pack_id: &str) -> Result<u32, ServerError> {
             let mut st = self.gate()?;
             st.creator(pack_id, &self.user)?;
+            let now = st.clock;
+            for p in st.publishes.values_mut() {
+                if p.pack_id == pack_id && p.expires_at > now {
+                    p.cleared = true;
+                }
+            }
             Ok(st.expire_publishes(pack_id, None))
         }
 
@@ -2176,6 +2199,14 @@ mod tests {
         assert_eq!(friend.me().unwrap().packs[0].access, "viewer");
         assert!(creator.editors("pack-e").unwrap().is_empty());
         assert_eq!(creator.remove_editor("pack-e", "f1").unwrap_err().code, "user_gone");
+
+        // The owner becomes a real editor, so they can publish
+        assert_eq!(owner.accept_invite(&code).unwrap().kind, "editor");
+        assert_eq!(owner.me().unwrap().packs[0].access, "editor");
+        assert_eq!(owner.me().unwrap().role.as_deref(), Some("owner"));
+        assert_eq!(creator.editors("pack-e").unwrap().len(), 1);
+        assert_eq!(other.accept_invite(&code).unwrap_err().code, "invite_gone");
+        assert!(owner.begin("pack-e", "Pack", "2.0", Some("1.0"), &[]).is_ok());
     }
 
     #[test]
@@ -2230,7 +2261,8 @@ mod tests {
         assert_eq!(editor.clear_hold("pack-h").unwrap_err().code, "forbidden");
         assert_eq!(owner.clear_hold("pack-h").unwrap(), 1);
         assert_eq!(owner.clear_hold("pack-h").unwrap(), 0);
-        assert_eq!(creator.upload_urls(&second.publish_id, &[]).unwrap_err().code, "publish_gone");
+        assert_eq!(creator.upload_urls(&second.publish_id, &[]).unwrap_err().code, "publish_cleared");
+        assert_eq!(creator.verify(&second.publish_id, &[]).unwrap_err().code, "publish_cleared");
         let third = editor.begin("pack-h", "Pack", "2.0", Some("1.0"), &[]).unwrap();
 
         // A hold lapses after an hour, and any step of the publish extends it
