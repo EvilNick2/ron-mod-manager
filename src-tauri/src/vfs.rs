@@ -3287,7 +3287,7 @@ mod tests {
             mod_ids: vec!["3063".into(), "4296".into()],
             installed_hashes: [("3063".to_string(), InstalledMod { hash: "recorded".into(), files: Default::default() })].into(),
             ..Default::default() }).unwrap();
-        let history = vec![VersionEntry { version: "1.2".into(), published_at: 9, notes: "Older notes".into() }];
+        let history = vec![VersionEntry { version: "1.2".into(), published_at: 9, notes: "Older notes".into(), publisher: None }];
         write_changelog(&pack, &Changelog { entries: history.clone(), base: Some(BaseSnapshot { name: "Origin".into(), ..Default::default() }) }).unwrap();
 
         fork_pack_dir(&m, "CS", "My Fork").unwrap();

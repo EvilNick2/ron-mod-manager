@@ -426,7 +426,7 @@ mod tests {
 
         let mods = BTreeMap::from([("3063".to_string(), ModState { name: "Vests".into(), hash: "h".into(), ..Default::default() })]);
         let c = Changelog {
-            entries: vec![VersionEntry { version: "2".into(), published_at: 9, notes: "x".into() }],
+            entries: vec![VersionEntry { version: "2".into(), published_at: 9, notes: "x".into(), publisher: None }],
             base: Some(BaseSnapshot { name: "CS".into(), version: Some("1".into()), mods }),
         };
         write_changelog(&m, &c).unwrap();

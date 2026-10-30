@@ -84,6 +84,7 @@ pub fn describe(code: &str, message: &str, base: &str) -> String {
         "storage_full" => "The pack server is out of space.".into(),
         "op_budget" => "The pack server's monthly upload budget is used up.".into(),
         "pack_taken" => "Another uploader on this server already uses this pack id. Rename the pack and try again.".into(),
+        "pack_behind" => "A newer version of this pack is on the server. Update to it, make your changes again and publish.".into(),
         "blob_gone" => "The pack changed while downloading. Try again.".into(),
         _ => message.to_string(),
     }
@@ -202,6 +203,8 @@ pub struct VersionEntry {
     pub version: String,
     pub published_at: u64,
     pub notes: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publisher: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -212,6 +215,8 @@ pub struct RemoteManifest {
     pub version: String,
     pub status: String,
     pub published_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_by: Option<String>,
     pub mods: Vec<RemoteMod>,
 }
 
@@ -247,7 +252,7 @@ pub trait PackServer: Send + Sync {
         cancel: &dyn Fn() -> bool,
         on_bytes: &mut dyn FnMut(u64),
     ) -> Result<String, ServerError>;
-    fn begin(&self, pack_id: &str, name: &str, version: &str, blobs: &[(String, u64)]) -> Result<Begun, ServerError>;
+    fn begin(&self, pack_id: &str, name: &str, version: &str, base: Option<&str>, blobs: &[(String, u64)]) -> Result<Begun, ServerError>;
     fn upload_urls(&self, publish_id: &str, hashes: &[String]) -> Result<BTreeMap<String, String>, ServerError>;
     fn put_blob(&self, url: &str, src: &Path, size: u64, sha256: &str, on_bytes: &mut dyn FnMut(u64)) -> Result<(), ServerError>;
     fn verify(&self, publish_id: &str, hashes: &[String]) -> Result<Verified, ServerError>;
@@ -261,6 +266,15 @@ pub trait PackServer: Send + Sync {
     fn reset_invite(&self, pack_id: &str) -> Result<Link, ServerError>;
     fn viewers(&self, pack_id: &str) -> Result<Vec<Viewer>, ServerError>;
     fn remove_viewer(&self, pack_id: &str, user_id: &str) -> Result<RemovedViewer, ServerError>;
+    #[allow(dead_code)]
+    fn editor_invite(&self, pack_id: &str) -> Result<Link, ServerError>;
+    #[allow(dead_code)]
+    fn editors(&self, pack_id: &str) -> Result<Vec<Viewer>, ServerError>;
+    #[allow(dead_code)]
+    fn remove_editor(&self, pack_id: &str, user_id: &str) -> Result<(), ServerError>;
+    /// How many open publishes of the pack it expired
+    #[allow(dead_code)]
+    fn clear_hold(&self, pack_id: &str) -> Result<u32, ServerError>;
     fn leave(&self, pack_id: &str) -> Result<(), ServerError>;
     fn delete_pack(&self, pack_id: &str) -> Result<(), ServerError>;
     fn uploader_invite(&self) -> Result<Link, ServerError>;
@@ -553,11 +567,11 @@ impl PackServer for HttpServer {
         result
     }
 
-    fn begin(&self, pack_id: &str, name: &str, version: &str, blobs: &[(String, u64)]) -> Result<Begun, ServerError> {
+    fn begin(&self, pack_id: &str, name: &str, version: &str, base: Option<&str>, blobs: &[(String, u64)]) -> Result<Begun, ServerError> {
         let blobs: Vec<_> = blobs.iter().map(|(sha256, size)| json!({ "sha256": sha256, "size": size })).collect();
         self.post(
             &format!("/packs/{}/publish/begin", seg(pack_id)),
-            json!({ "name": name, "version": version, "blobs": blobs }),
+            json!({ "name": name, "version": version, "base": base, "blobs": blobs }),
         )
     }
 
@@ -646,6 +660,27 @@ impl PackServer for HttpServer {
         self.call(self.request(Method::DELETE, &format!("/packs/{}/viewers/{}", seg(pack_id), seg(user_id))))
     }
 
+    fn editor_invite(&self, pack_id: &str) -> Result<Link, ServerError> {
+        self.post(&format!("/packs/{}/editor-invite", seg(pack_id)), json!({}))
+    }
+
+    fn editors(&self, pack_id: &str) -> Result<Vec<Viewer>, ServerError> {
+        self.get(&format!("/packs/{}/editors", seg(pack_id)))
+    }
+
+    fn remove_editor(&self, pack_id: &str, user_id: &str) -> Result<(), ServerError> {
+        self.delete(&format!("/packs/{}/editors/{}", seg(pack_id), seg(user_id))).map(|_| ())
+    }
+
+    fn clear_hold(&self, pack_id: &str) -> Result<u32, ServerError> {
+        #[derive(Deserialize)]
+        struct Cleared {
+            cleared: u32,
+        }
+        let got: Cleared = self.call(self.request(Method::DELETE, &format!("/packs/{}/hold", seg(pack_id))))?;
+        Ok(got.cleared)
+    }
+
     fn leave(&self, pack_id: &str) -> Result<(), ServerError> {
         self.delete(&format!("/packs/{}/membership", seg(pack_id))).map(|_| ())
     }
@@ -684,6 +719,7 @@ pub mod fake {
     const KEEP_VERSIONS: usize = 100;
     const MAX_VERSION: usize = 200;
     const URL_LIFETIME: u64 = 300;
+    const PUBLISH_LIFETIME: u64 = 3600;
 
     struct Pack {
         uploader: String,
@@ -692,6 +728,7 @@ pub mod fake {
         manifest: Option<RemoteManifest>,
         blobs: BTreeSet<String>,
         viewers: BTreeSet<String>,
+        editors: BTreeSet<String>,
         /// Oldest first, as the server's row ids run
         versions: Vec<VersionEntry>,
     }
@@ -710,6 +747,8 @@ pub mod fake {
         user: String,
         name: String,
         version: String,
+        base: Option<String>,
+        expires_at: u64,
         blobs: BTreeMap<String, u64>,
         verified: BTreeSet<String>,
     }
@@ -752,6 +791,10 @@ pub mod fake {
         ServerError::new(code, message)
     }
 
+    fn behind() -> ServerError {
+        err("pack_behind", "The pack has a newer version. Update your copy before publishing.")
+    }
+
     fn pack_gone() -> ServerError {
         err("pack_gone", "This pack is not available")
     }
@@ -777,16 +820,30 @@ pub mod fake {
         fn visible(&self, pack_id: &str, user: &str) -> bool {
             self.packs.get(pack_id).is_some_and(|p| {
                 p.manifest.is_some()
-                    && (self.role(user).as_deref() == Some("owner") || p.uploader == user || p.viewers.contains(user))
+                    && (self.role(user).as_deref() == Some("owner") || p.uploader == user || p.editors.contains(user) || p.viewers.contains(user))
             })
         }
 
+        /// Creator, editor or owner
         fn managed(&self, pack_id: &str, user: &str) -> Result<(), ServerError> {
             let pack = self.packs.get(pack_id).ok_or_else(pack_gone)?;
-            if self.role(user).as_deref() != Some("owner") && pack.uploader != user {
-                return Err(err("forbidden", "Only the pack's uploader can do this"));
+            if self.role(user).as_deref() != Some("owner") && pack.uploader != user && !pack.editors.contains(user) {
+                return Err(err("forbidden", "Only the pack's creator or an editor can do this"));
             }
             Ok(())
+        }
+
+        /// Creator or owner
+        fn creator(&self, pack_id: &str, user: &str) -> Result<(), ServerError> {
+            let pack = self.packs.get(pack_id).ok_or_else(pack_gone)?;
+            if self.role(user).as_deref() != Some("owner") && pack.uploader != user {
+                return Err(err("forbidden", "Only the pack's creator can do this"));
+            }
+            Ok(())
+        }
+
+        fn may_publish(&self, pack_id: &str, user: &str) -> bool {
+            self.packs.get(pack_id).is_some_and(|p| p.uploader == user || p.editors.contains(user))
         }
 
         fn uploader(&self, user: &str) -> Result<(), ServerError> {
@@ -798,7 +855,7 @@ pub mod fake {
 
         fn own_publish(&self, publish_id: &str, user: &str) -> Result<(), ServerError> {
             match self.publishes.get(publish_id) {
-                Some(p) if p.user == user => Ok(()),
+                Some(p) if p.user == user && p.expires_at > self.clock => Ok(()),
                 _ => Err(publish_gone()),
             }
         }
@@ -846,6 +903,26 @@ pub mod fake {
             Ok(())
         }
 
+        fn extend(&mut self, publish_id: &str) {
+            let until = self.clock + PUBLISH_LIFETIME;
+            if let Some(p) = self.publishes.get_mut(publish_id) {
+                p.expires_at = until;
+            }
+        }
+
+        /// Expires open publishes of the pack by `user`, or by everyone when None
+        fn expire_publishes(&mut self, pack_id: &str, user: Option<&str>) -> u32 {
+            let now = self.clock;
+            let mut n = 0;
+            for p in self.publishes.values_mut() {
+                if p.pack_id == pack_id && p.expires_at > now && user.is_none_or(|u| p.user == u) {
+                    p.expires_at = now;
+                    n += 1;
+                }
+            }
+            n
+        }
+
         fn drop_pack(&mut self, pack_id: &str) {
             self.packs.remove(pack_id);
             self.invites.retain(|i| i.pack_id.as_deref() != Some(pack_id));
@@ -853,7 +930,16 @@ pub mod fake {
         }
 
         /// The commit statements, shared with the seeding knobs
-        fn record(&mut self, pack_id: &str, manifest: &RemoteManifest, name: &str, version: &str, notes: &str, history: &[VersionEntry]) -> u64 {
+        fn record(
+            &mut self,
+            pack_id: &str,
+            manifest: &RemoteManifest,
+            name: &str,
+            version: &str,
+            notes: &str,
+            history: &[VersionEntry],
+            publisher: Option<&str>,
+        ) -> u64 {
             self.clock += 1;
             let at = self.clock;
             let hashes: BTreeSet<String> =
@@ -864,6 +950,7 @@ pub mod fake {
             stored.name = name.to_string();
             stored.version = version.to_string();
             stored.published_at = at;
+            stored.published_by = publisher.map(str::to_string);
             pack.name = name.to_string();
             pack.version = version.to_string();
             pack.manifest = Some(stored);
@@ -871,7 +958,12 @@ pub mod fake {
             if pack.versions.is_empty() {
                 pack.versions.extend(history.iter().cloned());
             }
-            pack.versions.push(VersionEntry { version: version.to_string(), published_at: at, notes: notes.to_string() });
+            pack.versions.push(VersionEntry {
+                version: version.to_string(),
+                published_at: at,
+                notes: notes.to_string(),
+                publisher: publisher.map(str::to_string),
+            });
             let extra = pack.versions.len().saturating_sub(KEEP_VERSIONS);
             pack.versions.drain(..extra);
             at
@@ -923,9 +1015,17 @@ pub mod fake {
                 manifest: None,
                 blobs: BTreeSet::new(),
                 viewers: BTreeSet::new(),
+                editors: BTreeSet::new(),
                 versions: Vec::new(),
             });
-            st.record(&manifest.pack_id, manifest, &manifest.name, &manifest.version, notes, &[]);
+            st.record(&manifest.pack_id, manifest, &manifest.name, &manifest.version, notes, &[], None);
+        }
+
+        pub fn add_editor(&self, pack_id: &str, user_id: &str) {
+            if let Some(p) = self.lock().packs.get_mut(pack_id) {
+                p.viewers.remove(user_id);
+                p.editors.insert(user_id.into());
+            }
         }
 
         pub fn add_viewer(&self, pack_id: &str, user_id: &str) {
@@ -1036,7 +1136,8 @@ pub mod fake {
 
         /// Publishes begun and neither committed nor cancelled
         pub fn open_publishes(&self) -> usize {
-            self.lock().publishes.len()
+            let st = self.lock();
+            st.publishes.values().filter(|p| p.expires_at > st.clock).count()
         }
 
         /// Counts finished downloads only
@@ -1095,6 +1196,8 @@ pub mod fake {
                     },
                     access: if p.uploader == self.user {
                         "uploader"
+                    } else if p.editors.contains(&self.user) {
+                        "editor"
                     } else if p.viewers.contains(&self.user) || !owner {
                         "viewer"
                     } else {
@@ -1151,7 +1254,17 @@ pub mod fake {
                 }
                 Some(id) => {
                     let pack = st.packs.get_mut(&id).ok_or_else(|| err("invite_gone", "This invite is no longer valid"))?;
-                    if role.as_deref() != Some("owner") && pack.uploader != self.user {
+                    let exempt = role.as_deref() == Some("owner") || pack.uploader == self.user;
+                    if kind == "editor" {
+                        if !exempt && !pack.editors.contains(&self.user) {
+                            pack.editors.insert(self.user.clone());
+                            pack.viewers.remove(&self.user);
+                            st.invites.iter_mut().filter(|i| i.code == code).for_each(|i| i.used = true);
+                            if let Some(u) = st.users.get_mut(&self.user) {
+                                u.role.get_or_insert_with(|| "uploader".into());
+                            }
+                        }
+                    } else if !exempt {
                         pack.viewers.insert(self.user.clone());
                     }
                     Ok(Accepted { kind, pack_id: Some(id) })
@@ -1205,7 +1318,7 @@ pub mod fake {
                 let (_, manifest) = st.replace.take().expect("checked above");
                 let (name, version) = (manifest.name.clone(), manifest.version.clone());
                 if st.packs.contains_key(&manifest.pack_id) {
-                    st.record(&manifest.pack_id, &manifest, &name, &version, "", &[]);
+                    st.record(&manifest.pack_id, &manifest, &name, &version, "", &[], None);
                 }
             }
             let user = self.user.clone();
@@ -1232,9 +1345,8 @@ pub mod fake {
             Ok(hashing::sha256_bytes(&bytes))
         }
 
-        fn begin(&self, pack_id: &str, name: &str, version: &str, blobs: &[(String, u64)]) -> Result<Begun, ServerError> {
+        fn begin(&self, pack_id: &str, name: &str, version: &str, base: Option<&str>, blobs: &[(String, u64)]) -> Result<Begun, ServerError> {
             let mut st = self.gate()?;
-            st.uploader(&self.user)?;
             if blobs.len() > MAX_BLOBS {
                 return Err(bad_request("Blobs must be a list of at most 2000"));
             }
@@ -1244,8 +1356,20 @@ pub mod fake {
                     return Err(bad_request("Conflicting sizes"));
                 }
             }
-            if st.packs.get(pack_id).is_some_and(|p| p.uploader != self.user) {
-                return Err(err("pack_taken", "Another uploader owns this pack id"));
+            match st.packs.get(pack_id) {
+                None => st.uploader(&self.user)?,
+                Some(_) if !st.may_publish(pack_id, &self.user) => {
+                    return Err(err("pack_taken", "Another uploader owns this pack id"));
+                }
+                Some(p) if p.manifest.is_some() && base != Some(p.version.as_str()) => return Err(behind()),
+                Some(_) => {}
+            }
+            st.expire_publishes(pack_id, Some(&self.user));
+            let now = st.clock;
+            let holder = st.publishes.values().find(|p| p.pack_id == pack_id && p.expires_at > now).map(|p| p.user.clone());
+            if let Some(holder) = holder {
+                let who = st.users.get(&holder).map(|u| u.name.clone()).unwrap_or_default();
+                return Err(err("pack_busy", &format!("{} is publishing this pack right now. Try again once it is done.", who)));
             }
             st.packs.entry(pack_id.into()).or_insert_with(|| Pack {
                 uploader: self.user.clone(),
@@ -1254,6 +1378,7 @@ pub mod fake {
                 manifest: None,
                 blobs: BTreeSet::new(),
                 viewers: BTreeSet::new(),
+                editors: BTreeSet::new(),
                 versions: Vec::new(),
             });
             let missing: Vec<String> = wanted.keys().filter(|h| !st.stored.contains(*h)).cloned().collect();
@@ -1265,6 +1390,8 @@ pub mod fake {
                     user: self.user.clone(),
                     name: name.into(),
                     version: version.into(),
+                    base: base.map(str::to_string),
+                    expires_at: now + PUBLISH_LIFETIME,
                     blobs: wanted,
                     verified: BTreeSet::new(),
                 },
@@ -1280,8 +1407,8 @@ pub mod fake {
                 st.objects.insert(sha.clone(), bytes);
                 st.stored.insert(sha);
             }
-            st.uploader(&self.user)?;
             st.own_publish(publish_id, &self.user)?;
+            st.extend(publish_id);
             if hashes.len() > MAX_BATCH {
                 return Err(bad_request("Send at most 50 blobs"));
             }
@@ -1334,8 +1461,8 @@ pub mod fake {
 
         fn verify(&self, publish_id: &str, hashes: &[String]) -> Result<Verified, ServerError> {
             let mut st = self.gate()?;
-            st.uploader(&self.user)?;
             st.own_publish(publish_id, &self.user)?;
+            st.extend(publish_id);
             if hashes.len() > MAX_BATCH {
                 return Err(bad_request("Send at most 50 blobs"));
             }
@@ -1360,7 +1487,6 @@ pub mod fake {
 
         fn commit(&self, publish_id: &str, manifest: &RemoteManifest, notes: &str, history: &[VersionEntry]) -> Result<Option<u64>, ServerError> {
             let mut st = self.gate()?;
-            st.uploader(&self.user)?;
             st.own_publish(publish_id, &self.user)?;
             if std::mem::take(&mut st.expire_commit) {
                 st.publishes.remove(publish_id);
@@ -1391,11 +1517,16 @@ pub mod fake {
             if publish.blobs.keys().any(|h| !publish.verified.contains(h) && !st.stored.contains(h)) {
                 return Err(err("not_uploaded", "Some blobs have not been uploaded and verified"));
             }
-            if st.packs.get(&publish.pack_id).map(|p| p.uploader.as_str()) != Some(self.user.as_str()) {
+            if !st.may_publish(&publish.pack_id, &self.user) {
                 return Err(err("pack_taken", "Another uploader owns this pack id"));
             }
+            let pack = &st.packs[&publish.pack_id];
+            if pack.manifest.is_some() && publish.base.as_deref() != Some(pack.version.as_str()) {
+                return Err(behind());
+            }
             let publish = st.publishes.remove(publish_id).expect("checked above");
-            let at = st.record(&publish.pack_id, manifest, &publish.name, &publish.version, notes, history);
+            let publisher = st.users[&self.user].name.clone();
+            let at = st.record(&publish.pack_id, manifest, &publish.name, &publish.version, notes, history, Some(&publisher));
             Ok(if st.omit_published_at { None } else { Some(at) })
         }
 
@@ -1413,7 +1544,6 @@ pub mod fake {
 
         fn cancel(&self, publish_id: &str) -> Result<(), ServerError> {
             let mut st = self.gate()?;
-            st.uploader(&self.user)?;
             st.own_publish(publish_id, &self.user)?;
             st.publishes.remove(publish_id);
             Ok(())
@@ -1436,7 +1566,7 @@ pub mod fake {
 
         fn reset_invite(&self, pack_id: &str) -> Result<Link, ServerError> {
             let mut st = self.gate()?;
-            st.managed(pack_id, &self.user)?;
+            st.creator(pack_id, &self.user)?;
             st.invites.retain(|i| !(i.kind == "viewer" && i.pack_id.as_deref() == Some(pack_id)));
             Ok(st.mint("viewer", Some(pack_id), &self.user))
         }
@@ -1466,21 +1596,62 @@ pub mod fake {
             Ok(RemovedViewer { invite_reset: st.invites.len() != before })
         }
 
+        fn editor_invite(&self, pack_id: &str) -> Result<Link, ServerError> {
+            let mut st = self.gate()?;
+            st.creator(pack_id, &self.user)?;
+            Ok(st.mint("editor", Some(pack_id), &self.user))
+        }
+
+        fn editors(&self, pack_id: &str) -> Result<Vec<Viewer>, ServerError> {
+            let st = self.gate()?;
+            st.creator(pack_id, &self.user)?;
+            let mut out: Vec<Viewer> = st.packs[pack_id]
+                .editors
+                .iter()
+                .filter_map(|id| st.users.get(id))
+                .map(|u| Viewer { id: u.id.clone(), name: u.name.clone() })
+                .collect();
+            out.sort_by(|a, b| (&a.name, &a.id).cmp(&(&b.name, &b.id)));
+            Ok(out)
+        }
+
+        fn remove_editor(&self, pack_id: &str, user_id: &str) -> Result<(), ServerError> {
+            let mut st = self.gate()?;
+            st.creator(pack_id, &self.user)?;
+            let pack = st.packs.get_mut(pack_id).expect("checked above");
+            if !pack.editors.remove(user_id) {
+                return Err(err("user_gone", "This person is not on the server"));
+            }
+            pack.viewers.insert(user_id.into());
+            st.expire_publishes(pack_id, Some(user_id));
+            Ok(())
+        }
+
+        fn clear_hold(&self, pack_id: &str) -> Result<u32, ServerError> {
+            let mut st = self.gate()?;
+            st.creator(pack_id, &self.user)?;
+            Ok(st.expire_publishes(pack_id, None))
+        }
+
         fn leave(&self, pack_id: &str) -> Result<(), ServerError> {
             let mut st = self.gate()?;
             let pack = st.packs.get_mut(pack_id).ok_or_else(pack_gone)?;
             if pack.uploader == self.user {
                 return Err(err("own_pack", "You cannot leave your own pack"));
             }
-            if !pack.viewers.remove(&self.user) {
+            let was_editor = pack.editors.remove(&self.user);
+            if !pack.viewers.remove(&self.user) && !was_editor {
                 return Err(pack_gone());
+            }
+            if was_editor {
+                st.expire_publishes(pack_id, Some(&self.user));
             }
             Ok(())
         }
 
         fn delete_pack(&self, pack_id: &str) -> Result<(), ServerError> {
             let mut st = self.gate()?;
-            st.managed(pack_id, &self.user)?;
+            st.creator(pack_id, &self.user)?;
             st.drop_pack(pack_id);
             Ok(())
         }
@@ -1529,12 +1700,13 @@ pub mod fake {
                 st.drop_pack(&id);
             }
             let viewed: BTreeSet<String> =
-                st.packs.iter().filter(|(_, p)| p.viewers.contains(user_id)).map(|(id, _)| id.clone()).collect();
+                st.packs.iter().filter(|(_, p)| p.viewers.contains(user_id) || p.editors.contains(user_id)).map(|(id, _)| id.clone()).collect();
             st.invites.retain(|i| {
                 !(i.kind == "viewer" && i.pack_id.as_ref().is_some_and(|p| viewed.contains(p))) && i.created_by != user_id
             });
             st.packs.values_mut().for_each(|p| {
                 p.viewers.remove(user_id);
+                p.editors.remove(user_id);
             });
             st.signed_in.remove(user_id);
             st.publishes.retain(|_, p| p.user != user_id);
@@ -1872,6 +2044,7 @@ mod tests {
             version: version.into(),
             status: "ready".into(),
             published_at: 0,
+            published_by: None,
             mods: vec![RemoteMod {
                 id: "m".into(),
                 name: "M".into(),
@@ -1897,7 +2070,8 @@ mod tests {
 
     /// Runs begin, PUT, verify and commit for `files`
     fn publish(up: &FakeServer, dir: &Path, m: &RemoteManifest, files: &[&[u8]], notes: &str, history: &[VersionEntry]) {
-        let begun = up.begin(&m.pack_id, &m.name, &m.version, &blobs_of(m)).unwrap();
+        let base = up.manifest(&m.pack_id).ok().map(|current| current.version);
+        let begun = up.begin(&m.pack_id, &m.name, &m.version, base.as_deref(), &blobs_of(m)).unwrap();
         if !begun.missing.is_empty() {
             let urls = up.upload_urls(&begun.publish_id, &begun.missing).unwrap();
             for bytes in files {
@@ -1945,7 +2119,7 @@ mod tests {
         assert_eq!(viewer.downloads(), 1);
 
         // A second publish reuses stored blobs
-        let begun = up.begin("pack-a", "Pack", "1.1", &blobs_of(&m)).unwrap();
+        let begun = up.begin("pack-a", "Pack", "1.1", Some("1.0"), &blobs_of(&m)).unwrap();
         assert!(begun.missing.is_empty());
         up.cancel(&begun.publish_id).unwrap();
         assert_eq!(up.cancel(&begun.publish_id).unwrap_err().code, "publish_gone");
@@ -1959,6 +2133,138 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn pair(pack: &str) -> (FakeServer, FakeServer, FakeServer) {
+        let owner = FakeServer::new();
+        let creator = owner.add_user("u1", "Creator", Some("uploader"));
+        let editor = owner.add_user("e1", "Editor", Some("uploader"));
+        let m = manifest(pack, "1.0", &[]);
+        owner.seed_pack("u1", &m, "");
+        owner.add_editor(pack, "e1");
+        (owner, creator, editor)
+    }
+
+    #[test]
+    fn fake_editor_invite_makes_an_editor() {
+        let owner = FakeServer::new();
+        let creator = owner.add_user("u1", "Creator", Some("uploader"));
+        let friend = owner.add_user("f1", "Friend", None);
+        let other = owner.add_user("f2", "Other", None);
+        owner.seed_pack("u1", &manifest("pack-e", "1.0", &[]), "");
+        owner.add_viewer("pack-e", "f1");
+
+        assert_eq!(friend.editor_invite("pack-e").unwrap_err().code, "forbidden");
+        let link = creator.editor_invite("pack-e").unwrap();
+        let (_, code) = parse_invite(&link.url).unwrap();
+        assert_eq!(friend.invite_info(&code).unwrap().kind, "editor");
+        let got = friend.accept_invite(&code).unwrap();
+        assert_eq!((got.kind.as_str(), got.pack_id.as_deref()), ("editor", Some("pack-e")));
+        assert_eq!(friend.me().unwrap().packs[0].access, "editor");
+        assert_eq!(friend.me().unwrap().role.as_deref(), Some("uploader"));
+        assert_eq!(creator.editors("pack-e").unwrap(), vec![Viewer { id: "f1".into(), name: "Friend".into() }]);
+        assert!(creator.viewers("pack-e").unwrap().is_empty());
+        assert_eq!(other.accept_invite(&code).unwrap_err().code, "invite_gone");
+
+        // The creator and an editor accepting their own invite change nothing
+        let again = creator.editor_invite("pack-e").unwrap();
+        let (_, code) = parse_invite(&again.url).unwrap();
+        assert_eq!(creator.accept_invite(&code).unwrap().kind, "editor");
+        assert_eq!(creator.me().unwrap().packs[0].access, "uploader");
+        assert_eq!(friend.accept_invite(&code).unwrap().kind, "editor");
+        assert_eq!(creator.editors("pack-e").unwrap().len(), 1);
+
+        creator.remove_editor("pack-e", "f1").unwrap();
+        assert_eq!(friend.me().unwrap().packs[0].access, "viewer");
+        assert!(creator.editors("pack-e").unwrap().is_empty());
+        assert_eq!(creator.remove_editor("pack-e", "f1").unwrap_err().code, "user_gone");
+    }
+
+    #[test]
+    fn fake_editor_can_publish() {
+        let dir = scratch("fake-editor-publish");
+        let (owner, _creator, editor) = pair("pack-p");
+        let m = manifest("pack-p", "2.0", &[b"new"]);
+        publish(&editor, &dir, &m, &[b"new"], "", &[]);
+        assert_eq!(owner.as_user("u1").manifest("pack-p").unwrap().version, "2.0");
+
+        let rival = owner.add_user("u2", "Rival", Some("uploader"));
+        assert_eq!(rival.begin("pack-p", "Pack", "3.0", Some("2.0"), &[]).unwrap_err().code, "pack_taken");
+        let viewer = owner.add_user("v1", "Viewer", None);
+        assert_eq!(viewer.begin("pack-p", "Pack", "3.0", Some("2.0"), &[]).unwrap_err().code, "pack_taken");
+
+        // Once removed, an editor is refused again
+        owner.as_user("u1").remove_editor("pack-p", "e1").unwrap();
+        assert_eq!(editor.begin("pack-p", "Pack", "3.0", Some("2.0"), &[]).unwrap_err().code, "pack_taken");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fake_refuses_stale_base() {
+        let (owner, creator, _editor) = pair("pack-s");
+        assert_eq!(creator.begin("pack-s", "Pack", "2.0", None, &[]).unwrap_err().code, "pack_behind");
+        assert_eq!(creator.begin("pack-s", "Pack", "2.0", Some("0.9"), &[]).unwrap_err().code, "pack_behind");
+        assert_eq!(creator.open_publishes(), 0);
+
+        // The pack moves on after begin
+        let begun = creator.begin("pack-s", "Pack", "2.0", Some("1.0"), &[]).unwrap();
+        owner.seed_pack("u1", &manifest("pack-s", "1.5", &[]), "");
+        let e = creator.commit(&begun.publish_id, &manifest("pack-s", "2.0", &[]), "", &[]).unwrap_err();
+        assert_eq!(e.code, "pack_behind");
+        assert_eq!(creator.manifest("pack-s").unwrap().version, "1.5");
+
+        // A brand new pack needs no base
+        assert!(creator.begin("pack-new", "Pack", "1.0", None, &[]).is_ok());
+    }
+
+    #[test]
+    fn fake_holds_a_pack_while_publishing() {
+        let (owner, creator, editor) = pair("pack-h");
+        let first = creator.begin("pack-h", "Pack", "2.0", Some("1.0"), &[]).unwrap();
+        let busy = editor.begin("pack-h", "Pack", "2.0", Some("1.0"), &[]).unwrap_err();
+        assert_eq!(busy.code, "pack_busy");
+        assert_eq!(busy.message, "Creator is publishing this pack right now. Try again once it is done.");
+
+        // The same user takes over their own open publish
+        let second = creator.begin("pack-h", "Pack", "2.0", Some("1.0"), &[]).unwrap();
+        assert_eq!(creator.cancel(&first.publish_id).unwrap_err().code, "publish_gone");
+
+        assert_eq!(editor.clear_hold("pack-h").unwrap_err().code, "forbidden");
+        assert_eq!(owner.clear_hold("pack-h").unwrap(), 1);
+        assert_eq!(owner.clear_hold("pack-h").unwrap(), 0);
+        assert_eq!(creator.upload_urls(&second.publish_id, &[]).unwrap_err().code, "publish_gone");
+        let third = editor.begin("pack-h", "Pack", "2.0", Some("1.0"), &[]).unwrap();
+
+        // A hold lapses after an hour, and any step of the publish extends it
+        owner.advance_clock(3000);
+        editor.upload_urls(&third.publish_id, &[]).unwrap();
+        owner.advance_clock(3000);
+        assert_eq!(creator.begin("pack-h", "Pack", "2.0", Some("1.0"), &[]).unwrap_err().code, "pack_busy");
+        owner.advance_clock(600);
+        assert!(creator.begin("pack-h", "Pack", "2.0", Some("1.0"), &[]).is_ok());
+    }
+
+    #[test]
+    fn fake_records_publisher() {
+        let dir = scratch("fake-publisher");
+        let (_owner, creator, editor) = pair("pack-r");
+        publish(&editor, &dir, &manifest("pack-r", "2.0", &[]), &[], "", &[]);
+        assert_eq!(creator.manifest("pack-r").unwrap().published_by.as_deref(), Some("Editor"));
+        let log = creator.changelog("pack-r").unwrap();
+        assert_eq!(log[0].publisher.as_deref(), Some("Editor"));
+        publish(&creator, &dir, &manifest("pack-r", "3.0", &[]), &[], "", &[]);
+        assert_eq!(creator.changelog("pack-r").unwrap()[0].publisher.as_deref(), Some("Creator"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn describe_pack_behind() {
+        assert_eq!(
+            describe("pack_behind", "ignored", fake::BASE),
+            "A newer version of this pack is on the server. Update to it, make your changes again and publish."
+        );
+        let busy = "Sam is publishing this pack right now. Try again once it is done.";
+        assert_eq!(describe("pack_busy", busy, fake::BASE), busy);
+    }
+
     #[test]
     fn fake_commit_needs_verified_uploads_and_matching_manifest() {
         let dir = scratch("fake-commit");
@@ -1966,13 +2272,13 @@ mod tests {
         let up = owner.add_user("u1", "Uploader", Some("uploader"));
         let files: [&[u8]; 1] = [b"data"];
         let m = manifest("pack-b", "1.0", &files);
-        let begun = up.begin("pack-b", "Pack", "1.0", &blobs_of(&m)).unwrap();
+        let begun = up.begin("pack-b", "Pack", "1.0", None, &blobs_of(&m)).unwrap();
         assert_eq!(up.commit(&begun.publish_id, &m, "", &[]).unwrap_err().code, "not_uploaded");
         let mut other = m.clone();
         other.mods[0].files[0].size = 9;
         assert_eq!(up.commit(&begun.publish_id, &other, "", &[]).unwrap_err().code, "bad_manifest");
         assert_eq!(up.commit(&begun.publish_id, &m, &"x".repeat(32001), &[]).unwrap_err().code, "bad_changelog");
-        let long = VersionEntry { version: "v".repeat(201), published_at: 1, notes: String::new() };
+        let long = VersionEntry { version: "v".repeat(201), published_at: 1, notes: String::new(), publisher: None };
         assert_eq!(up.commit(&begun.publish_id, &m, "", &[long]).unwrap_err().code, "bad_changelog");
 
         let sha = &begun.missing[0];
@@ -1990,9 +2296,9 @@ mod tests {
         assert_eq!(up.upload_urls(&begun.publish_id, &begun.missing).unwrap_err().code, "publish_gone");
 
         let viewer = owner.add_user("v1", "Viewer", None);
-        assert_eq!(viewer.begin("pack-b", "Pack", "2", &[]).unwrap_err().code, "forbidden");
+        assert_eq!(viewer.begin("pack-b", "Pack", "2", Some("1.0"), &[]).unwrap_err().code, "pack_taken");
         let rival = owner.add_user("u2", "Rival", Some("uploader"));
-        assert_eq!(rival.begin("pack-b", "Pack", "2", &[]).unwrap_err().code, "pack_taken");
+        assert_eq!(rival.begin("pack-b", "Pack", "2", Some("1.0"), &[]).unwrap_err().code, "pack_taken");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2001,7 +2307,7 @@ mod tests {
         let dir = scratch("fake-changelog");
         let owner = FakeServer::new();
         let up = owner.add_user("u1", "Uploader", Some("uploader"));
-        let entry = |v: &str, at: u64| VersionEntry { version: v.into(), published_at: at, notes: String::new() };
+        let entry = |v: &str, at: u64| VersionEntry { version: v.into(), published_at: at, notes: String::new(), publisher: None };
         let history: Vec<VersionEntry> = (0..99).map(|i| entry(&format!("h{}", i), i)).collect();
         publish(&up, &dir, &manifest("pack-c", "1.0", &[b"a"]), &[b"a"], "n", &history);
         let log = up.changelog("pack-c").unwrap();
@@ -2108,13 +2414,13 @@ mod tests {
         std::fs::write(&src, b"data").unwrap();
         let sha = crate::hashing::sha256_bytes(b"data");
 
-        let begun = up.begin("pack-j", "Pack", "1.0", &blobs_of(&m)).unwrap();
+        let begun = up.begin("pack-j", "Pack", "1.0", None, &blobs_of(&m)).unwrap();
         let url = up.upload_urls(&begun.publish_id, &begun.missing).unwrap()[&sha].clone();
         up.cancel(&begun.publish_id).unwrap();
         up.put_blob(&url, &src, 4, &sha, &mut |_| {}).unwrap();
         assert_eq!(up.blob(&sha).unwrap(), b"data");
 
-        let begun = up.begin("pack-j", "Pack", "1.0", &blobs_of(&m)).unwrap();
+        let begun = up.begin("pack-j", "Pack", "1.0", None, &blobs_of(&m)).unwrap();
         let url = up.upload_urls(&begun.publish_id, &begun.missing).unwrap()[&sha].clone();
         owner.advance_clock(300);
         let e = up.put_blob(&url, &src, 4, &sha, &mut |_| {}).unwrap_err();
@@ -2128,7 +2434,7 @@ mod tests {
         let owner = FakeServer::new();
         let up = owner.add_user("u1", "Uploader", Some("uploader"));
         let m = manifest("pack-k", "1.0", &[]);
-        let begun = up.begin("pack-k", "Pack", "1.0", &[]).unwrap();
+        let begun = up.begin("pack-k", "Pack", "1.0", None, &[]).unwrap();
         let at = up.commit(&begun.publish_id, &m, "", &[]).unwrap();
         assert_eq!(at, Some(up.changelog("pack-k").unwrap()[0].published_at));
         assert_eq!(at, Some(up.manifest("pack-k").unwrap().published_at));
@@ -2156,5 +2462,16 @@ mod tests {
         owner.seed_pack(OWNER, &manifest("pack-f", "1.0", &[]), "");
         owner.delete_pack("pack-f").unwrap();
         assert_eq!(owner.delete_pack("pack-f").unwrap_err().code, "pack_gone");
+    }
+
+    #[test]
+    fn fake_removing_an_editor_rotates_the_viewer_invite() {
+        let (owner, creator, _editor) = pair("pack-i");
+        let friend = owner.add_user("f1", "Friend", None);
+        let (_, code) = parse_invite(&creator.pack_invite("pack-i").unwrap().url).unwrap();
+        assert_eq!(friend.invite_info(&code).unwrap().kind, "viewer");
+        owner.remove_user("e1").unwrap();
+        assert_eq!(friend.invite_info(&code).unwrap_err().code, "invite_gone");
+        assert!(creator.editors("pack-i").unwrap().is_empty());
     }
 }

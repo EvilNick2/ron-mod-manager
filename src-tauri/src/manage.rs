@@ -193,6 +193,7 @@ mod tests {
                 version: "1.0.0".into(),
                 status: "ready".into(),
                 published_at: 1792364400,
+                published_by: None,
                 mods: vec![],
             };
             server.seed_pack(OWNER, &manifest, "First");
@@ -306,6 +307,6 @@ mod tests {
     fn viewer_cannot_manage_access() {
         let w = World::new();
         let err = remove_viewer(&w.conn(VIEWER), PACK, OWNER).unwrap_err();
-        assert_eq!(err, "Only the pack's uploader can do this");
+        assert_eq!(err, "Only the pack's creator or an editor can do this");
     }
 }

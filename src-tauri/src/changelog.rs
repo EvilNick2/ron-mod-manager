@@ -338,7 +338,7 @@ mod tests {
 
     #[test]
     fn fit_history_drops_oldest() {
-        let entry = |i: usize, notes: String| VersionEntry { version: format!("v{}", i), published_at: i as u64, notes };
+        let entry = |i: usize, notes: String| VersionEntry { version: format!("v{}", i), published_at: i as u64, notes, publisher: None };
         let many: Vec<_> = (0..150).map(|i| entry(i, "n".into())).collect();
         let got = fit_history(many);
         assert_eq!(got.len(), 99);

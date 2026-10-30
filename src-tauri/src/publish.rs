@@ -327,6 +327,7 @@ struct Upload<'a> {
     server: &'a dyn PackServer,
     pack_dir: &'a Path,
     pack_id: &'a str,
+    base: Option<&'a str>,
     blobs: &'a BTreeMap<String, Blob>,
     cancel: &'a dyn Fn() -> bool,
     progress: &'a mut dyn FnMut(Progress),
@@ -356,7 +357,7 @@ impl Upload<'_> {
         }
         (self.progress)(progress_event(self.pack_id, "checking_server", 0, 1, None, (0, 0)));
         let list: Vec<(String, u64)> = self.blobs.iter().map(|(h, b)| (h.clone(), b.size)).collect();
-        let begun = self.server.begin(self.pack_id, name, version, &list)?;
+        let begun = self.server.begin(self.pack_id, name, version, self.base, &list)?;
         self.publish_id = begun.publish_id;
         self.done = 0;
         self.total = begun.missing.len();
@@ -553,6 +554,7 @@ fn run_publish(
         version: version.to_string(),
         status: "ready".to_string(),
         published_at: now,
+        published_by: None,
         mods: local
             .iter()
             .map(|m| RemoteMod {
@@ -569,6 +571,7 @@ fn run_publish(
         server: conn.server(),
         pack_dir,
         pack_id,
+        base: manifest.published.as_ref().filter(|p| p.server.is_some()).and(manifest.version.as_deref()),
         blobs: &blobs,
         cancel,
         progress,
@@ -589,7 +592,7 @@ fn run_publish(
 
     mark_published(pack_dir, &base, version)?;
     let mut log = packs::read_changelog(pack_dir);
-    log.entries.insert(0, VersionEntry { version: version.to_string(), published_at, notes });
+    log.entries.insert(0, VersionEntry { version: version.to_string(), published_at, notes, publisher: None });
     log.base = None;
     if let Err(e) = packs::write_changelog(pack_dir, &log) {
         eprintln!("[PUBLISH] Could not save the changelog for {}: {}", pack_id, e);
@@ -969,6 +972,7 @@ mod tests {
             version: "3.0.0".into(),
             status: "ready".into(),
             published_at: 1,
+            published_by: None,
             mods: Vec::new(),
         };
         w.owner.seed_pack("other", &theirs, "Theirs");
@@ -990,6 +994,7 @@ mod tests {
             version: "3.0.0".into(),
             status: "ready".into(),
             published_at: 1,
+            published_by: None,
             mods: Vec::new(),
         };
         w.owner.seed_pack("other", &theirs, "Theirs");
@@ -1181,7 +1186,7 @@ mod tests {
     }
 
     fn entry(version: &str, notes: &str) -> VersionEntry {
-        VersionEntry { version: version.into(), published_at: 5, notes: notes.into() }
+        VersionEntry { version: version.into(), published_at: 5, notes: notes.into(), publisher: None }
     }
 
     fn fork_changelog(pack_dir: &Path) -> Changelog {

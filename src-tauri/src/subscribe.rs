@@ -1544,6 +1544,7 @@ mod tests {
             version: "1.0".into(),
             status: "ready".into(),
             published_at: 1792364400,
+            published_by: None,
             mods: mods.iter().map(|m| fixture_mod(w, m)).collect(),
         };
         w.owner.seed_pack(UPLOADER, &manifest, "First");
@@ -2577,13 +2578,23 @@ mod tests {
         let pack_dir = mods.join(ID);
         fs::create_dir_all(pack_dir.join("3063")).unwrap();
         fs::write(pack_dir.join("3063/a.pak"), "a").unwrap();
-        let local = PackManifest { pack_id: ID.into(), name: NAME.into(), mod_ids: vec!["3063".into()], ..Default::default() };
+        let local = PackManifest {
+            pack_id: ID.into(),
+            name: NAME.into(),
+            mod_ids: vec!["3063".into()],
+            version: Some("1.1".into()),
+            published: Some(packs::Published { server: Some(BASE.into()), dirty: false }),
+            ..Default::default()
+        };
         packs::write_manifest(&pack_dir, &local).unwrap();
         let before = listing(&mods);
         let mut refused = None;
         let downloads = w.downloads();
         crate::publish::publish_pack(&w.conn_as(UPLOADER), &pack_dir, "9.0.0", 0, None, &mut |_| {
             if refused.is_none() {
+                // The base is read before this, and a published copy would be refused as the user's own pack
+                let unpublished = PackManifest { published: None, ..local.clone() };
+                packs::write_manifest(&pack_dir, &unpublished).unwrap();
                 refused = Some(add_id(&w, ID, &mods, &paks).unwrap_err());
             }
         })
@@ -2721,7 +2732,7 @@ mod tests {
         assert!(packs::read_changelog(&pack_dir).entries.is_empty());
 
         let old = packs::Changelog {
-            entries: vec![VersionEntry { version: "1.0".into(), published_at: 1, notes: "Saved".into() }],
+            entries: vec![VersionEntry { version: "1.0".into(), published_at: 1, notes: "Saved".into(), publisher: None }],
             base: Some(packs::BaseSnapshot { name: "Origin".into(), ..Default::default() }),
         };
         packs::write_changelog(&pack_dir, &old).unwrap();
@@ -2752,7 +2763,7 @@ mod tests {
         assert_eq!(packs::read_changelog(&pack_dir).entries, fresh.entries);
 
         let local = packs::Changelog {
-            entries: vec![VersionEntry { version: "1.0".into(), published_at: 1, notes: "Saved".into() }],
+            entries: vec![VersionEntry { version: "1.0".into(), published_at: 1, notes: "Saved".into(), publisher: None }],
             base: None,
         };
         packs::write_changelog(&pack_dir, &local).unwrap();
