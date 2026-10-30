@@ -226,8 +226,10 @@ export async function removeUser(req: Request, env: Env, id: string): Promise<Re
 export async function clearHold(req: Request, env: Env, id: string): Promise<Response> {
   const { packId } = await creatorPack(req, env, id);
   const now = nowSeconds();
-  const res = await env.DB.prepare("update publishes set expires_at = ? where pack_id = ? and expires_at > ?")
-    .bind(cancelledExpiry(now), packId, now)
+  const res = await env.DB.prepare(
+    "update publishes set expires_at = ?, cleared_at = ? where pack_id = ? and expires_at > ?",
+  )
+    .bind(cancelledExpiry(now), now, packId, now)
     .run();
   return json({ cleared: res.meta.changes });
 }

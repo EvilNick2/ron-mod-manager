@@ -605,5 +605,21 @@ it("clearing the hold frees the pack", async () => {
   expect(res.status).toBe(200);
   expect(await res.json()).toEqual({ cleared: 1 });
   expect((await beginAs("pack-h", creator, "1.0.0")).status).toBe(200);
-  expect((await commitOf(publish_id, "pack-h", "2.0", editor)).status).toBe(404);
+  const commit = await commitOf(publish_id, "pack-h", "2.0", editor);
+  expect(commit.status).toBe(409);
+  expect(await errCode(commit)).toBe("publish_cleared");
+  for (const step of ["urls", "verify"]) {
+    const res = await post(`/publishes/${publish_id}/${step}`, { blobs: [] }, editor);
+    expect(res.status).toBe(409);
+    expect(await errCode(res)).toBe("publish_cleared");
+  }
+});
+
+it("an expired publish is gone, not cleared", async () => {
+  const { editor } = await publishedPack();
+  const { publish_id } = (await (await beginAs("pack-h", editor, "1.0.0")).json()) as { publish_id: string };
+  await env.DB.prepare("update publishes set expires_at = ?").bind(nowSeconds() - 1).run();
+  const res = await post(`/publishes/${publish_id}/urls`, { blobs: [] }, editor);
+  expect(res.status).toBe(404);
+  expect(await errCode(res)).toBe("publish_gone");
 });

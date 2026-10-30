@@ -33,6 +33,15 @@ interface PublishRow {
 
 const badRequest = (msg: string) => new HttpError(400, "bad_request", msg);
 const gone = () => new HttpError(404, "publish_gone", "This publish is no longer available");
+const cleared = () => new HttpError(409, "publish_cleared", "The pack's creator stopped this publish.");
+
+// Cleared by the creator answers differently from expired, so the app does not start over.
+async function endedPublish(env: Env, id: string, userId: string): Promise<HttpError> {
+  const row = await env.DB.prepare("select 1 as x from publishes where id = ? and user_id = ? and cleared_at is not null")
+    .bind(id, userId)
+    .first();
+  return row ? cleared() : gone();
+}
 
 // Creator or editor of the pack. Binds: user id, user id.
 const MAY_PUBLISH = `(uploader_id = ? or exists (select 1 from pack_editors e where e.pack_id = packs.id and e.user_id = ?))`;
@@ -55,7 +64,7 @@ async function ownPublish(env: Env, user: User, id: string): Promise<PublishRow>
   )
     .bind(id, user.id, nowSeconds())
     .first<PublishRow>();
-  if (!row) throw gone();
+  if (!row) throw await endedPublish(env, id, user.id);
   return row;
 }
 
@@ -381,7 +390,7 @@ export async function commitPublish(req: Request, env: Env, pid: string): Promis
       .bind(publish.id, nowSeconds())
       .first();
     if (pack && stillOpen && pack.published_at !== null && pack.version !== publish.base_version) throw behind();
-    throw gone();
+    throw await endedPublish(env, publish.id, user.id);
   }
   return json({ ok: true, published_at: publishedAt });
 }

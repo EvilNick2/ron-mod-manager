@@ -97,7 +97,7 @@ export async function acceptInvite(
     const editing = await env.DB.prepare("select 1 as x from pack_editors where pack_id = ? and user_id = ?")
       .bind(pack.id, user.id)
       .first();
-    if (user.role === "owner" || user.id === pack.uploader_id || editing) {
+    if (user.id === pack.uploader_id || editing) {
       return { kind: "editor", pack_id: pack.id };
     }
     await claim(env, code);

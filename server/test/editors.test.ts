@@ -243,7 +243,7 @@ it("removing a user who edits a pack rotates its viewer invite", async () => {
   expect(await errorOf(res)).toBe("invite_gone");
 });
 
-it("the owner accepting an editor invite is a no-op", async () => {
+it("the owner accepting an editor invite becomes an editor", async () => {
   const up = await signIn("up");
   const owner = await signIn("own", "Own", "owner");
   await pack("pack-a", "up");
@@ -251,6 +251,17 @@ it("the owner accepting an editor invite is a no-op", async () => {
   const res = await accept(code, owner);
   expect(res.status).toBe(200);
   expect(await res.json()).toEqual({ kind: "editor", pack_id: "pack-a" });
+  expect(await count("select count(*) as n from pack_editors where user_id = 'own'")).toBe(1);
+  expect(await count("select count(*) as n from invites where code = ? and used_at is null", code)).toBe(0);
+  expect(await count("select count(*) as n from users where id = 'own' and role = 'owner'")).toBe(1);
+});
+
+it("the creator accepting their own editor invite is a no-op", async () => {
+  const up = await signIn("up");
+  await pack("pack-a", "up");
+  const code = await editorCode("pack-a", up);
+  const res = await accept(code, up);
+  expect(res.status).toBe(200);
   expect(await count("select count(*) as n from pack_editors")).toBe(0);
   expect(await count("select count(*) as n from invites where code = ? and used_at is null", code)).toBe(1);
 });
