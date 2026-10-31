@@ -1162,6 +1162,7 @@ pub async fn add_pack_from_link(app_handle: tauri::AppHandle, link: String) -> R
     .await
     .map_err(|e| e.to_string())??;
     let Some(Added { summary, .. }) = &added else { return Ok(added_outcome(&base, None)) };
+    crate::usage::report_download(&app_handle, &base, &summary.pack.pack_id);
 
     let mut config = crate::config::load_config(app_handle.clone())?;
     crate::config::tidy_presets_after_import(&mut config, &summary.pack.pack_id, &summary.superseded_ids, &summary.removed_keys);
@@ -1199,7 +1200,9 @@ pub async fn switch_pack(
     let old_id = pack_id.clone();
     let active = crate::config::load_config(app_handle.clone())?.active_preset.as_deref() == Some(format!("pack:{}", pack_id).as_str());
     let handle = app_handle.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    let reporter = app_handle.clone();
+    let (report_base, report_id) = (base.clone(), new_pack_id.clone());
+    let summary = tauri::async_runtime::spawn_blocking(move || {
         let mut emit = |p: Progress| {
             let _ = handle.emit("pack-progress", p);
         };
@@ -1212,7 +1215,9 @@ pub async fn switch_pack(
         switch_pack_with(&Conn::live(&base), &pack_id, &new_pack_id, invite, active, &mods_dir, &paks_dir, &mut emit, &mut save)
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())??;
+    crate::usage::report_download(&reporter, &report_base, &report_id);
+    Ok(summary)
 }
 
 #[tauri::command]
@@ -1538,6 +1543,9 @@ async fn run_update(app_handle: tauri::AppHandle, pack_id: String, force: Vec<St
     let config = crate::config::load_config(app_handle.clone())?;
     let active = config.active_preset.as_deref() == Some(format!("pack:{}", pack_id).as_str());
     let handle = app_handle.clone();
+    // Forced mods are a repair of a copy the user already has, which redownload_mods asks for
+    let whole_pack = force.is_empty();
+    let (report_base, report_id) = (base.clone(), pack_id.clone());
     let summary = tauri::async_runtime::spawn_blocking(move || {
         let mut emit = |p: Progress| {
             let _ = handle.emit("pack-progress", p);
@@ -1546,6 +1554,9 @@ async fn run_update(app_handle: tauri::AppHandle, pack_id: String, force: Vec<St
     })
     .await
     .map_err(|e| e.to_string())??;
+    if whole_pack {
+        crate::usage::report_download(&app_handle, &report_base, &report_id);
+    }
 
     let mut config = crate::config::load_config(app_handle.clone())?;
     crate::config::strip_keys_from_presets(&mut config, &summary.removed_keys);
