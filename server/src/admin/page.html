@@ -1,0 +1,603 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pack server dashboard</title>
+<style nonce="__NONCE__">
+  :root { color-scheme: dark; --bg: #16181d; --fg: #e6e8ec; --line: rgba(127,127,127,0.35); --one: #3f7fd6; --shared: #1f9e8c; --waiting: #9b6fd4; --extra: #bf7d16; --danger: #c0392b; }
+  * { box-sizing: border-box; }
+  body { background: var(--bg); color: var(--fg); font-family: system-ui, sans-serif; margin: 0 auto; max-width: 64rem; padding: 16px; font-size: 14px; }
+  [hidden] { display: none !important; }
+  h1 { font-size: 20px; margin: 0; }
+  .top { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+  .signin { max-width: 30rem; margin: 4rem auto; }
+  .signin a { display: inline-block; background: var(--one); color: #fff; text-decoration: none; padding: 8px 16px; border-radius: 5px; font-weight: 600; }
+  .err { background: rgba(192,57,43,0.25); border: 1px solid var(--danger); border-radius: 6px; padding: 8px 12px; margin-bottom: 12px; }
+  .tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); margin-bottom: 16px; }
+  .tab { background: none; border: 0; border-bottom: 2px solid transparent; color: inherit; padding: 8px 14px; cursor: pointer; font-size: 14px; opacity: 0.7; }
+  .tab.on { border-bottom-color: var(--one); opacity: 1; font-weight: 600; }
+  .pane { display: none; }
+  .pane.on { display: block; }
+  .label { font-weight: 600; }
+  .bar { background: rgba(127,127,127,0.25); border-radius: 6px; height: 28px; display: flex; gap: 2px; margin: 6px 0 8px; }
+  .seg { position: relative; display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 600; white-space: nowrap; color: #fff; min-width: 2px; }
+  .seg:first-child { border-radius: 6px 0 0 6px; }
+  .seg .size { overflow: hidden; }
+  .seg .tip, .pt .tip { display: none; position: absolute; bottom: 34px; left: 50%; transform: translateX(-50%); background: #000; border: 1px solid var(--line); color: #fff; padding: 4px 8px; border-radius: 4px; font-weight: 400; font-size: 12px; white-space: nowrap; z-index: 5; }
+  .pt .tip { bottom: auto; top: 4px; }
+  .pt.first .tip { left: 0; transform: none; }
+  .pt.last .tip { left: auto; right: 0; transform: none; }
+  .seg:hover .tip, .pt:hover .tip { display: block; }
+  .key { display: flex; flex-wrap: wrap; gap: 16px; font-size: 13px; align-items: center; }
+  .swatch { display: inline-block; width: 12px; height: 12px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
+  .total { margin-left: auto; opacity: 0.8; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; margin-top: 16px; }
+  .box { border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; }
+  .big { font-size: 22px; font-weight: 600; }
+  .muted { opacity: 0.7; font-size: 13px; }
+  .meter { background: rgba(127,127,127,0.25); border-radius: 4px; height: 10px; margin: 8px 0; }
+  .meter div { background: var(--one); height: 100%; border-radius: 4px; }
+  .wrap { overflow-x: auto; }
+  table.t { width: 100%; border-collapse: collapse; }
+  table.t th { text-align: left; border-bottom: 1px solid var(--line); }
+  table.t td, table.t th { padding: 7px 8px; }
+  table.t td.act, table.t th.act { text-align: right; }
+  button { font: inherit; }
+  .del { background: var(--danger); color: #fff; border: 0; border-radius: 4px; padding: 3px 10px; font-size: 12px; cursor: pointer; }
+  .plain { background: none; color: inherit; border: 1px solid rgba(127,127,127,0.5); border-radius: 4px; padding: 3px 10px; font-size: 12px; cursor: pointer; }
+  button:disabled { opacity: 0.5; cursor: default; }
+  .row { cursor: pointer; }
+  .row:hover { background: rgba(127,127,127,0.12); }
+  .stale { background: rgba(220,70,70,0.22); }
+  .stale:hover { background: rgba(220,70,70,0.3); }
+  .detail { display: none; }
+  .detail.on { display: table-row; }
+  .detail > td { background: rgba(127,127,127,0.08); }
+  .cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; font-size: 13px; }
+  .cols ul { margin: 4px 0 0; padding-left: 16px; }
+  .chart { position: relative; height: 90px; margin-top: 8px; }
+  .chart svg { width: 100%; height: 100%; display: block; }
+  .pts { position: absolute; inset: 0; }
+  .pt { position: absolute; top: 0; bottom: 0; }
+  .pt:hover { background: rgba(127,127,127,0.15); }
+  .chart-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .range { display: flex; border: 1px solid var(--line); border-radius: 5px; overflow: hidden; }
+  .range button { white-space: nowrap; background: none; border: 0; color: inherit; padding: 2px 9px; font-size: 12px; cursor: pointer; opacity: 0.7; }
+  .range button.on { background: rgba(63,127,214,0.35); opacity: 1; font-weight: 600; }
+  .gap { margin-top: 6px; }
+  .people-head { margin-bottom: 12px; }
+</style>
+</head>
+<body>
+<div id="signin" class="signin" hidden>
+  <h1>Pack server dashboard</h1>
+  <p><a href="/admin/login">Sign in with Discord</a></p>
+</div>
+
+<div id="app" hidden>
+  <div class="top">
+    <h1>Pack server dashboard</h1>
+    <button class="plain" id="signout">Sign out</button>
+  </div>
+  <div class="err" id="err" hidden></div>
+  <div class="tabs">
+    <button class="tab on" data-pane="overview">Overview</button>
+    <button class="tab" data-pane="packs">Packs</button>
+    <button class="tab" data-pane="people">People</button>
+  </div>
+
+  <div class="pane on" id="overview">
+    <div class="label">Storage</div>
+    <div class="bar" id="bar"></div>
+    <div class="key" id="key"></div>
+
+    <div class="grid">
+      <div class="box">
+        <div class="chart-head">
+          <div class="label">Storage over time</div>
+          <div class="range" id="range">
+            <button data-range="24h">24h</button>
+            <button data-range="7d">7 days</button>
+            <button data-range="30d" class="on">30 days</button>
+          </div>
+        </div>
+        <div class="chart">
+          <svg viewBox="0 0 300 90" preserveAspectRatio="none">
+            <line x1="0" y1="89" x2="300" y2="89" stroke="rgba(127,127,127,0.4)" stroke-width="1" vector-effect="non-scaling-stroke"/>
+            <polyline id="line" fill="none" stroke="#3f7fd6" stroke-width="2" vector-effect="non-scaling-stroke" points=""/>
+          </svg>
+          <div class="pts" id="pts"></div>
+        </div>
+        <div class="muted gap" id="chart-note"></div>
+      </div>
+
+      <div class="box">
+        <div class="label">Operations this month</div>
+        <div class="big" id="ops-big"></div>
+        <div class="meter"><div id="ops-meter"></div></div>
+        <div class="muted" id="ops-note"></div>
+      </div>
+
+      <div class="box">
+        <div class="label">Publishes in progress</div>
+        <div id="publishes"></div>
+      </div>
+
+      <div class="box">
+        <div class="label">Leftover files</div>
+        <div class="big" id="left-big"></div>
+        <div class="muted gap">In storage, but no pack points to them.</div>
+        <div class="gap"><button class="plain" id="cleanup">Clean up</button></div>
+        <div class="muted gap" id="cleanup-note"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="pane" id="packs">
+    <div class="wrap">
+      <table class="t">
+        <thead><tr><th>Pack</th><th>Frees if deleted</th><th>Shared files</th><th>Last used</th><th>Last downloaded</th><th>Downloads</th><th class="act"></th></tr></thead>
+        <tbody id="packs-body"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="pane" id="people">
+    <div class="key people-head">
+      <div class="big" id="people-count"></div>
+      <div class="total"><button class="plain" id="invite">Copy uploader invite link</button> <span class="muted" id="invite-note"></span></div>
+    </div>
+    <div class="wrap">
+      <table class="t">
+        <thead><tr><th>Name</th><th>Role</th><th>Packs created</th><th>Edits</th><th>Views</th><th class="act"></th></tr></thead>
+        <tbody id="people-body"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script nonce="__NONCE__">
+(function () {
+  var DAY = 86400;
+  var COLORS = { one: "#3f7fd6", shared: "#1f9e8c", waiting: "#9b6fd4", extra: "#bf7d16" };
+  var MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+  var state = { overview: null, packs: null, range: "30d", details: {}, cleaning: false };
+
+  function $(id) { return document.getElementById(id); }
+  function el(tag, text, cls) {
+    var e = document.createElement(tag);
+    if (text !== undefined && text !== null) e.textContent = text;
+    if (cls) e.className = cls;
+    return e;
+  }
+  function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+  function now() { return Math.floor(Date.now() / 1000); }
+
+  function size(b) {
+    if (b >= 1e9) return (b / 1e9).toFixed(1).replace(/\.0$/, "") + " GB";
+    if (b >= 1e6) return Math.round(b / 1e6) + " MB";
+    if (b >= 1e3) return Math.round(b / 1e3) + " KB";
+    return b + " B";
+  }
+  function plural(n, word) { return n + " " + word + (n === 1 ? "" : "s"); }
+  function ago(t) {
+    if (t === null || t === undefined) return "Not recorded";
+    var d = now() - t;
+    if (d < 60) return "just now";
+    if (d < 3600) return plural(Math.floor(d / 60), "minute") + " ago";
+    if (d < DAY) return plural(Math.floor(d / 3600), "hour") + " ago";
+    var days = Math.floor(d / DAY);
+    if (days === 1) return "yesterday";
+    if (days < 14) return days + " days ago";
+    if (days < 60) return plural(Math.floor(days / 7), "week") + " ago";
+    if (days < 730) return plural(Math.floor(days / 30), "month") + " ago";
+    return plural(Math.floor(days / 365), "year") + " ago";
+  }
+  function until(t) {
+    var d = t - now();
+    if (d < 60) return "less than a minute";
+    if (d < 3600) return Math.round(d / 60) + " min";
+    return plural(Math.round(d / 3600), "hour");
+  }
+
+  function showError(msg) {
+    var e = $("err");
+    e.textContent = msg;
+    e.hidden = false;
+  }
+  function hideError() { $("err").hidden = true; }
+  function signedOut() {
+    $("app").hidden = true;
+    $("signin").hidden = false;
+  }
+  function signedIn() {
+    $("signin").hidden = true;
+    $("app").hidden = false;
+  }
+  function Unauthed() {}
+
+  function call(method, path) {
+    return fetch(path, { method: method, credentials: "same-origin" }).then(function (res) {
+      if (res.status === 401) throw new Unauthed();
+      return res.json().catch(function () { return {}; }).then(function (body) {
+        if (!res.ok) throw new Error(body && body.message ? body.message : "The request failed (" + res.status + ").");
+        return body;
+      });
+    });
+  }
+  function fail(e) {
+    if (e instanceof Unauthed) signedOut();
+    else {
+      signedIn();
+      showError(e && e.message ? e.message : "Something went wrong.");
+    }
+  }
+
+  // Storage bar
+  function renderBar() {
+    var s = state.overview.storage;
+    var bar = $("bar");
+    var key = $("key");
+    clear(bar);
+    clear(key);
+    var parts = [
+      { name: "Only in one pack", bytes: s.single, color: COLORS.one },
+      { name: "Shared by several packs", bytes: s.shared, color: COLORS.shared },
+      { name: "Waiting for cleanup", bytes: s.waiting, color: COLORS.waiting }
+    ];
+    if (s.extra !== null) parts.push({ name: s.extra_label || "Other bucket", bytes: s.extra, color: COLORS.extra });
+    var span = Math.max(s.cap, s.used, 1);
+    parts.forEach(function (p) {
+      if (p.bytes > 0) {
+        var seg = el("div", null, "seg");
+        seg.style.width = (p.bytes / span * 100) + "%";
+        seg.style.background = p.color;
+        seg.appendChild(el("span", size(p.bytes), "size"));
+        seg.appendChild(el("span", p.name + ": " + size(p.bytes), "tip"));
+        bar.appendChild(seg);
+      }
+      var item = el("div");
+      var sw = el("span", null, "swatch");
+      sw.style.background = p.color;
+      item.appendChild(sw);
+      item.appendChild(document.createTextNode(p.name));
+      key.appendChild(item);
+    });
+    var free = el("div");
+    var fsw = el("span", null, "swatch");
+    fsw.style.background = "rgba(127,127,127,0.35)";
+    free.appendChild(fsw);
+    free.appendChild(document.createTextNode("Free"));
+    key.appendChild(free);
+    key.appendChild(el("div", size(s.used) + " of " + size(s.cap) + " used", "total"));
+    fitLabels();
+  }
+  function fitLabels() {
+    var segs = document.querySelectorAll(".seg");
+    for (var i = 0; i < segs.length; i++) {
+      var sz = segs[i].querySelector(".size");
+      sz.style.visibility = "visible";
+      if (sz.scrollWidth + 8 > segs[i].clientWidth) sz.style.visibility = "hidden";
+    }
+  }
+
+  // Graph
+  var RANGES = { "24h": { secs: DAY, bucket: 3600, label: "24 hours" }, "7d": { secs: 7 * DAY, bucket: 6 * 3600, label: "7 days" }, "30d": { secs: 30 * DAY, bucket: DAY, label: "30 days" } };
+  function inRange(samples, secs) {
+    var from = now() - secs;
+    return samples.filter(function (p) { return p.t >= from; });
+  }
+  function thin(samples, bucket) {
+    var out = [];
+    var last = null;
+    samples.forEach(function (p) {
+      var b = Math.floor(p.t / bucket);
+      if (b === last) out[out.length - 1] = p;
+      else out.push(p);
+      last = b;
+    });
+    return out;
+  }
+  function drawRange() {
+    var r = RANGES[state.range];
+    var o = state.overview;
+    var raw = inRange(o.samples, r.secs);
+    var pts = thin(raw, r.bucket);
+    if (pts.length < 2) pts = raw;
+    var line = $("line");
+    var holder = $("pts");
+    var note = $("chart-note");
+    clear(holder);
+    var buttons = document.querySelectorAll("#range button");
+    for (var b = 0; b < buttons.length; b++) buttons[b].classList.toggle("on", buttons[b].getAttribute("data-range") === state.range);
+    if (raw.length < 2) {
+      line.setAttribute("points", "");
+      note.textContent = "Collecting data";
+      return;
+    }
+    var vals = pts.map(function (p) { return p.bytes; });
+    var min = Math.min.apply(null, vals);
+    var max = Math.max.apply(null, vals);
+    var pad = (max - min) * 0.1 || Math.max(max * 0.05, 1);
+    var lo = min - pad;
+    var hi = max + pad;
+    var n = pts.length;
+    line.setAttribute("points", n < 2 ? "" : pts.map(function (p, i) {
+      return (i / (n - 1) * 300) + "," + (84 - (p.bytes - lo) / (hi - lo) * 76);
+    }).join(" "));
+    pts.forEach(function (p, i) {
+      var w = 100 / n;
+      var cell = el("div", null, "pt" + (i === 0 ? " first" : "") + (i === n - 1 ? " last" : ""));
+      cell.style.left = (i * w) + "%";
+      cell.style.width = w + "%";
+      cell.appendChild(el("span", ago(p.t) + ": " + size(p.bytes), "tip"));
+      holder.appendChild(cell);
+    });
+    var first = raw[0];
+    var lastP = raw[raw.length - 1];
+    var delta = lastP.bytes - first.bytes;
+    var span = lastP.t - first.t;
+    var within = span >= r.secs * 0.9 ? r.label : span < 3600 ? "the last hour" : span < 2 * DAY ? plural(Math.max(1, Math.round(span / 3600)), "hour") : plural(Math.round(span / DAY), "day");
+    var text = delta > 0 ? "Up " + size(delta) + " in " + within + "." : delta < 0 ? "Down " + size(-delta) + " in " + within + "." : "No change in " + within + ".";
+    if (state.range === "30d" && delta > 0 && span >= 7 * DAY) {
+      var perDay = delta / (span / DAY);
+      var room = o.storage.cap - lastP.bytes;
+      text += room <= 0 ? " Storage is full." : " About " + Math.round(room / perDay) + " days until full at this rate.";
+    }
+    note.textContent = text;
+  }
+
+  // Overview
+  function renderOverview() {
+    var o = state.overview;
+    renderBar();
+    drawRange();
+
+    var big = $("ops-big");
+    clear(big);
+    big.appendChild(document.createTextNode(o.ops.used.toLocaleString("en-US") + " "));
+    big.appendChild(el("span", "of " + o.ops.budget.toLocaleString("en-US"), "muted"));
+    var pct = o.ops.budget > 0 ? Math.min(100, o.ops.used / o.ops.budget * 100) : 0;
+    $("ops-meter").style.width = pct + "%";
+    var reset = new Date(o.ops.resets_at * 1000);
+    $("ops-note").textContent = Math.round(pct) + "% used, resets on " + reset.getUTCDate() + " " + MONTHS[reset.getUTCMonth()] + ". At the limit, new publishes are refused so you are not charged. Downloads keep working.";
+
+    var pubs = $("publishes");
+    clear(pubs);
+    if (o.publishes.length === 0) {
+      pubs.appendChild(el("div", "Nothing is publishing", "muted gap"));
+    } else {
+      var tbl = el("table", null, "t");
+      o.publishes.forEach(function (p) {
+        var tr = el("tr");
+        var td = el("td");
+        td.appendChild(document.createTextNode(p.name + " " + p.version));
+        td.appendChild(el("br"));
+        td.appendChild(el("span", (p.user || "Unknown") + ", ends in " + until(p.expires_at) + " if idle", "muted"));
+        var act = el("td", null, "act");
+        var btn = el("button", "Clear", "plain");
+        btn.addEventListener("click", function () {
+          btn.disabled = true;
+          call("DELETE", "/admin/api/packs/" + encodeURIComponent(p.pack_id) + "/hold").then(function () { return loadAll(); }, function (e) { btn.disabled = false; fail(e); });
+        });
+        act.appendChild(btn);
+        tr.appendChild(td);
+        tr.appendChild(act);
+        tbl.appendChild(tr);
+      });
+      pubs.appendChild(tbl);
+    }
+
+    showLeft(o.leftovers);
+    $("cleanup").disabled = state.cleaning;
+  }
+  function showLeft(left) {
+    var lb = $("left-big");
+    clear(lb);
+    lb.appendChild(document.createTextNode(plural(left.files, "file") + " "));
+    lb.appendChild(el("span", size(left.bytes), "muted"));
+  }
+
+  function cleanUp() {
+    if (state.cleaning) return;
+    state.cleaning = true;
+    var btn = $("cleanup");
+    var note = $("cleanup-note");
+    btn.disabled = true;
+    note.textContent = "";
+    var prev = null;
+    function pass() {
+      return call("POST", "/admin/api/cleanup").then(function (left) {
+        showLeft(left);
+        if (left.files === 0) return;
+        if (prev !== null && left.files >= prev) {
+          note.textContent = "Some files are waiting out a short delay. Try again in 15 minutes.";
+          return;
+        }
+        prev = left.files;
+        return pass();
+      });
+    }
+    var failed = false;
+    pass().catch(function (e) { failed = true; fail(e); }).then(function () {
+      state.cleaning = false;
+      btn.disabled = false;
+      return loadAll(failed);
+    });
+  }
+
+  // Packs
+  function activityOf(p) {
+    var a = Math.max(p.last_used_at || 0, p.last_downloaded_at || 0);
+    return a > 0 ? a : null;
+  }
+  function renderPacks() {
+    var d = state.packs;
+    var body = $("packs-body");
+    clear(body);
+    var rows = d.packs.map(function (p) { return { p: p, act: activityOf(p) }; });
+    rows.sort(function (a, b) {
+      if (a.act === null && b.act === null) return 0;
+      if (a.act === null) return -1;
+      if (b.act === null) return 1;
+      return a.act - b.act;
+    });
+    rows.forEach(function (r) {
+      var p = r.p;
+      var ref = r.act !== null ? r.act : Math.max(d.tracking_started || 0, p.published_at || 0);
+      var stale = ref > 0 && now() - ref > 60 * DAY;
+      var tr = el("tr", null, "row" + (stale ? " stale" : ""));
+      var name = el("td", p.name);
+      if (p.published_at === null) name.appendChild(el("span", " (unfinished publish)", "muted"));
+      tr.appendChild(name);
+      tr.appendChild(el("td", size(p.frees)));
+      tr.appendChild(el("td", p.shared_bytes > 0 ? size(p.shared_bytes) + ", with " + p.shared_with.join(", ") : "none"));
+      tr.appendChild(el("td", ago(p.last_used_at)));
+      tr.appendChild(el("td", ago(p.last_downloaded_at)));
+      tr.appendChild(el("td", String(p.download_count)));
+      var act = el("td", null, "act");
+      var del = el("button", "Delete", "del");
+      del.addEventListener("click", function (e) {
+        e.stopPropagation();
+        var people = p.viewers + p.editors;
+        var text = "Delete " + p.name + "? This frees " + size(p.frees) + " over the next few hours as cleanup runs. " + (people === 1 ? "1 person stops" : people + " people stop") + " getting updates. Installed copies stay on their machines.";
+        if (!window.confirm(text)) return;
+        del.disabled = true;
+        call("DELETE", "/admin/api/packs/" + encodeURIComponent(p.id)).then(function () { return loadAll(); }, function (err) { del.disabled = false; fail(err); });
+      });
+      act.appendChild(del);
+      tr.appendChild(act);
+      var detail = el("tr", null, "detail");
+      var dtd = el("td");
+      dtd.colSpan = 7;
+      detail.appendChild(dtd);
+      tr.addEventListener("click", function (e) {
+        if (e.target.closest && e.target.closest("button")) return;
+        var open = detail.classList.toggle("on");
+        if (open) loadDetail(p.id, dtd);
+      });
+      body.appendChild(tr);
+      body.appendChild(detail);
+    });
+  }
+  function listBox(title, items) {
+    var box = el("div");
+    box.appendChild(el("b", title));
+    if (items.length === 0) {
+      box.appendChild(el("br"));
+      box.appendChild(document.createTextNode("None"));
+    } else {
+      var ul = el("ul");
+      items.forEach(function (t) { ul.appendChild(el("li", t)); });
+      box.appendChild(ul);
+    }
+    return box;
+  }
+  function loadDetail(id, cell) {
+    clear(cell);
+    cell.appendChild(el("span", "Loading", "muted"));
+    call("GET", "/admin/api/packs/" + encodeURIComponent(id)).then(function (d) {
+      clear(cell);
+      var cols = el("div", null, "cols");
+      var c = el("div");
+      c.appendChild(el("b", "Creator"));
+      c.appendChild(el("br"));
+      c.appendChild(document.createTextNode(d.creator || "Unknown"));
+      cols.appendChild(c);
+      cols.appendChild(listBox("Versions", d.versions.map(function (v) {
+        return v.version + ", " + ago(v.published_at) + (v.publisher ? ", by " + v.publisher : "");
+      })));
+      cols.appendChild(listBox("Editors", d.editors));
+      cols.appendChild(listBox("Viewers", d.viewers));
+      cell.appendChild(cols);
+    }).catch(function (e) { clear(cell); fail(e); });
+  }
+
+  // People
+  function renderPeople(d) {
+    var count = $("people-count");
+    clear(count);
+    count.appendChild(document.createTextNode(d.people.length + " "));
+    count.appendChild(el("span", "of " + d.max_users + " people", "muted"));
+    var body = $("people-body");
+    clear(body);
+    d.people.forEach(function (u) {
+      var tr = el("tr");
+      tr.appendChild(el("td", u.name));
+      tr.appendChild(el("td", u.role === "owner" ? "Owner" : u.role === "uploader" ? "Uploader" : "Viewer"));
+      tr.appendChild(el("td", String(u.created.length)));
+      tr.appendChild(el("td", String(u.edits)));
+      tr.appendChild(el("td", String(u.views)));
+      var act = el("td", null, "act");
+      if (u.role !== "owner") {
+        var rm = el("button", "Remove", "del");
+        rm.addEventListener("click", function () {
+          var text = "Remove " + u.name + "? They lose access to the server.";
+          if (u.created.length > 0) text += " This also deletes the packs they created: " + u.created.join(", ") + ".";
+          if (!window.confirm(text)) return;
+          rm.disabled = true;
+          call("DELETE", "/admin/api/users/" + encodeURIComponent(u.id)).then(function () { return loadAll(); }, function (e) { rm.disabled = false; fail(e); });
+        });
+        act.appendChild(rm);
+      }
+      tr.appendChild(act);
+      body.appendChild(tr);
+    });
+  }
+
+  function copyInvite() {
+    var btn = $("invite");
+    var note = $("invite-note");
+    btn.disabled = true;
+    note.textContent = "";
+    call("POST", "/admin/api/invites/uploader").then(function (inv) {
+      var shown = function () { window.prompt("Copy this invite link", inv.url); };
+      if (!navigator.clipboard || !navigator.clipboard.writeText) return shown();
+      return navigator.clipboard.writeText(inv.url).then(function () {
+        note.textContent = "Link copied. It works for 24 hours.";
+      }, shown);
+    }).catch(fail).then(function () { btn.disabled = false; });
+  }
+
+  function loadAll(keepError) {
+    if (keepError !== true) hideError();
+    return Promise.all([
+      call("GET", "/admin/api/overview").then(function (d) { state.overview = d; signedIn(); renderOverview(); }),
+      call("GET", "/admin/api/packs").then(function (d) { state.packs = d; renderPacks(); }),
+      call("GET", "/admin/api/people").then(renderPeople)
+    ]).catch(fail);
+  }
+
+  var tabs = document.querySelectorAll(".tab");
+  for (var i = 0; i < tabs.length; i++) {
+    (function (tab) {
+      tab.addEventListener("click", function () {
+        var all = document.querySelectorAll(".tab, .pane");
+        for (var k = 0; k < all.length; k++) all[k].classList.remove("on");
+        tab.classList.add("on");
+        $(tab.getAttribute("data-pane")).classList.add("on");
+        fitLabels();
+      });
+    })(tabs[i]);
+  }
+  var rb = document.querySelectorAll("#range button");
+  for (var j = 0; j < rb.length; j++) {
+    (function (b) {
+      b.addEventListener("click", function () {
+        state.range = b.getAttribute("data-range");
+        if (state.overview) drawRange();
+      });
+    })(rb[j]);
+  }
+  $("cleanup").addEventListener("click", cleanUp);
+  $("invite").addEventListener("click", copyInvite);
+  $("signout").addEventListener("click", function () {
+    call("POST", "/admin/api/logout").then(signedOut, fail);
+  });
+  window.addEventListener("resize", fitLabels);
+  loadAll();
+})();
+</script>
+</body>
+</html>

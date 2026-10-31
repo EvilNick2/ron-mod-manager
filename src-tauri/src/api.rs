@@ -118,7 +118,9 @@ pub fn launch_game(app_handle: tauri::AppHandle) -> Result<(), String> {
     println!("[LAUNCH] Initiating game start for AppID: {} with URL: {}", app_id, launch_url);
     
     app_handle.opener().open_url(launch_url, None::<&str>)
-        .map_err(|e| format!("Failed to launch game: {}", e))
+        .map_err(|e| format!("Failed to launch game: {}", e))?;
+    crate::usage::report_launch(&app_handle);
+    Ok(())
 }
 
 #[tauri::command]

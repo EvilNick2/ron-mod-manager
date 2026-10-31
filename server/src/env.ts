@@ -3,6 +3,7 @@ export interface Env {
   DB: D1Database;
   PACKS: R2Bucket;
   EXTRA_BUCKET?: R2Bucket;
+  EXTRA_BUCKET_LABEL?: string;
   USER_LIMIT: RateLimit;
 
   OWNER_DISCORD_ID: string;

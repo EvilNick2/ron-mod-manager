@@ -30,6 +30,7 @@ export async function cleanup(env: Env, now: number): Promise<void> {
     env.DB.prepare("delete from logins where expires_at <= ?").bind(now),
     env.DB.prepare("delete from invites where expires_at <= ?").bind(now),
     env.DB.prepare("delete from sessions where last_used < ?").bind(now - IDLE_EXPIRY),
+    env.DB.prepare("delete from admin_sessions where expires_at <= ?").bind(now),
     env.DB.prepare(`delete from pack_viewers where pack_id in (${ABANDONED_PACKS})`).bind(now),
     env.DB.prepare(`delete from pack_editors where pack_id in (${ABANDONED_PACKS})`).bind(now),
     env.DB.prepare(`delete from invites where pack_id in (${ABANDONED_PACKS})`).bind(now),

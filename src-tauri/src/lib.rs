@@ -10,6 +10,7 @@ mod server;
 mod sso;
 mod subscribe;
 mod updater;
+mod usage;
 mod vfs;
 
 use tauri::{Emitter, Manager};
@@ -123,7 +124,9 @@ pub fn run() {
             vfs::toggle_addon,
             vfs::remove_addon,
             updater::check_for_app_update,
-            updater::install_app_update
+            updater::install_app_update,
+            usage::report_pack_use_on_open,
+            usage::set_report_pack_use
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

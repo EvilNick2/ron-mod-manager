@@ -10,6 +10,7 @@ const activeTab = ref("Global");
 const pendingGamePath = ref("");
 const pendingLaunchOptions = ref("");
 const serverBusy = ref<Record<string, "in" | "out">>({});
+const reportPackUse = ref(true);
 
 onMounted(async () => {
   loadServers();
@@ -17,6 +18,7 @@ onMounted(async () => {
     store.defaultModStoragePath = await invoke("get_default_storage_path");
     
     const config: any = await invoke("load_config");
+    reportPackUse.value = config.report_pack_use !== false;
     if (config.mod_storage_path) {
       store.modStoragePathStore = config.mod_storage_path;
     }
@@ -122,6 +124,16 @@ async function toggleBlur(state: boolean) {
     console.error("Failed to save blur config", e);
   }
 }
+
+async function toggleReportPackUse(state: boolean) {
+  try {
+    await invoke("set_report_pack_use", { on: state });
+    reportPackUse.value = state;
+  } catch(e) {
+    console.error("Failed to save pack use config", e);
+    await showAlert("Failed to save the pack use setting: " + e);
+  }
+}
 </script>
 
 <template>
@@ -196,6 +208,15 @@ async function toggleBlur(state: boolean) {
             <div class="settings-tabs" style="margin-bottom: 0;">
               <button class="tab-btn" :class="{ active: store.isBlurEnabled }" @click="toggleBlur(true)">Blur Enabled</button>
               <button class="tab-btn" :class="{ active: !store.isBlurEnabled }" @click="toggleBlur(false)">Blur Disabled</button>
+            </div>
+          </div>
+
+          <div class="settings-section">
+            <h3>Pack Use <Info :size="14" color="#3b82f6" class="info-icon" /></h3>
+            <p class="settings-desc" style="margin-bottom: 1rem;">Tells your pack server when a pack was last downloaded or played. It stores the time for the pack, not who sent it.</p>
+            <div class="settings-tabs" style="margin-bottom: 0;">
+              <button class="tab-btn" :class="{ active: reportPackUse }" @click="toggleReportPackUse(true)">Report pack use</button>
+              <button class="tab-btn" :class="{ active: !reportPackUse }" @click="toggleReportPackUse(false)">Don't report</button>
             </div>
           </div>
         </template>
