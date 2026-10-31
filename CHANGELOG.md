@@ -1,5 +1,50 @@
 # Changelog
 
+## [0.6.0](https://github.com/EvilNick2/ron-mod-manager/compare/v0.5.0...v0.6.0) (2026-10-31)
+
+
+### Features
+
+* **mods:** install 7z archives and detect archive types by content ([5f8a233](https://github.com/EvilNick2/ron-mod-manager/commit/5f8a2335ad3dcb9eb259080b8ed8e0d30d35ee99))
+* **packs:** add the pack server client ([0c0d7b8](https://github.com/EvilNick2/ron-mod-manager/commit/0c0d7b8e51faa4e5e82ca0195cf02c652ac4d38c))
+* **packs:** create a modpack from the sidebar ([446f15b](https://github.com/EvilNick2/ron-mod-manager/commit/446f15bdfdb3309c472c4cffd5f5a995b7aae95b))
+* **packs:** generate changelogs from pack changes ([d982f99](https://github.com/EvilNick2/ron-mod-manager/commit/d982f9973ad1b09ae8960f70690e51c29b61601c))
+* **packs:** manage pack access and remove google drive ([6b014b5](https://github.com/EvilNick2/ron-mod-manager/commit/6b014b5d0b0e2d0a86c7847a70849abd128c0fff))
+* **packs:** publish, update and manage working copies of a pack ([d8d9230](https://github.com/EvilNick2/ron-mod-manager/commit/d8d92308b9633ff4b48a9d48a00c3d7aafdbe3ae))
+* **packs:** sign in to pack servers with discord ([0812e91](https://github.com/EvilNick2/ron-mod-manager/commit/0812e9148c4047b35b0c7d2b2d80a49f49ecbb9c))
+* **publish:** publish packs to pack servers ([36b2dbc](https://github.com/EvilNick2/ron-mod-manager/commit/36b2dbc122a439de740154575c2731ea5af3683d))
+* **server-client:** talk to pack editors, holds and base versions ([ab75c14](https://github.com/EvilNick2/ron-mod-manager/commit/ab75c14dfd80d2686c844e62e1e6af668d04a167))
+* **server:** add sessions and the auth guard ([bc91bc2](https://github.com/EvilNick2/ron-mod-manager/commit/bc91bc226f8fcbb0acb096b2ecd1a4e78dc56d17))
+* **server:** add uploader invites and the people cap ([1302b69](https://github.com/EvilNick2/ron-mod-manager/commit/1302b69240ca6e1e8c90ee70438cd62eedd8e7ac))
+* **server:** clean up orphan files on a schedule ([0f9c5cd](https://github.com/EvilNick2/ron-mod-manager/commit/0f9c5cd3fc135630fa5544737acc2f8744cfbadf))
+* **server:** hold a pack while it publishes and refuse stale publishes ([8fb4b83](https://github.com/EvilNick2/ron-mod-manager/commit/8fb4b8342857f52232c4b06008bba1c51992519e))
+* **server:** keep a changelog per pack version ([93d2201](https://github.com/EvilNick2/ron-mod-manager/commit/93d22011fdd5c79203c358e534ab380296cf3dca))
+* **server:** let a pack's creator add editors ([8cf3912](https://github.com/EvilNick2/ron-mod-manager/commit/8cf39120b5bcdcf54bf85f83563c65fc4b92ab2a))
+* **server:** let uploaders and the owner manage access ([f21ec6d](https://github.com/EvilNick2/ron-mod-manager/commit/f21ec6d95e497686e4c3e47494dd56bd9c418040))
+* **server:** return published_at on commit and cap history versions ([241b3b0](https://github.com/EvilNick2/ron-mod-manager/commit/241b3b08c5a6ebc590180bdb715d6ba14ea27af7))
+* **server:** scaffold the pack server worker ([a094d8e](https://github.com/EvilNick2/ron-mod-manager/commit/a094d8eb877238adc6cd396cb9bfede170a4222c))
+* **server:** serve pack files to people with access ([a11ae10](https://github.com/EvilNick2/ron-mod-manager/commit/a11ae10a7831ad5d1878b86d066f2adaf6be7735))
+* **server:** sign in with discord ([09c8875](https://github.com/EvilNick2/ron-mod-manager/commit/09c8875ad3f0e135450bd53966b2ef36c65390c8))
+* **server:** stop cleared publishes and let the owner become an editor ([3db49f6](https://github.com/EvilNick2/ron-mod-manager/commit/3db49f676a2b980abf302b09d25777b466f61ce6))
+* **server:** take publishes under the storage cap ([1d3c818](https://github.com/EvilNick2/ron-mod-manager/commit/1d3c818d6e90232edd1416e67c010a50e72a40e1))
+* **subscribe:** install and update packs from pack servers ([b727f93](https://github.com/EvilNick2/ron-mod-manager/commit/b727f93502110d15bda3ac73e96dad3dd4013aea))
+* **subscribe:** switch an installed pack to another link ([aa2d155](https://github.com/EvilNick2/ron-mod-manager/commit/aa2d155c2436d3a0184c031608ba253b37bec973))
+* **ui:** manage pack editors, accept invites in settings and warn before replacing changes ([4a64605](https://github.com/EvilNick2/ron-mod-manager/commit/4a646051cf98ce107c592d74f62a0f84c719004a))
+* **ui:** show pack details and changelogs ([c89a7ae](https://github.com/EvilNick2/ron-mod-manager/commit/c89a7ae42e3ad66b29d4c61360c11968f99195e0))
+* **ui:** sign in to pack servers and manage pack access ([cee023b](https://github.com/EvilNick2/ron-mod-manager/commit/cee023b0c7b0ee583a6041b369b6f065c1745de3))
+
+
+### Bug Fixes
+
+* **mods:** keep the installed copy when an archive fails to extract ([fbc2f2b](https://github.com/EvilNick2/ron-mod-manager/commit/fbc2f2b71c50f7edfdec4cd11868ef78cc17357b))
+* **mods:** keep the installed version when checking nexus for updates ([2a13cc5](https://github.com/EvilNick2/ron-mod-manager/commit/2a13cc5589b9353f1d287bd9fab39de45cfe7721))
+* **packs:** harden switching, sign-in and server requests ([e3b2fe1](https://github.com/EvilNick2/ron-mod-manager/commit/e3b2fe1404968d3256768625654324aa8325f6dd))
+* **packs:** refresh roles after invites and allow switching servers ([e5959bb](https://github.com/EvilNick2/ron-mod-manager/commit/e5959bbe5d9e6d7866b20c829648c8afe2001194))
+* **server:** close storage cap and invite gaps from review ([d493a4c](https://github.com/EvilNick2/ron-mod-manager/commit/d493a4cf2d0fefc5cc47c340ec80e19c13f21294))
+* **ui:** make dropdowns readable on webkitgtk ([af7c8f1](https://github.com/EvilNick2/ron-mod-manager/commit/af7c8f1b339994152bcc5f9675f8268adab6c77b))
+* **ui:** move pack export into the more menu ([4fdd091](https://github.com/EvilNick2/ron-mod-manager/commit/4fdd09147a4a366971ba9e9573d14def0a34b671))
+* **ui:** offer the invite link only on a pack's first publish ([381a235](https://github.com/EvilNick2/ron-mod-manager/commit/381a2350174a0dbc246fac833103fb0a31b412f1))
+
 ## [0.5.0](https://github.com/EvilNick2/ron-mod-manager/compare/v0.4.1...v0.5.0) (2026-10-24)
 
 
