@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.7.0](https://github.com/EvilNick2/ron-mod-manager/compare/v0.6.0...v0.7.0) (2026-10-31)
+
+
+### Features
+
+* **packs:** report pack downloads and plays to the server, with a setting to turn it off ([a10dc4f](https://github.com/EvilNick2/ron-mod-manager/commit/a10dc4febeaf2a25b77d2e72a4f0df8c3d0b7035))
+* **server:** dashboard data and actions for the owner ([ec5d936](https://github.com/EvilNick2/ron-mod-manager/commit/ec5d936d51baa95d8c8b5530d0d2d2e7ad9703bd))
+* **server:** owner sign-in for a dashboard at /admin ([084a05c](https://github.com/EvilNick2/ron-mod-manager/commit/084a05c2aca6206aadc6a30a01165ddffe836c08))
+* **server:** record when a pack was last downloaded and played ([bc16d67](https://github.com/EvilNick2/ron-mod-manager/commit/bc16d67b9eaf49a750c618c750c767fdabc392fd))
+* **server:** the dashboard page ([6de6190](https://github.com/EvilNick2/ron-mod-manager/commit/6de6190634c6693776f5be88d38cb620965a8587))
+
 ## [0.6.0](https://github.com/EvilNick2/ron-mod-manager/compare/v0.5.0...v0.6.0) (2026-10-31)
 
 
