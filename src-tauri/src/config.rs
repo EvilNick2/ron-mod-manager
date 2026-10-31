@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager};
 
 #[derive(Serialize, Deserialize, Default, Clone)]
@@ -15,6 +15,11 @@ pub struct AppConfig {
     pub active_preset: Option<String>,
     #[serde(default)]
     pub presets: HashMap<String, Vec<String>>,
+    /// None means on
+    #[serde(default)]
+    pub report_pack_use: Option<bool>,
+    #[serde(default)]
+    pub last_reported_play: Option<u64>,
 }
 
 pub fn get_config_path(app_handle: &AppHandle) -> Result<PathBuf, String> {
@@ -49,10 +54,18 @@ pub fn load_config(app_handle: tauri::AppHandle) -> Result<AppConfig, String> {
 #[tauri::command]
 pub fn save_config(app_handle: tauri::AppHandle, config: AppConfig) -> Result<(), String> {
     let path = get_config_path(&app_handle)?;
-    let json = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
-    
-    fs::write(path, json).map_err(|e| e.to_string())?;
-    Ok(())
+    write_config_file(&path, &config)
+}
+
+// A load during a save must see a whole file, because load_config turns a parse failure into defaults.
+// The temp name is unique so two saves at once cannot write into the same file.
+fn write_config_file(path: &Path, config: &AppConfig) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(config).map_err(|e| e.to_string())?;
+    let tmp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+    fs::write(&tmp, json).and_then(|_| fs::rename(&tmp, path)).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        e.to_string()
+    })
 }
 
 #[tauri::command]
@@ -77,28 +90,8 @@ pub fn load_presets(app_handle: tauri::AppHandle) -> Result<HashMap<String, Vec<
 
 #[tauri::command]
 pub fn auto_detect_game_path() -> Result<Option<String>, String> {
-    let mut steam_paths = Vec::new();
-    
-    #[cfg(windows)]
-    {
-        if let Ok(program_files) = std::env::var("ProgramFiles(x86)") {
-            steam_paths.push(PathBuf::from(program_files).join("Steam"));
-        }
-        if let Ok(program_files) = std::env::var("ProgramFiles") {
-            steam_paths.push(PathBuf::from(program_files).join("Steam"));
-        }
-    }
-    
-    #[cfg(unix)]
-    {
-        if let Ok(home) = std::env::var("HOME") {
-            steam_paths.push(PathBuf::from(&home).join(".local/share/Steam"));
-            steam_paths.push(PathBuf::from(&home).join(".steam/steam"));
-            steam_paths.push(PathBuf::from(&home).join(".steam/root"));
-            steam_paths.push(PathBuf::from(&home).join(".var/app/com.valvesoftware.Steam/.local/share/Steam"));
-        }
-    }
-    
+    let steam_paths = crate::usage::steam_roots();
+
     let mut all_libraries = Vec::new();
     for base_steam in &steam_paths {
         all_libraries.push(base_steam.clone());
@@ -266,6 +259,67 @@ pub fn rename_key_in_presets(config: &mut AppConfig, old: &str, new: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ron-config-{}-{}", name, uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn names_in(dir: &Path) -> Vec<String> {
+        fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().to_string()).collect()
+    }
+
+    #[test]
+    fn saving_replaces_the_file_and_leaves_no_temp() {
+        let dir = scratch("replace");
+        let path = dir.join("config.json");
+        let mut c = AppConfig { report_pack_use: Some(false), ..Default::default() };
+        write_config_file(&path, &c).unwrap();
+        c.last_reported_play = Some(5);
+        write_config_file(&path, &c).unwrap();
+        assert_eq!(names_in(&dir), ["config.json"]);
+        let read: AppConfig = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!((read.report_pack_use, read.last_reported_play), (Some(false), Some(5)));
+    }
+
+    #[test]
+    fn a_failed_save_leaves_no_temp() {
+        let dir = scratch("failed");
+        let target = dir.join("config.json");
+        fs::create_dir(&target).unwrap();
+        assert!(write_config_file(&target, &AppConfig::default()).is_err());
+        assert_eq!(names_in(&dir), ["config.json"]);
+    }
+
+    #[test]
+    fn a_load_during_saves_never_sees_a_partial_file() {
+        let dir = scratch("race");
+        let path = dir.join("config.json");
+        let mut c = AppConfig::default();
+        c.presets.insert("Mine".into(), (0..5000).map(|n| n.to_string()).collect());
+        write_config_file(&path, &c).unwrap();
+        // Two writers, as the background report and the frontend can be
+        let writers: Vec<_> = (0..2)
+            .map(|_| {
+                let (path, c) = (path.clone(), c.clone());
+                std::thread::spawn(move || {
+                    for _ in 0..100 {
+                        write_config_file(&path, &c).unwrap();
+                    }
+                })
+            })
+            .collect();
+        while !writers.iter().all(|w| w.is_finished()) {
+            let text = fs::read_to_string(&path).unwrap();
+            let read: AppConfig = serde_json::from_str(&text).expect("a load must never see a partial file");
+            assert_eq!(read.presets["Mine"].len(), 5000);
+        }
+        for w in writers {
+            w.join().unwrap();
+        }
+        assert_eq!(names_in(&dir), ["config.json"]);
+    }
 
     #[test]
     fn tidy_presets_after_import_cases() {

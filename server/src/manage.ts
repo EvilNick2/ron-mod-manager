@@ -30,7 +30,7 @@ export async function deletePack(env: Env, packId: string): Promise<void> {
   await env.DB.batch(packStatements(env, "?", packId));
 }
 
-async function loadPack(env: Env, id: string): Promise<{ id: string; uploader_id: string }> {
+export async function loadPack(env: Env, id: string): Promise<{ id: string; uploader_id: string }> {
   if (!PACK_ID.test(id) || /^[0-9]+$/.test(id)) throw packGone();
   const pack = await env.DB.prepare("select id, uploader_id from packs where id = ?")
     .bind(id)
@@ -185,8 +185,7 @@ async function requireOwner(req: Request, env: Env): Promise<User> {
   return user;
 }
 
-export async function listUsers(req: Request, env: Env): Promise<Response> {
-  await requireOwner(req, env);
+export async function listUserRows(env: Env) {
   const rows = await env.DB.prepare(
     `select u.id, u.name, u.role,
             (select count(*) from packs p where p.uploader_id = u.id) as packs
@@ -195,12 +194,19 @@ export async function listUsers(req: Request, env: Env): Promise<Response> {
         or exists (select 1 from pack_viewers v where v.user_id = u.id)
      order by u.name, u.id`,
   ).all<{ id: string; name: string; role: User["role"]; packs: number }>();
-  return json(rows.results);
+  return rows.results;
 }
 
-export async function removeUser(req: Request, env: Env, id: string): Promise<Response> {
-  const owner = await requireOwner(req, env);
-  if (id === owner.id) throw new HttpError(400, "self_remove", "The owner cannot remove themselves");
+export async function listUsers(req: Request, env: Env): Promise<Response> {
+  await requireOwner(req, env);
+  return json(await listUserRows(env));
+}
+
+export function refuseSelfRemoval(ownerId: string, id: string): void {
+  if (id === ownerId) throw new HttpError(400, "self_remove", "The owner cannot remove themselves");
+}
+
+export async function removeUserAccount(env: Env, id: string): Promise<void> {
   const target = await env.DB.prepare("select id from users where id = ?").bind(id).first();
   if (!target) throw userGone();
   const run = (sql: string) => env.DB.prepare(sql).bind(id);
@@ -220,16 +226,26 @@ export async function removeUser(req: Request, env: Env, id: string): Promise<Re
     ),
     run("update users set role = null where id = ?"),
   ]);
+}
+
+export async function removeUser(req: Request, env: Env, id: string): Promise<Response> {
+  const owner = await requireOwner(req, env);
+  refuseSelfRemoval(owner.id, id);
+  await removeUserAccount(env, id);
   return json({ ok: true });
 }
 
-export async function clearHold(req: Request, env: Env, id: string): Promise<Response> {
-  const { packId } = await creatorPack(req, env, id);
+export async function clearPackHold(env: Env, packId: string): Promise<number> {
   const now = nowSeconds();
   const res = await env.DB.prepare(
     "update publishes set expires_at = ?, cleared_at = ? where pack_id = ? and expires_at > ?",
   )
     .bind(cancelledExpiry(now), now, packId, now)
     .run();
-  return json({ cleared: res.meta.changes });
+  return res.meta.changes;
+}
+
+export async function clearHold(req: Request, env: Env, id: string): Promise<Response> {
+  const { packId } = await creatorPack(req, env, id);
+  return json({ cleared: await clearPackHold(env, packId) });
 }

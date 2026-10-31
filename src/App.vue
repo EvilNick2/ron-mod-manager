@@ -78,6 +78,7 @@ onMounted(async () => {
 
   await loadServers();
   checkPackUpdates();
+  invoke("report_pack_use_on_open").catch((e) => console.warn("Pack use report failed:", e));
 
   try {
     const update = await invoke("check_for_app_update");

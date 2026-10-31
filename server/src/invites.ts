@@ -117,17 +117,24 @@ export async function acceptInvite(
   return { kind: "viewer", pack_id: pack.id };
 }
 
-export async function createUploaderInvite(req: Request, env: Env): Promise<Response> {
-  const user = await requireUser(req, env);
-  if (user.role !== "owner") throw new HttpError(403, "forbidden", "Only the owner can do this");
+export async function mintUploaderInvite(
+  env: Env,
+  userId: string,
+): Promise<{ url: string; expires_at: number }> {
   const code = randomToken();
   const expiresAt = nowSeconds() + DAY;
   await env.DB.prepare(
     "insert into invites (code, kind, created_by, expires_at) values (?, 'uploader', ?, ?)",
   )
-    .bind(code, user.id, expiresAt)
+    .bind(code, userId, expiresAt)
     .run();
-  return json({ url: inviteUrl(env, code), expires_at: expiresAt });
+  return { url: inviteUrl(env, code), expires_at: expiresAt };
+}
+
+export async function createUploaderInvite(req: Request, env: Env): Promise<Response> {
+  const user = await requireUser(req, env);
+  if (user.role !== "owner") throw new HttpError(403, "forbidden", "Only the owner can do this");
+  return json(await mintUploaderInvite(env, user.id));
 }
 
 export async function showInvite(req: Request, env: Env, code: string): Promise<Response> {

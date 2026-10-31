@@ -50,6 +50,7 @@ A modern, high-performance mod manager for **Ready or Not**. Built with Tauri an
 :heavy_check_mark: **Mod Presets**: Save, load, and share collections of enabled mods via portable ZIP exports\
 :heavy_check_mark: **Drag-and-Drop Installation**: Drop any mod ZIP directly into the grid to install\
 :heavy_check_mark: **Performance First**: Optimized UI for smooth scrolling on Linux/WebKitGTK with large mod libraries\
+:heavy_check_mark: **Pack Use Reporting**: Tells your pack server when a pack was last downloaded or played, storing the time for the pack, not who sent it. Turn it off in Settings\
 :heavy_check_mark: **Cross-platform**: Built with Tauri for native performance on Windows and Linux
 
 ---

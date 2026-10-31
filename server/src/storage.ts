@@ -1,3 +1,4 @@
+import { DAY } from "./auth";
 import type { Env } from "./env";
 
 const month = () => new Date().toISOString().slice(0, 7);
@@ -46,4 +47,22 @@ export const DB_BYTES_SQL = `(
 export async function storageUsed(env: Env): Promise<number> {
   const row = await env.DB.prepare(`select ${DB_BYTES_SQL} as n`).first<{ n: number }>();
   return (row?.n ?? 0) + (await extraBucketBytes(env));
+}
+
+const SAMPLE_INTERVAL = 3540;
+const SAMPLE_KEEP = 31 * DAY;
+
+export async function takeSample(env: Env, now: number): Promise<void> {
+  await env.DB.prepare("delete from storage_samples where taken_at < ?").bind(now - SAMPLE_KEEP).run();
+  const newest = await env.DB.prepare("select max(taken_at) as t from storage_samples").first<{
+    t: number | null;
+  }>();
+  if (newest?.t != null && now - newest.t < SAMPLE_INTERVAL) return;
+  const row = await env.DB.prepare(`select ${DB_BYTES_SQL} as n`).first<{ n: number }>();
+  const extra = await extraBucketBytes(env);
+  await env.DB.prepare(
+    "insert or replace into storage_samples (taken_at, bytes, extra_bytes) values (?, ?, ?)",
+  )
+    .bind(now, (row?.n ?? 0) + extra, extra)
+    .run();
 }

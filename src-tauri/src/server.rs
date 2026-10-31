@@ -199,6 +199,11 @@ pub struct RemovedViewer {
     pub invite_reset: bool,
 }
 
+#[derive(Deserialize)]
+struct Recorded {
+    recorded: bool,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct VersionEntry {
     pub version: String,
@@ -277,6 +282,9 @@ pub trait PackServer: Send + Sync {
     fn uploader_invite(&self) -> Result<Link, ServerError>;
     fn users(&self) -> Result<Vec<AdminUser>, ServerError>;
     fn remove_user(&self, user_id: &str) -> Result<(), ServerError>;
+    /// True when the server counted it. It does not for the pack's creator, its editors or the owner.
+    fn report_downloaded(&self, pack_id: &str) -> Result<bool, ServerError>;
+    fn report_used(&self, pack_id: &str, played_at: u64) -> Result<bool, ServerError>;
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -697,6 +705,16 @@ impl PackServer for HttpServer {
     fn remove_user(&self, user_id: &str) -> Result<(), ServerError> {
         self.delete(&format!("/admin/users/{}", seg(user_id))).map(|_| ())
     }
+
+    fn report_downloaded(&self, pack_id: &str) -> Result<bool, ServerError> {
+        let answer: Recorded = self.post(&format!("/packs/{}/downloaded", seg(pack_id)), json!({}))?;
+        Ok(answer.recorded)
+    }
+
+    fn report_used(&self, pack_id: &str, played_at: u64) -> Result<bool, ServerError> {
+        let answer: Recorded = self.post(&format!("/packs/{}/used", seg(pack_id)), json!({ "played_at": played_at }))?;
+        Ok(answer.recorded)
+    }
 }
 
 #[cfg(test)]
@@ -717,6 +735,7 @@ pub mod fake {
     const MAX_VERSION: usize = 200;
     const URL_LIFETIME: u64 = 300;
     const PUBLISH_LIFETIME: u64 = 3600;
+    const FUTURE_SLACK: u64 = 300;
 
     struct Pack {
         uploader: String,
@@ -728,6 +747,9 @@ pub mod fake {
         editors: BTreeSet<String>,
         /// Oldest first, as the server's row ids run
         versions: Vec<VersionEntry>,
+        last_downloaded: Option<u64>,
+        download_count: u64,
+        last_used: Option<u64>,
     }
 
     struct Invite {
@@ -784,6 +806,7 @@ pub mod fake {
         downloads: usize,
         puts: usize,
         begins: usize,
+        report_calls: usize,
     }
 
     fn err(code: &str, message: &str) -> ServerError {
@@ -825,6 +848,15 @@ pub mod fake {
                 p.manifest.is_some()
                     && (self.role(user).as_deref() == Some("owner") || p.uploader == user || p.editors.contains(user) || p.viewers.contains(user))
             })
+        }
+
+        /// Whether a usage report from `user` counts. Needs read access, and the people who run the pack do not count.
+        fn usage_counts(&self, pack_id: &str, user: &str) -> Result<bool, ServerError> {
+            if !self.visible(pack_id, user) {
+                return Err(pack_gone());
+            }
+            let pack = &self.packs[pack_id];
+            Ok(self.role(user).as_deref() != Some("owner") && pack.uploader != user && !pack.editors.contains(user))
         }
 
         /// Creator, editor or owner
@@ -1021,6 +1053,9 @@ pub mod fake {
                 viewers: BTreeSet::new(),
                 editors: BTreeSet::new(),
                 versions: Vec::new(),
+                last_downloaded: None,
+                download_count: 0,
+                last_used: None,
             });
             st.record(&manifest.pack_id, manifest, &manifest.name, &manifest.version, notes, &[], None);
         }
@@ -1161,6 +1196,23 @@ pub mod fake {
 
         pub fn begins(&self) -> usize {
             self.lock().begins
+        }
+
+        /// Usage reports that reached the server, counted or not
+        pub fn report_calls(&self) -> usize {
+            self.lock().report_calls
+        }
+
+        pub fn last_used(&self, pack_id: &str) -> Option<u64> {
+            self.lock().packs.get(pack_id).and_then(|p| p.last_used)
+        }
+
+        pub fn last_downloaded(&self, pack_id: &str) -> Option<u64> {
+            self.lock().packs.get(pack_id).and_then(|p| p.last_downloaded)
+        }
+
+        pub fn download_count(&self, pack_id: &str) -> u64 {
+            self.lock().packs.get(pack_id).map_or(0, |p| p.download_count)
         }
 
         fn lock(&self) -> MutexGuard<'_, State> {
@@ -1389,6 +1441,9 @@ pub mod fake {
                 viewers: BTreeSet::new(),
                 editors: BTreeSet::new(),
                 versions: Vec::new(),
+                last_downloaded: None,
+                download_count: 0,
+                last_used: None,
             });
             let missing: Vec<String> = wanted.keys().filter(|h| !st.stored.contains(*h)).cloned().collect();
             let publish_id = st.id("pub");
@@ -1737,6 +1792,36 @@ pub mod fake {
                 u.role = None;
             }
             Ok(())
+        }
+
+        fn report_downloaded(&self, pack_id: &str) -> Result<bool, ServerError> {
+            let mut st = self.gate()?;
+            st.report_calls += 1;
+            if !st.usage_counts(pack_id, &self.user)? {
+                return Ok(false);
+            }
+            let now = st.clock;
+            if let Some(p) = st.packs.get_mut(pack_id) {
+                p.last_downloaded = Some(now);
+                p.download_count += 1;
+            }
+            Ok(true)
+        }
+
+        fn report_used(&self, pack_id: &str, played_at: u64) -> Result<bool, ServerError> {
+            let mut st = self.gate()?;
+            st.report_calls += 1;
+            let counts = st.usage_counts(pack_id, &self.user)?;
+            if played_at == 0 {
+                return Err(bad_request("played_at must be a positive integer"));
+            }
+            if !counts || played_at > st.clock + FUTURE_SLACK {
+                return Ok(false);
+            }
+            if let Some(p) = st.packs.get_mut(pack_id) {
+                p.last_used = p.last_used.max(Some(played_at));
+            }
+            Ok(true)
         }
     }
 }
@@ -2494,6 +2579,71 @@ mod tests {
         owner.seed_pack(OWNER, &manifest("pack-f", "1.0", &[]), "");
         owner.delete_pack("pack-f").unwrap();
         assert_eq!(owner.delete_pack("pack-f").unwrap_err().code, "pack_gone");
+    }
+
+    fn usage_pack() -> (FakeServer, FakeServer, FakeServer) {
+        let owner = FakeServer::new();
+        let up = owner.add_user("u1", "Uploader", Some("uploader"));
+        let viewer = owner.add_user("v1", "Viewer", None);
+        owner.seed_pack("u1", &manifest("pack-u", "1.0", &[]), "");
+        owner.add_viewer("pack-u", "v1");
+        (owner, up, viewer)
+    }
+
+    #[test]
+    fn fake_usage_records_for_viewers_only() {
+        let (owner, up, viewer) = usage_pack();
+        let stranger = owner.add_user("s1", "Stranger", None);
+        let editor = owner.add_user("e1", "Editor", None);
+        owner.add_editor("pack-u", "e1");
+
+        for who in [&owner, &up, &editor] {
+            assert_eq!(who.report_downloaded("pack-u"), Ok(false));
+            assert_eq!(who.report_used("pack-u", 1000), Ok(false));
+        }
+        assert_eq!((owner.last_downloaded("pack-u"), owner.download_count("pack-u"), owner.last_used("pack-u")), (None, 0, None));
+
+        assert_eq!(stranger.report_downloaded("pack-u").unwrap_err().code, "pack_gone");
+        assert_eq!(stranger.report_used("pack-u", 1000).unwrap_err().code, "pack_gone");
+        assert_eq!(viewer.report_downloaded("no-such-pack").unwrap_err().code, "pack_gone");
+
+        assert_eq!(viewer.report_downloaded("pack-u"), Ok(true));
+        assert_eq!(viewer.report_downloaded("pack-u"), Ok(true));
+        assert_eq!(owner.download_count("pack-u"), 2);
+        assert!(owner.last_downloaded("pack-u").is_some());
+    }
+
+    #[test]
+    fn fake_usage_keeps_the_newest_time_and_ignores_the_future() {
+        let (owner, _, viewer) = usage_pack();
+        viewer.report_downloaded("pack-u").unwrap();
+        let now = owner.last_downloaded("pack-u").unwrap();
+        assert_eq!(viewer.report_used("pack-u", now - 10), Ok(true));
+        assert_eq!(viewer.report_used("pack-u", now - 20), Ok(true));
+        assert_eq!(owner.last_used("pack-u"), Some(now - 10));
+        assert_eq!(viewer.report_used("pack-u", now + 301), Ok(false));
+        assert_eq!(owner.last_used("pack-u"), Some(now - 10));
+        assert_eq!(viewer.report_used("pack-u", now + 300), Ok(true));
+        assert_eq!(owner.last_used("pack-u"), Some(now + 300));
+        assert_eq!(viewer.report_used("pack-u", 0).unwrap_err().code, "bad_request");
+    }
+
+    #[test]
+    fn report_downloaded_posts_to_the_pack() {
+        let (base, req) = stub(reply("200 OK\r\nContent-Type: application/json", r#"{"recorded":true}"#));
+        assert_eq!(HttpServer::new(&base, Some("tok".into())).report_downloaded("my-pack"), Ok(true));
+        let raw = req.join().unwrap();
+        assert!(raw.starts_with("POST /packs/my-pack/downloaded HTTP/1.1\r\n"), "{}", raw);
+        assert!(raw.to_ascii_lowercase().contains("authorization: bearer tok\r\n"));
+    }
+
+    #[test]
+    fn report_used_posts_only_the_time() {
+        let (base, req) = stub(reply("200 OK\r\nContent-Type: application/json", r#"{"recorded":false}"#));
+        assert_eq!(HttpServer::new(&base, Some("tok".into())).report_used("my-pack", 1792871734), Ok(false));
+        let raw = req.join().unwrap();
+        assert!(raw.starts_with("POST /packs/my-pack/used HTTP/1.1\r\n"), "{}", raw);
+        assert!(raw.ends_with(r#"{"played_at":1792871734}"#), "{}", raw);
     }
 
     #[test]
