@@ -302,6 +302,67 @@ it("a change with a foreign origin is refused", async () => {
   }
 });
 
+const CHANGES: [string, string][] = [
+  ["DELETE", "/admin/api/packs/A"],
+  ["DELETE", "/admin/api/packs/A/hold"],
+  ["DELETE", "/admin/api/users/u1"],
+  ["POST", "/admin/api/cleanup"],
+  ["POST", "/admin/api/invites/uploader"],
+];
+
+async function snapshot() {
+  const out: Record<string, number> = {};
+  for (const t of ["users", "packs", "publishes", "invites", "blobs", "op_counts", "sessions"]) {
+    out[t] = await count(t);
+  }
+  return out;
+}
+
+it("every admin change refuses a foreign origin and a bearer token", async () => {
+  const token = await ownerToken();
+  await signIn("u1", "Una", "uploader");
+  await env.DB.batch([
+    env.DB.prepare(
+      "insert into packs (id, uploader_id, name, version, manifest, published_at) values ('A', 'u1', 'A', '1.0', '{}', 100)",
+    ),
+    env.DB.prepare(
+      "insert into publishes (id, pack_id, user_id, name, version, expires_at) values ('pub', 'A', 'u1', 'A', '2.0', ?)",
+    ).bind(nowSeconds() + 600),
+  ]);
+  const before = await snapshot();
+  const bearer = await signIn(env.OWNER_DISCORD_ID, "boss", "owner");
+  const sessions = await snapshot();
+
+  for (const [method, path] of CHANGES) {
+    const label = `${method} ${path}`;
+    for (const origin of ["https://evil.test", null, "null"]) {
+      const headers: Record<string, string> = { cookie: `ron_admin=${token}` };
+      if (origin !== null) headers.origin = origin;
+      const res = await raw(path, { method, headers });
+      expect(res.status, `${label} ${origin}`).toBe(403);
+      expect(await errorOf(res)).toBe("bad_origin");
+    }
+    const viaBearer = await api(path, { method, headers: { origin: env.PUBLIC_URL } }, bearer);
+    expect(viaBearer.status, label).toBe(401);
+    expect(await errorOf(viaBearer)).toBe("signed_out");
+  }
+  expect(await snapshot()).toEqual(sessions);
+  expect(sessions.packs).toBe(before.packs);
+  expect(sessions.publishes).toBe(before.publishes);
+  expect(await env.DB.prepare("select id from users where id = 'u1'").first()).not.toBeNull();
+});
+
+it("an admin cookie cannot remove a user through the app route", async () => {
+  const token = await ownerToken();
+  await signIn("u1", "Una", "uploader");
+  const res = await raw("/admin/users/u1", {
+    method: "DELETE",
+    headers: { cookie: `ron_admin=${token}`, origin: env.PUBLIC_URL },
+  });
+  expect(res.status).toBe(401);
+  expect(await env.DB.prepare("select id from users where id = 'u1'").first()).not.toBeNull();
+});
+
 it("a read does not need an origin", async () => {
   const token = await ownerToken();
   for (const method of ["GET", "HEAD"]) {
@@ -367,4 +428,19 @@ it("cleanup deletes only expired dashboard sessions", async () => {
   await cleanup(env, now);
   expect(await sessionRow(dead)).toBeNull();
   expect(await sessionRow(live)).not.toBeNull();
+});
+
+it("no name reaches innerHTML", async () => {
+  const body = await (await raw("/admin")).text();
+  for (const word of ["innerHTML", "insertAdjacentHTML", "document.write", "eval"]) {
+    expect(body).not.toContain(word);
+  }
+});
+
+it("the page has one nonced script and one nonced style", async () => {
+  const body = await (await raw("/admin")).text();
+  expect(body.match(/<script\b/g)).toHaveLength(1);
+  expect(body.match(/<style\b/g)).toHaveLength(1);
+  expect(body.match(/<script nonce="[^"]+">/g)).toHaveLength(1);
+  expect(body.match(/<style nonce="[^"]+">/g)).toHaveLength(1);
 });

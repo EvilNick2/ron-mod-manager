@@ -138,6 +138,20 @@ R2 enforces both signed headers. Checked live on 2026-10-26:
 
 So an object stored under `blobs/<sha256>` always has the bytes that hash names.
 
+## Dashboard
+
+The server owner can open `/admin` in a browser and sign in with Discord. The page shows storage used against the cap, storage over time, the operations budget, publishes in progress and leftover files. It also lists packs and people, and lets the owner delete a pack or remove a person. It needs no setup beyond the Discord app and `OWNER_DISCORD_ID` the server already uses.
+
+`EXTRA_BUCKET_LABEL` is an optional var that names the `EXTRA_BUCKET` segment in the storage bar. The default is `Other bucket`.
+
+A deleted pack frees its space over the next few hours as cleanup runs, and the bar shows those bytes as waiting for cleanup until then. The Clean up button on the page hurries it along.
+
+To deploy, apply migrations first and stop if that fails:
+
+```
+npx wrangler d1 migrations apply DB --remote && npx wrangler deploy
+```
+
 ## Cleanup
 
 A cron trigger runs every 15 minutes (`*/15 * * * *`). It removes abandoned publishes and unreferenced blobs. Each run deletes at most 40 objects, so a large backlog clears over several runs.
