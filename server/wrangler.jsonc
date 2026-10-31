@@ -14,7 +14,8 @@
     "MAX_USERS": "30",
     "OP_BUDGET": "900000",
     "R2_ACCOUNT_ID": "c87261db825e26bcb5ecc42cabb44402",
-    "R2_BUCKET_NAME": "ron-packs"
+    "R2_BUCKET_NAME": "ron-packs",
+    "EXTRA_BUCKET_LABEL": "Orpheus downloads"
   },
   "d1_databases": [
     {

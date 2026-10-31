@@ -1,3 +1,14 @@
+import {
+  adminCleanup,
+  adminClearHold,
+  adminDeletePack,
+  adminDeleteUser,
+  adminInviteUploader,
+  adminOverview,
+  adminPackDetail,
+  adminPacks,
+  adminPeople,
+} from "./admin/api";
 import { adminLogout, adminPage } from "./admin/session";
 import { nowSeconds } from "./auth";
 import { cleanup } from "./cleanup";
@@ -31,6 +42,7 @@ import {
   publishUrls,
   verifyPublish,
 } from "./publish";
+import { takeSample } from "./storage";
 import { recordDownload, recordUse } from "./usage";
 import { adminLogin, authCallback, authLogout, authStart, authToken } from "./signin";
 
@@ -48,6 +60,11 @@ const routes: Record<string, Handler> = {
   "GET /admin": () => adminPage(),
   "GET /admin/login": (_req, env) => adminLogin(env),
   "POST /admin/api/logout": (req, env) => adminLogout(req, env),
+  "GET /admin/api/overview": (req, env) => adminOverview(req, env),
+  "GET /admin/api/packs": (req, env) => adminPacks(req, env),
+  "GET /admin/api/people": (req, env) => adminPeople(req, env),
+  "POST /admin/api/invites/uploader": (req, env) => adminInviteUploader(req, env),
+  "POST /admin/api/cleanup": (req, env) => adminCleanup(req, env),
 };
 
 type CodeHandler = (req: Request, env: Env, ...params: string[]) => Promise<Response> | Response;
@@ -76,6 +93,10 @@ const dynamicRoutes: { method: string; pattern: RegExp; handler: CodeHandler }[]
   { method: "DELETE", pattern: /^\/packs\/([^/]+)\/hold$/, handler: clearHold },
   { method: "DELETE", pattern: /^\/packs\/([^/]+)\/membership$/, handler: leavePack },
   { method: "DELETE", pattern: /^\/packs\/([^/]+)$/, handler: removePack },
+  { method: "GET", pattern: /^\/admin\/api\/packs\/([^/]+)$/, handler: adminPackDetail },
+  { method: "DELETE", pattern: /^\/admin\/api\/packs\/([^/]+)$/, handler: adminDeletePack },
+  { method: "DELETE", pattern: /^\/admin\/api\/packs\/([^/]+)\/hold$/, handler: adminClearHold },
+  { method: "DELETE", pattern: /^\/admin\/api\/users\/([^/]+)$/, handler: adminDeleteUser },
   { method: "DELETE", pattern: /^\/admin\/users\/([^/]+)$/, handler: removeUser },
 ];
 
@@ -103,6 +124,10 @@ export default {
     }
   },
   async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
-    await cleanup(env, nowSeconds());
+    const now = nowSeconds();
+    const results = await Promise.allSettled([takeSample(env, now), cleanup(env, now)]);
+    for (const r of results) if (r.status === "rejected") console.error(r.reason);
+    const failed = results.find((r) => r.status === "rejected");
+    if (failed) throw failed.reason;
   },
 } satisfies ExportedHandler<Env>;
