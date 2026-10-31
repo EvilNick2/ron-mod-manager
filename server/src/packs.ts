@@ -2,16 +2,16 @@ import { requireUser, type User } from "./auth";
 import type { Env } from "./env";
 import { HttpError, json } from "./http";
 
-const PACK_ID = /^[A-Za-z0-9-]{1,64}$/;
+export const PACK_ID = /^[A-Za-z0-9-]{1,64}$/;
 const HASH = /^[0-9a-f]{64}$/;
 
 // Binds: owner flag, user id, user id, user id. Applies to a `packs p` row.
-const VISIBLE = `p.manifest is not null and p.published_at is not null and (
+export const VISIBLE = `p.manifest is not null and p.published_at is not null and (
   ? = 1 or p.uploader_id = ?
   or exists (select 1 from pack_editors e where e.pack_id = p.id and e.user_id = ?)
   or exists (select 1 from pack_viewers v where v.pack_id = p.id and v.user_id = ?))`;
 
-const isOwner = (role: User["role"]) => (role === "owner" ? 1 : 0);
+export const isOwner = (role: User["role"]) => (role === "owner" ? 1 : 0);
 
 export async function visiblePacks(env: Env, user: User) {
   const rows = await env.DB.prepare(

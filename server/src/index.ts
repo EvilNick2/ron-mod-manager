@@ -30,6 +30,7 @@ import {
   publishUrls,
   verifyPublish,
 } from "./publish";
+import { recordDownload, recordUse } from "./usage";
 import { authCallback, authLogout, authStart, authToken } from "./signin";
 
 type Handler = (req: Request, env: Env, url: URL) => Promise<Response> | Response;
@@ -57,6 +58,8 @@ const dynamicRoutes: { method: string; pattern: RegExp; handler: CodeHandler }[]
   { method: "POST", pattern: /^\/publishes\/([^/]+)\/urls$/, handler: publishUrls },
   { method: "POST", pattern: /^\/publishes\/([^/]+)\/verify$/, handler: verifyPublish },
   { method: "POST", pattern: /^\/publishes\/([^/]+)\/commit$/, handler: commitPublish },
+  { method: "POST", pattern: /^\/packs\/([^/]+)\/downloaded$/, handler: recordDownload },
+  { method: "POST", pattern: /^\/packs\/([^/]+)\/used$/, handler: recordUse },
   { method: "DELETE", pattern: /^\/publishes\/([^/]+)$/, handler: cancelPublish },
   { method: "GET", pattern: /^\/i\/([^/]+)$/, handler: (_req, env, code) => invitePage(env, code) },
   { method: "POST", pattern: /^\/packs\/([^/]+)\/invite$/, handler: packInvite },
