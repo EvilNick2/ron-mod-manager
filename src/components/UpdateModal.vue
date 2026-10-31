@@ -1,10 +1,9 @@
 <script setup lang="ts">
 import { invoke } from "@tauri-apps/api/core";
-import { X, Download, ExternalLink, RefreshCw } from "lucide-vue-next";
+import { X, Download, RefreshCw } from "lucide-vue-next";
 import { computed, onMounted, ref } from "vue";
-import { marked } from "marked";
-import DOMPurify from "dompurify";
 import { store } from "../store";
+import ReleaseNotesList, { type ReleaseNotesEntry } from "./ReleaseNotesList.vue";
 
 type ReleaseEntry = {
   version: string;
@@ -59,21 +58,20 @@ const newerReleaseHistory = computed(() => {
     .sort((left, right) => compareVersions(right.version, left.version));
 });
 
+const newerReleaseEntries = computed<ReleaseNotesEntry[]>(() => newerReleaseHistory.value.map((release) => ({
+  version: release.version,
+  publishedAt: release.publishedAt ? new Date(release.publishedAt).toLocaleDateString() : publishedDate.value,
+  notes: release.notes,
+  url: release.url,
+  latest: normalizeVersion(release.version) === normalizeVersion(store.updateInfo?.version),
+})));
+
 
 // The version heading repeats the card header and commit links mean nothing to players
 function renderNotes(body: string): string {
-  const cleaned = body
+  return body
     .replace(/^#{1,3} \[?\d+\.\d+\.\d+.*$/m, "")
     .replace(/ \(\[[0-9a-f]{7,40}\]\([^)]*\)\)/g, "");
-  return DOMPurify.sanitize(marked.parse(cleaned, { async: false, gfm: true, breaks: true }));
-}
-
-// Links in the notes open in the system browser, not inside the app window
-function onNotesClick(event: MouseEvent) {
-  const link = (event.target as HTMLElement).closest("a");
-  if (!link) return;
-  event.preventDefault();
-  void openExternalUrl(link.href);
 }
 
 async function loadReleaseHistory() {
@@ -120,16 +118,6 @@ async function installUpdate() {
   }
 }
 
-async function openExternalUrl(url: string) {
-  if (!url) return;
-
-  try {
-    await invoke("open_browser_url", { url });
-  } catch (e) {
-    console.error("Failed to open URL:", e);
-  }
-}
-
 function closeModal() {
   if (store.isUpdatingApp) return;
   store.isUpdateModalOpen = false;
@@ -159,26 +147,7 @@ function closeModal() {
       <div class="update-details">
         <p class="details-label">Release Notes for Newer Versions</p>
 
-        <ul class="release-history-list" v-if="newerReleaseHistory.length > 0">
-          <li class="release-history-item" v-for="release in newerReleaseHistory" :key="release.version + release.publishedAt">
-            <div class="release-history-item__header">
-              <div class="release-history-item__version-row">
-                <span class="release-history-item__version">v{{ release.version }}</span>
-                <span class="status-pill status-ready" v-if="normalizeVersion(release.version) === normalizeVersion(store.updateInfo?.version)">Latest</span>
-              </div>
-              <span class="release-history-item__date">
-                {{ release.publishedAt ? new Date(release.publishedAt).toLocaleDateString() : publishedDate }}
-              </span>
-            </div>
-
-            <div class="release-history-item__notes" v-html="release.notes" @click="onNotesClick"></div>
-
-            <button class="release-link" @click="openExternalUrl(release.url)" :disabled="!release.url">
-              <ExternalLink :size="14" />
-              Open release page
-            </button>
-          </li>
-        </ul>
+        <ReleaseNotesList v-if="newerReleaseEntries.length > 0" :entries="newerReleaseEntries" />
 
         <p class="muted small" v-else-if="historyLoading">Loading release history…</p>
         <p class="error-text" v-else-if="historyError">{{ historyError }}</p>
@@ -292,124 +261,6 @@ function closeModal() {
   color: var(--muted, var(--text-muted));
 }
 
-.release-history-list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  max-height: 360px;
-  overflow-y: auto;
-}
-
-.release-history-item {
-  border: 1px solid var(--border, var(--border-light));
-  border-radius: 6px;
-  background: var(--surface, var(--bg-dark));
-  padding: 10px;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.release-history-item__header {
-  display: flex;
-  justify-content: space-between;
-  gap: 8px;
-  align-items: baseline;
-}
-
-.release-history-item__version-row {
-  display: inline-flex;
-  gap: 8px;
-  align-items: center;
-}
-
-.release-history-item__version {
-  font-size: 1.25rem;
-  font-weight: 700;
-}
-
-.release-history-item__date {
-  color: var(--muted, var(--text-muted));
-  font-size: 12px;
-}
-
-.release-history-item__notes {
-  font-size: 13px;
-  line-height: 1.5;
-}
-
-.release-history-item__notes :deep(h2),
-.release-history-item__notes :deep(h3) {
-  margin: 0.75rem 0 0.25rem;
-  font-size: 13px;
-  font-weight: 700;
-  color: var(--text-main);
-}
-
-.release-history-item__notes :deep(h2:first-child),
-.release-history-item__notes :deep(h3:first-child) {
-  margin-top: 0;
-}
-
-.release-history-item__notes :deep(ul) {
-  margin: 0;
-  padding-left: 1.25rem;
-}
-
-.release-history-item__notes :deep(p) {
-  margin: 0 0 0.5rem;
-}
-
-.release-history-item__notes :deep(a) {
-  color: var(--accent-primary);
-}
-
-.release-history-item__notes :deep(code) {
-  font-size: 12px;
-  background: var(--bg-card);
-  padding: 0 4px;
-  border-radius: 4px;
-}
-
-.status-pill {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  padding: 4px 8px;
-  border-radius: 999px;
-  font-size: 12px;
-  font-weight: 600;
-  border: 1px solid var(--border, var(--border-light));
-  background: var(--secondary-surface, var(--bg-card));
-}
-
-.status-ready {
-  color: var(--success-text, #1f6b3f);
-  background: var(--success-bg, rgba(21, 128, 61, 0.12));
-  border-color: var(--success-border, rgba(21, 128, 61, 0.2));
-}
-
-.release-link {
-  border: 1px solid var(--border, var(--border-light));
-  background: var(--button-bg, var(--bg-card));
-  color: var(--button-text, var(--text-main));
-  border-radius: 6px;
-  padding: 7px 9px;
-  display: inline-flex;
-  gap: 6px;
-  align-items: center;
-  justify-content: center;
-  font-weight: 600;
-  cursor: pointer;
-}
-
-.release-link:hover:enabled {
-  background: var(--button-hover, var(--bg-hover));
-}
-
 .action-row {
   margin-top: 12px;
   display: flex;
@@ -442,7 +293,6 @@ function closeModal() {
 
 .primary-btn:disabled,
 .secondary-btn:disabled,
-.release-link:disabled,
 .close-btn:disabled {
   opacity: 0.7;
   cursor: not-allowed;

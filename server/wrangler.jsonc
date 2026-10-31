@@ -1,0 +1,38 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "ron-pack-server",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-01-15",
+  "compatibility_flags": ["nodejs_compat"],
+  "routes": [{ "pattern": "packs.evilnick.net", "custom_domain": true }],
+  "triggers": { "crons": ["*/15 * * * *"] },
+  "vars": {
+    "OWNER_DISCORD_ID": "391839189160951808",
+    "DISCORD_CLIENT_ID": "1564087255948070942",
+    "PUBLIC_URL": "https://packs.evilnick.net",
+    "STORAGE_CAP_BYTES": "20000000000",
+    "MAX_USERS": "30",
+    "OP_BUDGET": "900000",
+    "R2_ACCOUNT_ID": "c87261db825e26bcb5ecc42cabb44402",
+    "R2_BUCKET_NAME": "ron-packs"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "ron-packs",
+      "database_id": "fa514595-4523-4165-87e9-854d21c0500d",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "r2_buckets": [
+    { "binding": "PACKS", "bucket_name": "ron-packs" },
+    { "binding": "EXTRA_BUCKET", "bucket_name": "downloads" }
+  ],
+  "ratelimits": [
+    {
+      "name": "USER_LIMIT",
+      "namespace_id": "1001",
+      "simple": { "limit": 300, "period": 60 }
+    }
+  ]
+}

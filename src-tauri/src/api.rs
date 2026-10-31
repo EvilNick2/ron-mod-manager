@@ -47,9 +47,38 @@ pub async fn fetch_mod_metadata(game_domain: String, mod_id: u32) -> Result<Valu
     }
 }
 
+pub fn fetch_mod_changelogs_blocking(game_domain: &str, mod_id: u32) -> Result<Value, String> {
+    let api_key = crate::config::get_api_key()?.ok_or("No API key found. Please log in first.")?;
+    let url = format!("https://api.nexusmods.com/v1/games/{}/mods/{}/changelogs.json", game_domain, mod_id);
+    let mut headers = HeaderMap::new();
+    headers.insert("apikey", HeaderValue::from_str(&api_key).map_err(|e| e.to_string())?);
+    headers.insert("accept", HeaderValue::from_static("application/json"));
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let res = client.get(&url).headers(headers).send().map_err(|e| e.to_string())?;
+    if res.status().is_success() {
+        res.json::<Value>().map_err(|e| e.to_string())
+    } else {
+        Err(format!("Nexus API Error: {}", res.status()))
+    }
+}
+
+// Only web pages go to the browser, never file: or other schemes the system could hand to an app
+fn browser_url(url: &str) -> Result<reqwest::Url, String> {
+    let parsed = reqwest::Url::parse(url.trim()).map_err(|_| format!("Not a web link: {}", url))?;
+    match parsed.scheme() {
+        "http" | "https" => Ok(parsed),
+        _ => Err(format!("Not a web link: {}", url)),
+    }
+}
+
 #[tauri::command]
 pub fn open_browser_url(app_handle: tauri::AppHandle, url: String) -> Result<(), String> {
-    app_handle.opener().open_url(&url, None::<&str>)
+    let url = browser_url(&url)?;
+    app_handle.opener().open_url(url.as_str(), None::<&str>)
         .map_err(|e| format!("Failed to open browser: {}", e))
 }
 
@@ -318,4 +347,18 @@ pub async fn download_online_mod(app_handle: tauri::AppHandle, game_domain: Stri
     std::fs::remove_file(temp_zip).ok();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod browser_url_tests {
+    use super::browser_url;
+
+    #[test]
+    fn only_web_links_open() {
+        assert!(browser_url("https://www.nexusmods.com/readyornot/mods/1").is_ok());
+        assert!(browser_url("http://example.com/").is_ok());
+        for bad in ["file:///etc/passwd", "javascript:alert(1)", "smb://host/share", "steam://run/1144200", "not a url", ""] {
+            assert!(browser_url(bad).is_err(), "{} should be refused", bad);
+        }
+    }
 }

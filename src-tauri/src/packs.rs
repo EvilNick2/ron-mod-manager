@@ -3,7 +3,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
+use crate::server::{RemoteManifest, VersionEntry};
+
 const MANIFEST_FILE: &str = "pack.json";
+const SERVER_KIND: &str = "server";
+pub const CHANGELOG_FILE: &str = "changelog.json";
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct PackRef {
@@ -15,8 +19,16 @@ pub struct PackRef {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 pub struct PackSource {
     pub kind: String,
-    pub folder_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invite: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uploader: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
@@ -27,7 +39,9 @@ pub struct InstalledMod {
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 pub struct Published {
-    pub folder_id: String,
+    /// The pack server it was published to. None for a pack published to Google Drive, which counts as never published.
+    #[serde(default)]
+    pub server: Option<String>,
     pub dirty: bool,
 }
 
@@ -57,6 +71,43 @@ pub struct PackManifest {
     pub local_hashes: BTreeMap<String, CachedHash>,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(default)]
+pub struct ModState {
+    pub name: String,
+    pub version: Option<String>,
+    pub hash: String,
+    pub nexus_mod_id: Option<u32>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(default)]
+pub struct BaseSnapshot {
+    pub name: String,
+    pub version: Option<String>,
+    /// Keyed by mod id
+    pub mods: BTreeMap<String, ModState>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(default)]
+pub struct Changelog {
+    /// Newest first
+    pub entries: Vec<VersionEntry>,
+    pub base: Option<BaseSnapshot>,
+}
+
+pub fn read_changelog(pack_dir: &Path) -> Changelog {
+    fs::read_to_string(pack_dir.join(CHANGELOG_FILE))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+pub fn write_changelog(pack_dir: &Path, c: &Changelog) -> Result<(), String> {
+    write_json(pack_dir, CHANGELOG_FILE, c)
+}
+
 pub fn read_manifest(pack_dir: &Path) -> Option<PackManifest> {
     let path = pack_dir.join(MANIFEST_FILE);
     let content = fs::read_to_string(&path).ok()?;
@@ -66,10 +117,14 @@ pub fn read_manifest(pack_dir: &Path) -> Option<PackManifest> {
 }
 
 pub fn write_manifest(pack_dir: &Path, m: &PackManifest) -> Result<(), String> {
-    let json = serde_json::to_string_pretty(m).map_err(|e| e.to_string())?;
-    let tmp = pack_dir.join(format!("{}.tmp", MANIFEST_FILE));
+    write_json(pack_dir, MANIFEST_FILE, m)
+}
+
+fn write_json(pack_dir: &Path, name: &str, value: &impl Serialize) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(value).map_err(|e| e.to_string())?;
+    let tmp = pack_dir.join(format!("{}.tmp", name));
     fs::write(&tmp, json).map_err(|e| e.to_string())?;
-    fs::rename(&tmp, pack_dir.join(MANIFEST_FILE)).map_err(|e| {
+    fs::rename(&tmp, pack_dir.join(name)).map_err(|e| {
         let _ = fs::remove_file(&tmp);
         e.to_string()
     })
@@ -84,6 +139,27 @@ pub fn ensure_pack_editable(mods_dir: &Path, pack_id: &str) -> Result<(), String
     }
 }
 
+// A Drive link or no link can publish. A link to a creator on a server cannot.
+pub fn ensure_pack_publishable(mods_dir: &Path, pack_id: &str) -> Result<(), String> {
+    match read_manifest(&mods_dir.join(pack_id)) {
+        Some(m) if m.source.as_ref().is_some_and(|s| s.kind == SERVER_KIND) => {
+            Err(format!("{} is linked to its creator. Fork it to make changes.", m.name))
+        }
+        _ => Ok(()),
+    }
+}
+
+pub fn installed_from(manifest: &RemoteManifest) -> BTreeMap<String, InstalledMod> {
+    manifest
+        .mods
+        .iter()
+        .map(|m| {
+            let files = m.files.iter().map(|f| (f.path.clone(), f.sha256.to_ascii_lowercase())).collect();
+            (m.id.clone(), InstalledMod { hash: m.hash.clone(), files })
+        })
+        .collect()
+}
+
 pub fn ensure_editable(mods_dir: &Path, key: &str) -> Result<(), String> {
     match parse_key(key) {
         Ok(KeyKind::Pack { pack_id, .. }) => ensure_pack_editable(mods_dir, &pack_id),
@@ -94,7 +170,8 @@ pub fn ensure_editable(mods_dir: &Path, key: &str) -> Result<(), String> {
 pub fn mark_pack_dirty(mods_dir: &Path, pack_id: &str) {
     let pack_dir = mods_dir.join(pack_id);
     let Some(mut m) = read_manifest(&pack_dir) else { return };
-    let Some(published) = m.published.as_mut() else { return };
+    // A Drive-era publish counts as never published
+    let Some(published) = m.published.as_mut().filter(|p| p.server.is_some()) else { return };
     if published.dirty {
         return;
     }
@@ -348,10 +425,44 @@ mod tests {
     }
 
     #[test]
+    fn drive_source_still_parses() {
+        let m = scratch("drivesource");
+        let old = r#"{"pack_id":"CS","name":"CS","version":"1","mod_ids":[],"imported_at":5,
+            "source":{"kind":"drive","folder_id":"F","resource_key":null}}"#;
+        fs::write(m.join("pack.json"), old).unwrap();
+        let source = read_manifest(&m).unwrap().source.unwrap();
+        assert_eq!(source.kind, "drive");
+        assert_eq!(source.folder_id.as_deref(), Some("F"));
+        assert_eq!((source.server, source.invite, source.uploader), (None, None, None));
+    }
+
+    #[test]
+    fn changelog_round_trips_and_defaults() {
+        let m = scratch("changelog");
+        assert_eq!(read_changelog(&m), Changelog::default());
+        fs::write(m.join("changelog.json"), b"{broken").unwrap();
+        assert_eq!(read_changelog(&m), Changelog::default());
+        fs::write(m.join("changelog.json"), br#"{"entries":[{"version":"1","published_at":3,"notes":"n"}]}"#).unwrap();
+        assert_eq!(read_changelog(&m).entries.len(), 1);
+        assert!(read_changelog(&m).base.is_none());
+
+        let mods = BTreeMap::from([("3063".to_string(), ModState { name: "Vests".into(), hash: "h".into(), ..Default::default() })]);
+        let c = Changelog {
+            entries: vec![VersionEntry { version: "2".into(), published_at: 9, notes: "x".into(), publisher: None }],
+            base: Some(BaseSnapshot { name: "CS".into(), version: Some("1".into()), mods }),
+        };
+        write_changelog(&m, &c).unwrap();
+        assert_eq!(read_changelog(&m), c);
+        let mut names: Vec<_> = fs::read_dir(&m).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        names.sort();
+        assert_eq!(names, ["changelog.json"]);
+    }
+
+    #[test]
     fn linked_pack_refuses_edits() {
         let mods = scratch("linked");
         put_pack(&mods, "CS", "Casual Shitters", |m| {
-            m.source = Some(PackSource { kind: "drive".into(), folder_id: "f".into(), resource_key: None });
+            m.source = Some(PackSource { kind: "drive".into(), folder_id: Some("f".into()), ..Default::default() });
         });
         assert_eq!(ensure_editable(&mods, "CS/3063").unwrap_err(),
             "Casual Shitters is linked to its creator. Fork it to make changes.");
@@ -364,7 +475,7 @@ mod tests {
     #[test]
     fn mark_dirty_only_touches_published() {
         let mods = scratch("dirty");
-        put_pack(&mods, "Pub", "Pub", |m| m.published = Some(Published { folder_id: "f".into(), dirty: false }));
+        put_pack(&mods, "Pub", "Pub", |m| m.published = Some(Published { server: Some("https://packs.test".into()), dirty: false }));
         put_pack(&mods, "Plain", "Plain", |_| {});
         let before = fs::read(mods.join("Plain/pack.json")).unwrap();
         mark_dirty(&mods, "Plain/3063");
@@ -373,5 +484,10 @@ mod tests {
         mark_dirty(&mods, "Pub/3063");
         assert!(read_manifest(&mods.join("Pub")).unwrap().published.unwrap().dirty);
         mark_dirty(&mods, "5543");
+
+        put_pack(&mods, "Drive", "Drive", |m| m.published = Some(Published { server: None, dirty: false }));
+        let before = fs::read(mods.join("Drive/pack.json")).unwrap();
+        mark_dirty(&mods, "Drive/3063");
+        assert_eq!(fs::read(mods.join("Drive/pack.json")).unwrap(), before);
     }
 }

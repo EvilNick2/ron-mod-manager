@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import { computed } from "vue";
 import { store } from "../store";
-import { cancelPackOp, canCancel, hasVisibleOps, opName, progressAmount, progressLine, progressPercent } from "../packActions";
+import {
+  cancelPackOp, canCancel, hasVisibleOps, opName, progressAmount, progressLine, progressPercent, SIGN_IN_PREFIX
+} from "../packActions";
 
 const ops = computed(() => Object.keys(store.inFlight)
   .filter((id) => !store.progressHidden[id])
@@ -16,6 +18,11 @@ const ops = computed(() => Object.keys(store.inFlight)
     };
   }));
 
+const title = computed(() => {
+  if (ops.value.length > 0 && ops.value.every((op) => op.key.startsWith(SIGN_IN_PREFIX))) return "Signing In";
+  return ops.value.length > 1 ? "Modpacks In Progress" : "Modpack In Progress";
+});
+
 function hide() {
   for (const id of Object.keys(store.inFlight)) store.progressHidden[id] = true;
 }
@@ -25,7 +32,7 @@ function hide() {
   <transition name="fade">
     <div v-if="hasVisibleOps()" class="modal-overlay">
       <div class="progress-modal">
-        <h2 class="modal-title">{{ ops.length > 1 ? "Modpacks In Progress" : "Modpack In Progress" }}</h2>
+        <h2 class="modal-title">{{ title }}</h2>
         <div v-for="op in ops" :key="op.key" class="op">
           <p class="op-name">{{ op.name }}</p>
           <p class="op-line">{{ op.line }}</p>

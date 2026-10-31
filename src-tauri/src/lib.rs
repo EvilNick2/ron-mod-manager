@@ -1,10 +1,12 @@
+mod accounts;
 mod api;
+mod changelog;
 mod config;
-mod drive;
-mod google;
 mod hashing;
+mod manage;
 mod packs;
 mod publish;
+mod server;
 mod sso;
 mod subscribe;
 mod updater;
@@ -26,6 +28,7 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
+            accounts::init(app.handle());
             // Runs before the window loads, so before the first scan and before any op can stage
             // Listed now, removed off the main thread so a large leftover does not delay the window
             if let Ok(mods_dir) = vfs::get_mods_dir(app.handle()) {
@@ -55,19 +58,37 @@ pub fn run() {
             config::get_default_storage_path,
             config::auto_detect_game_path,
             config::get_api_key,
-            google::google_status,
-            google::google_sign_in,
-            google::google_sign_out,
+            accounts::list_servers,
+            accounts::sign_in_server,
+            accounts::cancel_sign_in,
+            accounts::sign_out_server,
+            manage::pack_invite_link,
+            manage::reset_pack_invite,
+            manage::pack_viewers,
+            manage::remove_pack_viewer,
+            manage::pack_editor_invite_link,
+            manage::pack_editors,
+            manage::remove_pack_editor,
+            manage::clear_publish_hold,
+            manage::pack_access,
+            manage::leave_pack,
+            manage::delete_server_pack,
+            manage::uploader_invite_link,
+            manage::server_users,
+            manage::remove_server_user,
             publish::publish_pack_cmd,
             publish::list_dirty_packs,
             publish::force_close,
             subscribe::inspect_pack_link,
             subscribe::add_pack_from_link,
             subscribe::check_pack_updates,
+            subscribe::pack_changelog,
             subscribe::update_linked_pack,
             subscribe::verify_linked_pack,
             subscribe::redownload_mods,
             subscribe::cancel_pack_op,
+            subscribe::preview_switch,
+            subscribe::switch_pack,
             config::save_preset,
             config::delete_preset,
             config::load_presets,
@@ -91,6 +112,7 @@ pub fn run() {
             vfs::load_packs,
             vfs::delete_pack,
             vfs::fork_pack,
+            vfs::create_pack,
             vfs::get_pack_size,
             vfs::export_preset,
             vfs::pick_preset_archive,

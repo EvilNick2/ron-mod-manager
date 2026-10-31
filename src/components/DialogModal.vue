@@ -12,7 +12,8 @@ const card = ref<HTMLElement | null>(null);
 let restoreFocus: HTMLElement | null = null;
 
 const hasInput = computed(() => current.value?.kind === "prompt" || current.value?.kind === "copy");
-const hasCancel = computed(() => current.value?.kind === "confirm" || current.value?.kind === "prompt");
+const hasCancel = computed(() => ["confirm", "prompt", "choice"].includes(current.value?.kind ?? ""));
+const isChoice = computed(() => current.value?.kind === "choice");
 
 watch(() => current.value?.id, async (_id, previous) => {
   const d = current.value;
@@ -31,6 +32,8 @@ watch(() => current.value?.id, async (_id, previous) => {
   if (hasInput.value && input.value) {
     input.value.focus();
     input.value.select();
+  } else if (d.kind === "choice") {
+    card.value?.querySelector<HTMLButtonElement>(".choice-btn")?.focus();
   } else if (d.danger && cancel.value) {
     cancel.value.focus();
   } else {
@@ -45,7 +48,7 @@ function settle(result: boolean | string | null) {
 
 function confirmDialog() {
   const d = current.value;
-  if (!d) return;
+  if (!d || d.kind === "choice") return;
   if (d.kind === "prompt") {
     const message = d.validate?.(value.value) ?? null;
     if (message) {
@@ -120,9 +123,17 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown, { capture
           @input="onInput"
         />
         <p v-if="error" class="dialog-error">{{ error }}</p>
+        <div v-if="isChoice" class="choice-list">
+          <button
+            v-for="choice in current.choices ?? []"
+            :key="choice.value"
+            class="choice-btn"
+            @click="settle(choice.value)"
+          >{{ choice.label }}</button>
+        </div>
         <div class="modal-actions">
           <button v-if="hasCancel" ref="cancel" class="secondary-btn" @click="cancelDialog">{{ current.cancelLabel }}</button>
-          <button ref="primary" class="primary-btn" @click="confirmDialog">{{ current.confirmLabel }}</button>
+          <button v-if="!isChoice" ref="primary" class="primary-btn" @click="confirmDialog">{{ current.confirmLabel }}</button>
         </div>
       </div>
     </div>
@@ -206,6 +217,36 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown, { capture
   font-size: 0.85rem;
   line-height: 1.4;
   margin: -0.5rem 0 1rem;
+}
+
+.choice-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin: 0 0 1rem;
+}
+
+.choice-btn {
+  background: var(--bg-card);
+  border: 1px solid var(--border-light);
+  border-radius: 8px;
+  color: var(--text-main);
+  font-size: 0.95rem;
+  font-weight: 600;
+  padding: 0.75rem 1rem;
+  text-align: left;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.choice-btn:hover {
+  background: var(--bg-hover);
+  border-color: var(--text-muted);
+}
+
+.choice-btn:focus-visible {
+  outline: 2px solid var(--text-main);
+  outline-offset: 2px;
 }
 
 .modal-actions {

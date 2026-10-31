@@ -1,4 +1,4 @@
-import { reactive } from 'vue';
+import { reactive, watch } from 'vue';
 
 export interface PackManifest {
   pack_id: string;
@@ -6,9 +6,28 @@ export interface PackManifest {
   version: string | null;
   mod_ids: string[];
   imported_at: number;
-  source?: { kind: string; folder_id: string; resource_key: string | null };
+  source?: {
+    kind: string;
+    server?: string;
+    folder_id?: string;
+    resource_key?: string;
+    invite?: string;
+    uploader?: string;
+  };
   installed_hashes?: Record<string, { hash: string; files: Record<string, string> }>;
-  published?: { folder_id: string; dirty: boolean };
+  published?: { server: string | null; dirty: boolean };
+}
+
+export interface ServerUser {
+  id: string;
+  name: string;
+  role: string | null;
+}
+
+export interface ServerStatus {
+  base: string;
+  signed_in: boolean;
+  user: ServerUser | null;
 }
 
 export interface PackRef {
@@ -39,13 +58,15 @@ export interface ModRef {
 
 export interface UpdateCheck {
   pack_id: string;
-  status: "current" | "available" | "updating";
+  status: "current" | "available" | "error" | "unsupported";
   installed_version: string | null;
   remote_version: string | null;
   added: ModRef[];
   changed: ModRef[];
   removed: ModRef[];
   download_bytes: number;
+  error: string | null;
+  remote_publisher: string | null;
 }
 
 export interface CloseBlocked {
@@ -56,7 +77,7 @@ export interface CloseBlocked {
 
 export interface DialogRequest {
   id: number;
-  kind: "alert" | "confirm" | "prompt" | "copy";
+  kind: "alert" | "confirm" | "prompt" | "copy" | "choice";
   title: string;
   message: string;
   value: string;
@@ -64,7 +85,16 @@ export interface DialogRequest {
   cancelLabel: string;
   danger: boolean;
   validate?: (v: string) => string | null;
+  choices?: { label: string; value: string }[];
   resolve: (result: boolean | string | null) => void;
+}
+
+export interface PackChangelogRequest {
+  packId: string;
+  mode: "history" | "update";
+  // The size and counts line shown above the list in update mode
+  summary: string;
+  resolve: (update: boolean) => void;
 }
 
 export const store = reactive({
@@ -81,6 +111,7 @@ export const store = reactive({
   activeDeploymentFilter: "All" as "All" | "Enabled" | "Disabled",
   activePresetName: "" as string,
   selectedMod: null as any,
+  selectedPack: null as string | null,
   mods: [] as any[],
   onlineMods: [] as any[],
   isFetchingOnline: false,
@@ -103,7 +134,9 @@ export const store = reactive({
   awaitingDropForId: null as string | null,
   postInstallModId: null as string | null,
 
-  google: { signInAvailable: false, linksAvailable: false, email: null as string | null },
+  servers: [] as ServerStatus[],
+  packAccessFor: null as string | null,
+  serverAdminFor: null as string | null,
   packProgress: {} as Record<string, PackProgress>,
   inFlight: {} as Record<string, true>,
   opNames: {} as Record<string, string>,
@@ -111,5 +144,14 @@ export const store = reactive({
   cancelling: {} as Record<string, true>,
   dialogs: [] as DialogRequest[],
   packUpdates: {} as Record<string, UpdateCheck>,
+  packChangelog: null as PackChangelogRequest | null,
   closeBlocked: null as CloseBlocked | null
 });
+
+// The right panel shows one thing at a time, a mod or a pack
+watch(() => store.selectedPack, (id) => {
+  if (id) store.selectedMod = null;
+}, { flush: "sync" });
+watch(() => store.selectedMod, (mod) => {
+  if (mod) store.selectedPack = null;
+}, { flush: "sync" });

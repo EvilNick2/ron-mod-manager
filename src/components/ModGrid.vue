@@ -2,8 +2,8 @@
 import { store } from "../store";
 import { sectionMods, LOOSE_ID, type Section } from "../modSections";
 import {
-  applyPack, refreshMods as rescanMods, publishPack, copyText, folderLink, progressLine, checkPackUpdates, updatePack,
-  updateLine, isLinked
+  applyPack, refreshMods as rescanMods, publishPack, copyInviteLink, progressLine, checkPackUpdates, updatePack,
+  updateStatusLine, isLinked, canPublish
 } from "../packActions";
 import { showAlert, showConfirm } from "../dialogs";
 import { invoke } from "@tauri-apps/api/core";
@@ -187,7 +187,7 @@ function packOf(section: Section) {
 
 async function copySectionLink(section: Section) {
   const pack = packOf(section);
-  if (pack?.published) await copyText(folderLink(pack.published.folder_id));
+  if (pack) await copyInviteLink(pack);
 }
 
 async function applySectionPack(section: Section) {
@@ -416,7 +416,7 @@ async function refreshModsFromButton() {
         <input type="text" placeholder="Search mods..." class="search-bar" v-model="searchQuery" />
       </div>
       
-      <button class="btn add-mod-btn" @click="manualPickArchive" title="Install from .zip, .rar, or .pak archive">
+      <button class="btn add-mod-btn" @click="manualPickArchive" title="Install from .zip, .7z, .rar or .pak archive">
         <Plus :size="18" color="#22c55e" /> Add Mod
       </button>
 
@@ -434,7 +434,7 @@ async function refreshModsFromButton() {
       <div v-else-if="filteredMods.length === 0" style="grid-column: 1/-1; text-align: center; color: var(--text-muted); margin-top: 2rem;">
         <h3 v-if="store.currentMode === 'Installed' && store.mods.length === 0">No mods detected in local storage.</h3>
         <h3 v-else>No mods match your current search filters.</h3>
-        <p v-if="store.currentMode === 'Installed' && store.mods.length === 0">Drop a .zip, .rar, or .pak file anywhere to install a new mod!</p>
+        <p v-if="store.currentMode === 'Installed' && store.mods.length === 0">Drop a .zip, .7z, .rar or .pak file anywhere to install a new mod!</p>
       </div>
       
       <section
@@ -450,22 +450,22 @@ async function refreshModsFromButton() {
             <span v-if="section.version" class="section-version">{{ section.version }}</span>
           </button>
           <span v-if="section.isActive" class="section-active-tag">active</span>
-          <span v-if="packOf(section)?.published?.dirty" class="section-dirty-tag">Changes not uploaded</span>
+          <span v-if="packOf(section)?.published?.server && packOf(section)!.published!.dirty" class="section-dirty-tag">Changes not uploaded</span>
           <span class="section-count">{{ sectionCount(section) }}</span>
           <template v-if="packOf(section) && store.packUpdates[section.id]">
-            <span v-if="store.packUpdates[section.id].status === 'available'" class="section-update-tag">{{ updateLine(store.packUpdates[section.id]) }}</span>
-            <span v-else-if="store.packUpdates[section.id].status === 'updating'" class="section-update-tag">Being updated by its creator</span>
+            <span v-if="updateStatusLine(store.packUpdates[section.id])" class="section-update-tag">{{ updateStatusLine(store.packUpdates[section.id]) }}</span>
           </template>
           <span v-if="store.packProgress[section.id]" class="section-progress">{{ progressLine(store.packProgress[section.id]) }}</span>
           <div class="section-actions">
             <template v-if="packOf(section)">
               <button
-                v-if="store.google.email && !packOf(section)!.source"
+                v-if="canPublish() && packOf(section)!.source?.kind !== 'server'"
                 class="section-btn"
+                title="Publish modpack"
                 @click="publishPack(packOf(section)!)"
                 :disabled="!!store.inFlight[section.id]"
               >Publish</button>
-              <button v-if="packOf(section)!.published" class="section-btn" @click="copySectionLink(section)">Copy link</button>
+              <button v-if="packOf(section)!.published?.server" class="section-btn" @click="copySectionLink(section)">Copy invite link</button>
               <button
                 v-if="store.packUpdates[section.id]?.status === 'available'"
                 class="section-btn"

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { invoke } from "@tauri-apps/api/core";
 import { store } from "../store";
-import { refreshMods, loadGoogleStatus } from "../packActions";
+import { refreshMods, loadServers, signInServer, signOutServer, hostOf, checkPackUpdates, acceptInvite } from "../packActions";
 import { showAlert } from "../dialogs";
 import { onMounted, ref } from "vue";
 import { X, Globe, Crosshair, Info } from 'lucide-vue-next';
@@ -9,9 +9,10 @@ import { X, Globe, Crosshair, Info } from 'lucide-vue-next';
 const activeTab = ref("Global");
 const pendingGamePath = ref("");
 const pendingLaunchOptions = ref("");
-const googleBusy = ref(false);
+const serverBusy = ref<Record<string, "in" | "out">>({});
 
 onMounted(async () => {
+  loadServers();
   try {
     store.defaultModStoragePath = await invoke("get_default_storage_path");
     
@@ -87,29 +88,27 @@ async function saveGameConfig() {
   }
 }
 
-async function signInGoogle() {
-  googleBusy.value = true;
+async function signIn(base: string) {
+  serverBusy.value[base] = "in";
   try {
-    await invoke("google_sign_in");
-    await loadGoogleStatus();
+    if (await signInServer(base)) checkPackUpdates();
   } catch (e) {
-    console.error("Google sign-in failed:", e);
-    await showAlert("Failed to sign in with Google: " + e);
+    console.error("Pack server sign-in failed:", e);
+    await showAlert("Failed to sign in: " + e);
   } finally {
-    googleBusy.value = false;
+    delete serverBusy.value[base];
   }
 }
 
-async function signOutGoogle() {
-  googleBusy.value = true;
+async function signOut(base: string) {
+  serverBusy.value[base] = "out";
   try {
-    await invoke("google_sign_out");
-    await loadGoogleStatus();
+    await signOutServer(base);
   } catch (e) {
-    console.error("Google sign-out failed:", e);
-    await showAlert("Failed to sign out of Google: " + e);
+    console.error("Pack server sign-out failed:", e);
+    await showAlert("Failed to sign out: " + e);
   } finally {
-    googleBusy.value = false;
+    delete serverBusy.value[base];
   }
 }
 
@@ -162,18 +161,33 @@ async function toggleBlur(state: boolean) {
             </div>
           </div>
 
-          <div class="settings-section" v-if="store.google.signInAvailable">
-            <h3>Google Drive <Info :size="14" color="#3b82f6" class="info-icon" /></h3>
-            <p class="settings-desc" style="margin-bottom: 1rem;">Sign in to publish your modpacks to Google Drive and share them with a link.</p>
-            <div v-if="store.google.email" class="path-picker-row">
-              <span class="google-email">Signed in as {{ store.google.email }}</span>
-              <button class="secondary-action-btn" @click="signOutGoogle" :disabled="googleBusy">Sign out</button>
-            </div>
-            <div v-else>
-              <button class="action-btn" @click="signInGoogle" :disabled="googleBusy">
-                {{ googleBusy ? "Waiting for Google..." : "Sign in with Google" }}
+          <div class="settings-section">
+            <h3>Pack servers <Info :size="14" color="#3b82f6" class="info-icon" /></h3>
+            <p class="settings-desc" style="margin-bottom: 1rem;">Sign in with Discord to install modpacks from invite links and publish your own.</p>
+            <div v-for="server in store.servers" :key="server.base" class="server-row">
+              <div class="server-info">
+                <span class="server-host">{{ hostOf(server.base) }}</span>
+                <span class="server-user">
+                  {{ server.user ? `${server.user.name}${server.user.role ? ` (${server.user.role})` : ""}` : "Not signed in" }}
+                </span>
+              </div>
+              <button
+                v-if="server.user?.role === 'owner'"
+                class="secondary-action-btn"
+                @click="store.serverAdminFor = server.base"
+                :disabled="!!serverBusy[server.base]"
+              >Manage server</button>
+              <button
+                v-if="server.signed_in"
+                class="secondary-action-btn"
+                @click="signOut(server.base)"
+                :disabled="!!serverBusy[server.base]"
+              >Sign out</button>
+              <button v-else class="action-btn" @click="signIn(server.base)" :disabled="!!serverBusy[server.base]">
+                {{ serverBusy[server.base] === "in" ? "Waiting for Discord..." : "Sign in" }}
               </button>
             </div>
+            <button class="secondary-action-btn" style="margin-top: 0.75rem;" @click="acceptInvite()">Accept invite</button>
           </div>
 
           <div class="settings-section">
@@ -479,10 +493,31 @@ h3 {
   gap: 0.5rem;
 }
 
-.google-email {
+.server-row {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+  margin-bottom: 0.75rem;
+}
+
+.server-info {
   flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  min-width: 0;
+}
+
+.server-host {
   color: var(--text-main);
   font-size: 0.9rem;
+  font-weight: 600;
+  word-break: break-all;
+}
+
+.server-user {
+  color: var(--text-muted);
+  font-size: 0.85rem;
   word-break: break-all;
 }
 

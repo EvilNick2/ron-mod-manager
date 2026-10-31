@@ -216,6 +216,40 @@ pub fn strip_keys_from_presets(config: &mut AppConfig, removed_keys: &[String]) 
     }
 }
 
+// The pack shown as active follows it to its new id after a switch
+pub fn move_active_pack(config: &mut AppConfig, old_pack_id: &str, new_pack_id: &str) {
+    if config.active_preset.as_deref() == Some(format!("pack:{}", old_pack_id).as_str()) {
+        config.active_preset = Some(format!("pack:{}", new_pack_id));
+    }
+}
+
+// Preset keys of the old pack point at the new one where it has that mod, and are dropped where it does not
+pub fn rename_pack_in_presets(config: &mut AppConfig, old_pack_id: &str, new_pack_id: &str, new_keys: &[String]) {
+    let old_prefix = format!("{}/", old_pack_id);
+    let mut emptied: Vec<String> = Vec::new();
+    for (name, keys) in config.presets.iter_mut() {
+        let mut out: Vec<String> = Vec::with_capacity(keys.len());
+        for key in keys.drain(..) {
+            let key = match key.strip_prefix(&old_prefix) {
+                Some(id) => format!("{}/{}", new_pack_id, id),
+                None => key,
+            };
+            let gone = key.starts_with(&format!("{}/", new_pack_id)) && !new_keys.contains(&key);
+            if !gone && !out.contains(&key) {
+                out.push(key);
+            }
+        }
+        *keys = out;
+        if keys.is_empty() {
+            emptied.push(name.clone());
+        }
+    }
+    config.presets.retain(|_, keys| !keys.is_empty());
+    if config.active_preset.as_ref().is_some_and(|a| emptied.contains(a)) {
+        config.active_preset = None;
+    }
+}
+
 pub fn rename_key_in_presets(config: &mut AppConfig, old: &str, new: &str) {
     for keys in config.presets.values_mut() {
         let mut out: Vec<String> = Vec::with_capacity(keys.len());
@@ -271,6 +305,31 @@ mod tests {
         assert_eq!(c.presets["B"], ["CS/7000"]);
         assert_eq!(c.presets["C"], ["5"]);
         assert_eq!(c.active_preset.as_deref(), Some("A"));
+    }
+
+    #[test]
+    fn move_active_pack_moves_only_that_pack() {
+        let mut c = AppConfig::default();
+        c.active_preset = Some("pack:Old".into());
+        move_active_pack(&mut c, "Other", "New");
+        assert_eq!(c.active_preset.as_deref(), Some("pack:Old"));
+        move_active_pack(&mut c, "Old", "New");
+        assert_eq!(c.active_preset.as_deref(), Some("pack:New"));
+        c.active_preset = Some("Old".into());
+        move_active_pack(&mut c, "Old", "New");
+        assert_eq!(c.active_preset.as_deref(), Some("Old"));
+    }
+
+    #[test]
+    fn rename_pack_in_presets_cases() {
+        let mut c = AppConfig::default();
+        c.presets.insert("Mine".into(), vec!["5543".into(), "Old/1".into(), "Old/2".into(), "New/1".into()]);
+        c.presets.insert("Gone".into(), vec!["Old/9".into()]);
+        c.active_preset = Some("Gone".into());
+        rename_pack_in_presets(&mut c, "Old", "New", &["New/1".into(), "New/3".into()]);
+        assert_eq!(c.presets["Mine"], ["5543", "New/1"]);
+        assert!(!c.presets.contains_key("Gone"));
+        assert_eq!(c.active_preset, None);
     }
 
     #[test]

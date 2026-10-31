@@ -51,3 +51,13 @@ export async function showPrompt(
 export async function showCopy(text: string): Promise<void> {
   await enqueue({ ...base, kind: "copy", title: "Copy this link", message: "", value: text, confirmLabel: "Close" });
 }
+
+// Resolves to the picked choice's value, or null when cancelled
+export async function showChoice(
+  message: string,
+  choices: { label: string; value: string }[],
+  opts: { title?: string } = {},
+): Promise<string | null> {
+  const result = await enqueue({ ...base, kind: "choice", message, title: opts.title ?? "", choices });
+  return typeof result === "string" ? result : null;
+}

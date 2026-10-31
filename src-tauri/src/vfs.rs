@@ -1,8 +1,9 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use serde::{Serialize, Deserialize};
 use tauri::{AppHandle, Emitter, Manager};
-use crate::drive::Progress;
+use crate::server::Progress;
 use serde_json::Value;
 use crate::packs::{ensure_editable, ensure_pack_editable, mark_dirty, mark_pack_dirty, link_prefix, read_manifest, write_manifest, PackManifest, resolve_for_delete, resolve_key, parse_key, KeyKind, PackRef};
 use crate::subscribe::{OpGuard, OpKind};
@@ -206,6 +207,34 @@ pub async fn scan_local_mods(app_handle: tauri::AppHandle) -> Result<Vec<ModInfo
     Ok(scan_dir(&mods_dir))
 }
 
+// Nexus's version is the latest one, so `version` keeps what is installed
+fn merge_update_check(existing: &Value, fresh: Value, mod_id: u32) -> Value {
+    let text = |v: Option<&Value>| v.and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string);
+    let latest = text(fresh.get("version"));
+    let installed = text(existing.get("installed_version"))
+        .or_else(|| text(existing.get("version")))
+        .or_else(|| latest.clone());
+    let mut merged = fresh;
+    if let Some(obj) = merged.as_object_mut() {
+        for key in ["enabled", "addons"] {
+            if let Some(value) = existing.get(key) {
+                obj.insert(key.to_string(), value.clone());
+            }
+        }
+        if let Some(installed) = &installed {
+            obj.insert("version".to_string(), Value::String(installed.clone()));
+            obj.insert("installed_version".to_string(), Value::String(installed.clone()));
+        }
+        if let Some(latest) = &latest {
+            obj.insert("latest_version".to_string(), Value::String(latest.clone()));
+        }
+        let update_available = matches!((&installed, &latest), (Some(i), Some(l)) if i != l);
+        obj.insert("update_available".to_string(), Value::Bool(update_available));
+        obj.insert("mod_id".to_string(), Value::Number(serde_json::Number::from(mod_id)));
+    }
+    merged
+}
+
 #[tauri::command]
 pub async fn refresh_installed_mod_updates(app_handle: tauri::AppHandle) -> Result<usize, String> {
     let Some(_api_key) = crate::config::get_api_key()? else {
@@ -246,41 +275,7 @@ pub async fn refresh_installed_mod_updates(app_handle: tauri::AppHandle) -> Resu
             .and_then(|c| serde_json::from_str::<Value>(&c).ok())
             .unwrap_or(Value::Object(serde_json::Map::new()));
 
-        let preserved_enabled = existing.get("enabled").cloned();
-        let preserved_addons = existing.get("addons").cloned();
-        let installed_version = existing.get("installed_version")
-            .or_else(|| existing.get("version"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let latest_version = existing.get("version")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let update_available = !installed_version.is_empty()
-            && !latest_version.is_empty()
-            && installed_version != latest_version;
-        let mut merged = fresh;
-
-        if let Some(obj) = merged.as_object_mut() {
-            if let Some(enabled) = preserved_enabled {
-                obj.insert("enabled".to_string(), enabled);
-            }
-            if let Some(addons) = preserved_addons {
-                obj.insert("addons".to_string(), addons);
-            }
-            obj.insert(
-                "installed_version".to_string(),
-                Value::String(if installed_version.is_empty() {
-                    latest_version.clone()
-                } else {
-                    installed_version.clone()
-                }),
-            );
-            obj.insert("latest_version".to_string(), Value::String(latest_version));
-            obj.insert("update_available".to_string(), Value::Bool(update_available));
-            obj.insert("mod_id".to_string(), Value::Number(serde_json::Number::from(mod_id)));
-        }
+        let merged = merge_update_check(&existing, fresh, mod_id);
 
         if let Ok(json_str) = serde_json::to_string_pretty(&merged) {
             if fs::write(&metadata_path, json_str).is_ok() {
@@ -316,6 +311,118 @@ fn extract_rar(archive: &Path, dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn extract_7z(archive: &Path, dest: &Path) -> Result<(), String> {
+    fs::create_dir_all(dest).map_err(|e| format!("Failed to create directory: {}", e))?;
+    sevenz_rust2::decompress_file(archive, dest).map_err(|e| format!("Failed to extract 7z: {}", e))
+}
+
+#[derive(Debug, PartialEq)]
+enum ArchiveKind {
+    Zip,
+    Rar,
+    SevenZip,
+}
+
+// By content, since Nexus downloads are saved as .zip whatever their real format
+fn archive_kind(path: &Path) -> Result<ArchiveKind, String> {
+    let mut magic = [0u8; 6];
+    let mut file = fs::File::open(path).map_err(|e| format!("Failed to open archive: {}", e))?;
+    let read = std::io::Read::read(&mut file, &mut magic).map_err(|e| format!("Failed to read archive: {}", e))?;
+    Ok(match &magic[..read] {
+        m if m.starts_with(b"Rar!\x1a\x07") => ArchiveKind::Rar,
+        m if m.starts_with(b"7z\xbc\xaf\x27\x1c") => ArchiveKind::SevenZip,
+        _ => ArchiveKind::Zip,
+    })
+}
+
+fn extract_zip(path: &Path, dest: &Path) -> Result<(), String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("Failed to open archive: {}", e))?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("Invalid zip archive: {}", e))?;
+    
+    for i in 0..archive.len() {
+        let mut file = archive.by_index(i).map_err(|e| e.to_string())?;
+        let outpath = match file.enclosed_name() {
+            Some(path) => dest.join(path),
+            None => continue,
+        };
+        
+        if file.is_dir() {
+            std::fs::create_dir_all(&outpath).ok();
+        } else {
+            if let Some(p) = outpath.parent() {
+                std::fs::create_dir_all(p).ok();
+            }
+            let mut outfile = std::fs::File::create(&outpath).map_err(|_| "Failed to create extracted file")?;
+            std::io::copy(&mut file, &mut outfile).map_err(|_| "Failed to write extracted file")?;
+        }
+    }
+    Ok(())
+}
+
+// Extracts a .pak, .rar, .7z or .zip into dest
+fn extract_mod_archive(path: &Path, dest: &Path) -> Result<(), String> {
+    let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    if extension == "pak" {
+        let file_name = path.file_name().ok_or("Invalid file name")?;
+        std::fs::copy(path, dest.join(file_name)).map_err(|e| format!("Failed to copy .pak file: {}", e))?;
+        return Ok(());
+    }
+    match archive_kind(path)? {
+        ArchiveKind::Rar => extract_rar(path, dest),
+        ArchiveKind::SevenZip => extract_7z(path, dest),
+        ArchiveKind::Zip => extract_zip(path, dest),
+    }
+}
+
+// Extracts into staging and swaps the result in, so a bad archive leaves the installed copy as it was
+fn replace_from_archive(mods_dir: &Path, paks_dir: Option<&Path>, mod_id: &str, target_dir: &Path, archive: &Path, was_enabled: bool) -> Result<(), String> {
+    let staging = mods_dir.join(format!(".import-{}", uuid::Uuid::new_v4()));
+    let staged = staging.join("new");
+    let extracted = fs::create_dir_all(&staged)
+        .map_err(|e| format!("Failed to create staging folder: {}", e))
+        .and_then(|_| extract_mod_archive(archive, &staged));
+    if let Err(e) = extracted {
+        return Err(abandon_staging(&staging, e));
+    }
+    if let Some(paks_dir) = paks_dir {
+        if let Err(e) = unlink_mod(paks_dir, mod_id) {
+            return Err(abandon_staging(&staging, e));
+        }
+    }
+    let aside = staging.join("old");
+    let swapped = if target_dir.exists() {
+        fs::rename(target_dir, &aside).map_err(|e| format!("Failed to move the old copy of {} aside: {}", mod_id, e))
+    } else {
+        Ok(())
+    }
+    .and_then(|_| {
+        fs::rename(&staged, target_dir).map_err(|e| {
+            let err = format!("Failed to install {}: {}", mod_id, e);
+            match aside.exists().then(|| fs::rename(&aside, target_dir)) {
+                Some(Err(back)) => format!("{}. The old copy is kept in {}: {}", err, aside.display(), back),
+                _ => err,
+            }
+        })
+    });
+    if let Err(e) = swapped {
+        if aside.exists() {
+            return Err(e);
+        }
+        if was_enabled {
+            if let Some(paks_dir) = paks_dir {
+                if let Err(relink) = enable_key(mods_dir, paks_dir, mod_id) {
+                    eprintln!("[VFS] Could not re-enable {} after a failed install: {}", mod_id, relink);
+                }
+            }
+        }
+        return Err(abandon_staging(&staging, e));
+    }
+    if let Err(e) = fs::remove_dir_all(&staging) {
+        eprintln!("[VFS] Could not remove {}: {}", staging.display(), e);
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn install_mod_archive(app_handle: tauri::AppHandle, archive_path: String, mod_id: String) -> Result<(), String> {
     let mods_dir = get_mods_dir(&app_handle)?;
@@ -330,52 +437,11 @@ pub async fn install_mod_archive(app_handle: tauri::AppHandle, archive_path: Str
         .and_then(|c| serde_json::from_str::<Value>(&c).ok())
         .and_then(|v| v.get("enabled").and_then(Value::as_bool))
         .unwrap_or(false);
-    if let Some(paks_dir) = &paks_dir {
-        unlink_mod(paks_dir, &mod_id)?;
-    }
+    let (m, p, k, t, a) = (mods_dir.clone(), paks_dir.clone(), mod_id.clone(), target_dir.clone(), PathBuf::from(&archive_path));
+    tauri::async_runtime::spawn_blocking(move || replace_from_archive(&m, p.as_deref(), &k, &t, &a, was_enabled))
+        .await
+        .map_err(|e| e.to_string())??;
 
-    if target_dir.exists() {
-        std::fs::remove_dir_all(&target_dir).map_err(|e| format!("Failed to remove the old copy of {}: {}", mod_id, e))?;
-    }
-    std::fs::create_dir_all(&target_dir).map_err(|e| format!("Failed to create mod directory: {}", e))?;
-    
-    let path = std::path::Path::new(&archive_path);
-    let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-
-    if extension == "pak" {
-        // Just copy the pak file directly
-        let file_name = path.file_name().ok_or("Invalid file name")?;
-        let outpath = target_dir.join(file_name);
-        std::fs::copy(&archive_path, &outpath).map_err(|e| format!("Failed to copy .pak file: {}", e))?;
-    } else if extension == "rar" {
-        let (a, d) = (path.to_path_buf(), target_dir.clone());
-        tauri::async_runtime::spawn_blocking(move || extract_rar(&a, &d))
-            .await
-            .map_err(|e| e.to_string())??;
-    } else {
-        // Assume it's a zip and extract
-        let file = std::fs::File::open(&archive_path).map_err(|e| format!("Failed to open archive: {}", e))?;
-        let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("Invalid zip archive: {}", e))?;
-        
-        for i in 0..archive.len() {
-            let mut file = archive.by_index(i).map_err(|e| e.to_string())?;
-            let outpath = match file.enclosed_name() {
-                Some(path) => target_dir.join(path),
-                None => continue,
-            };
-            
-            if file.is_dir() {
-                std::fs::create_dir_all(&outpath).ok();
-            } else {
-                if let Some(p) = outpath.parent() {
-                    std::fs::create_dir_all(p).ok();
-                }
-                let mut outfile = std::fs::File::create(&outpath).map_err(|_| "Failed to create extracted file")?;
-                std::io::copy(&mut file, &mut outfile).map_err(|_| "Failed to write extracted file")?;
-            }
-        }
-    }
-    
     if let Ok(mod_id_num) = mod_id.parse::<u32>() {
         if let Ok(metadata) = crate::api::fetch_mod_metadata("readyornot".to_string(), mod_id_num).await {
             let meta_path = target_dir.join("metadata.json");
@@ -652,8 +718,8 @@ pub async fn toggle_mod(app_handle: tauri::AppHandle, mod_id: String, enable: bo
 #[tauri::command]
 pub async fn pick_mod_archive() -> Result<Option<String>, String> {
     let result = rfd::AsyncFileDialog::new()
-        .set_title("Select Mod Archive (.zip, .pak, .rar)")
-        .add_filter("Mod Archives", &["zip", "pak", "rar"])
+        .set_title("Select Mod Archive (.zip, .7z, .rar, .pak)")
+        .add_filter("Mod Archives", &["zip", "7z", "rar", "pak"])
         .pick_file()
         .await;
         
@@ -932,12 +998,23 @@ fn delete_pack_dir(mods_dir: &Path, paks_dir: Option<&Path>, pack_id: &str) -> R
         _ => return Err(format!("No modpack folder for {:?}", pack_id)),
     };
     let _op = OpGuard::begin_named(&pack_dir, OpKind::Local, &manifest.name)?;
-    if let Some(paks_dir) = paks_dir {
-        for name in child_dirs(&pack_dir)? {
-            let key = format!("{}/{}", pack_id, name);
-            if parse_key(&key).is_ok() {
-                unlink_mod(paks_dir, &key)?;
-            }
+    remove_pack_dir(mods_dir, paks_dir, pack_id)
+}
+
+// delete_pack_dir without its checks, for a caller that already holds the pack's op.
+// Each mod is marked off once it is unlinked, so a folder left by a failure has flags that match its links.
+pub(crate) fn remove_pack_dir(mods_dir: &Path, paks_dir: Option<&Path>, pack_id: &str) -> Result<(), String> {
+    let pack_dir = mods_dir.join(pack_id);
+    for name in child_dirs(&pack_dir)? {
+        let key = format!("{}/{}", pack_id, name);
+        if parse_key(&key).is_err() {
+            continue;
+        }
+        if let Some(paks_dir) = paks_dir {
+            unlink_mod(paks_dir, &key)?;
+        }
+        if let Err(e) = clear_enabled_flag(&pack_dir.join(&name)) {
+            eprintln!("[VFS] Could not turn off {} before deleting it: {}", key, e);
         }
     }
     let aside = mods_dir.join(format!(".deleting-{}", uuid::Uuid::new_v4()));
@@ -984,6 +1061,113 @@ fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
     Ok(())
 }
 
+// Keeps the source's history and records its mods so the fork's first publish can diff against them.
+// A fork without a changelog still works, so failures here are only logged.
+fn write_fork_changelog(pack_dir: &Path, source: &PackManifest, staged: &Path) {
+    let build = || -> Result<crate::packs::Changelog, String> {
+        let mut base = crate::packs::BaseSnapshot { name: source.name.clone(), version: source.version.clone(), ..Default::default() };
+        for id in &source.mod_ids {
+            let dir = pack_dir.join(id);
+            let meta = read_meta(&dir);
+            let name = meta.as_ref().and_then(|m| m.get("name")).and_then(|n| n.as_str()).unwrap_or(id).to_string();
+            let hash = match source.installed_hashes.get(id) {
+                Some(record) => record.hash.clone(),
+                None => {
+                    let files = crate::hashing::hash_mod_files_cached(&dir, id, &source.local_hashes, &mut BTreeMap::new(), &mut |_| {})?;
+                    crate::hashing::mod_hash(files.iter().map(|f| (f.path.as_str(), f.sha256.as_str())), &crate::hashing::addon_states(&dir))
+                }
+            };
+            base.mods.insert(id.clone(), crate::packs::ModState { name, version: meta_version(meta.as_ref()), hash, nexus_mod_id: id.parse().ok() });
+        }
+        let mut log = crate::packs::read_changelog(pack_dir);
+        log.base = Some(base);
+        Ok(log)
+    };
+    if let Err(e) = build().and_then(|log| crate::packs::write_changelog(staged, &log)) {
+        eprintln!("[FORK] Could not write the changelog for {}: {}", source.name, e);
+    }
+}
+
+// The pack id for a new pack called name, refused when a folder already uses it
+fn free_pack_id(mods_dir: &Path, name: &str) -> Result<String, String> {
+    let id = crate::packs::slugify(name);
+    let taken = crate::subscribe::is_reserved_name(&id)
+        || fs::read_dir(mods_dir)
+            .map_err(|e| format!("Failed to read {}: {}", mods_dir.display(), e))?
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().eq_ignore_ascii_case(&id));
+    if taken {
+        return Err(format!("A modpack called {} already exists", id));
+    }
+    Ok(id)
+}
+
+#[derive(Serialize, Debug)]
+pub struct CreatedPack {
+    pub pack: PackManifest,
+    pub warnings: Vec<String>,
+}
+
+// Makes an empty local pack, then moves the given loose mods into it.
+// A mod that fails to move stays loose and is reported as a warning.
+fn create_pack_dir(mods_dir: &Path, paks_dir: Option<&Path>, name: &str, keys: &[String]) -> Result<(CreatedPack, Vec<(String, String)>), String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("Enter a name for the modpack".to_string());
+    }
+    let pack_id = free_pack_id(mods_dir, name)?;
+    let staging = mods_dir.join(format!(".import-{}", uuid::Uuid::new_v4()));
+    let manifest = PackManifest {
+        pack_id: pack_id.clone(),
+        name: name.to_string(),
+        imported_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        ..Default::default()
+    };
+    let made = fs::create_dir_all(&staging)
+        .map_err(|e| format!("Failed to create staging folder: {}", e))
+        .and_then(|_| write_manifest(&staging, &manifest))
+        .and_then(|_| fs::rename(&staging, mods_dir.join(&pack_id)).map_err(|e| format!("Failed to create the modpack: {}", e)));
+    if let Err(e) = made {
+        return Err(abandon_staging(&staging, e));
+    }
+
+    let mut warnings = Vec::new();
+    let mut moved = Vec::new();
+    for key in keys {
+        match move_into_pack(mods_dir, paks_dir, key, &pack_id) {
+            Ok((new_key, warning)) => {
+                warnings.extend(warning.map(|w| format!("{}: {}", key, w)));
+                moved.push((key.clone(), new_key));
+            }
+            Err(e) => warnings.push(format!("{}: {}", key, e)),
+        }
+    }
+    let pack = read_manifest(&mods_dir.join(&pack_id)).unwrap_or(manifest);
+    Ok((CreatedPack { pack, warnings }, moved))
+}
+
+#[tauri::command]
+pub async fn create_pack(app_handle: tauri::AppHandle, name: String, keys: Vec<String>) -> Result<CreatedPack, String> {
+    let mods_dir = get_mods_dir(&app_handle)?;
+    let paks_dir = get_paks_dir(&app_handle).ok();
+    let (mut created, moved) = create_pack_dir(&mods_dir, paks_dir.as_deref(), &name, &keys)?;
+    if !moved.is_empty() {
+        let saved = crate::config::load_config(app_handle.clone()).and_then(|mut config| {
+            for (old, new) in &moved {
+                crate::config::rename_key_in_presets(&mut config, old, new);
+            }
+            crate::config::save_config(app_handle, config)
+        });
+        if let Err(e) = saved {
+            created.warnings.push(format!("Saved presets were not updated: {}", e));
+        }
+    }
+    Ok(created)
+}
+
 // Copies the pack into a staging folder and renames it into place, so a failure leaves nothing behind.
 fn fork_pack_dir(mods_dir: &Path, pack_id: &str, new_name: &str) -> Result<PackManifest, String> {
     let pack_dir = mods_dir.join(pack_id);
@@ -996,15 +1180,7 @@ fn fork_pack_dir(mods_dir: &Path, pack_id: &str, new_name: &str) -> Result<PackM
     if name.is_empty() {
         return Err("Enter a name for the fork".to_string());
     }
-    let new_id = crate::packs::slugify(name);
-    let taken = crate::subscribe::is_reserved_name(&new_id)
-        || fs::read_dir(mods_dir)
-            .map_err(|e| format!("Failed to read {}: {}", mods_dir.display(), e))?
-            .filter_map(|e| e.ok())
-            .any(|e| e.file_name().to_string_lossy().eq_ignore_ascii_case(&new_id));
-    if taken {
-        return Err(format!("A modpack called {} already exists", new_id));
-    }
+    let new_id = free_pack_id(mods_dir, name)?;
 
     let staging = mods_dir.join(format!(".fork-{}", uuid::Uuid::new_v4()));
     let build = || -> Result<PackManifest, String> {
@@ -1026,6 +1202,7 @@ fn fork_pack_dir(mods_dir: &Path, pack_id: &str, new_name: &str) -> Result<PackM
             ..Default::default()
         };
         write_manifest(&staged, &manifest)?;
+        write_fork_changelog(&pack_dir, &source, &staged);
         fs::rename(&staged, mods_dir.join(&new_id)).map_err(|e| format!("Failed to create the fork: {}", e))?;
         Ok(manifest)
     };
@@ -1739,9 +1916,10 @@ pub async fn install_addon(app_handle: tauri::AppHandle, mod_id: String, archive
                 }
             }
         }
-    } else if extension == "rar" {
+    } else if extension == "rar" || extension == "7z" {
         let (a, d) = (std::path::PathBuf::from(&archive_path), addons_dir.clone());
-        tauri::async_runtime::spawn_blocking(move || extract_rar(&a, &d))
+        let extract = if extension == "rar" { extract_rar } else { extract_7z };
+        tauri::async_runtime::spawn_blocking(move || extract(&a, &d))
             .await
             .map_err(|e| e.to_string())??;
 
@@ -1906,6 +2084,92 @@ mod tests {
         fs::write(&junk, b"not a rar").unwrap();
         let err = extract_rar(&junk, &dir.join("out")).unwrap_err();
         assert!(err.starts_with("Failed to open RAR"), "{err}");
+    }
+
+    #[test]
+    fn extract_7z_keeps_folders() {
+        let dest = scratch("7z");
+        let archive = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata").join("7z_small.7z");
+        extract_7z(&archive, &dest).unwrap();
+        assert_eq!(fs::read(dest.join("Mod/a.pak")).unwrap(), b"pak-a ".repeat(200));
+        assert_eq!(fs::read(dest.join("Mod/a.ucas")).unwrap(), b"ucas-a ".repeat(200));
+        assert_eq!(fs::read(dest.join("Mod/sub/b.utoc")).unwrap(), b"utoc-b ".repeat(50));
+    }
+
+    #[test]
+    fn extract_7z_rejects_a_non_7z_file() {
+        let dir = scratch("7z-junk");
+        let junk = dir.join("junk.7z");
+        fs::write(&junk, b"not a 7z").unwrap();
+        let err = extract_7z(&junk, &dir.join("out")).unwrap_err();
+        assert!(err.starts_with("Failed to extract 7z"), "{err}");
+    }
+
+    #[test]
+    fn archives_are_recognised_by_content_not_name() {
+        let mods = scratch("by-content");
+        let zip = mods.join("real.zip");
+        write_zip(&zip, &[("Mod/z.pak", b"z")]);
+        for (fixture, kind) in [("7z_small.7z", ArchiveKind::SevenZip), ("rar5_small.rar", ArchiveKind::Rar)] {
+            let saved_as_zip = mods.join(format!("downloaded-{}.zip", fixture));
+            fs::copy(Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata").join(fixture), &saved_as_zip).unwrap();
+            assert_eq!(archive_kind(&saved_as_zip).unwrap(), kind);
+
+            let target = mods.join("5543");
+            replace_from_archive(&mods, None, "5543", &target, &saved_as_zip, false).unwrap();
+            assert_eq!(fs::read(target.join("Mod/a.pak")).unwrap(), b"pak-a ".repeat(200));
+        }
+        assert_eq!(archive_kind(&zip).unwrap(), ArchiveKind::Zip);
+    }
+
+    fn write_zip(path: &Path, files: &[(&str, &[u8])]) {
+        let mut zip = zip::ZipWriter::new(fs::File::create(path).unwrap());
+        for (name, data) in files {
+            zip.start_file(*name, zip::write::SimpleFileOptions::default()).unwrap();
+            std::io::Write::write_all(&mut zip, data).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn bad_archive_keeps_the_installed_copy() {
+        let mods = scratch("replace-bad");
+        let target = mods.join("5543");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("old.pak"), b"old").unwrap();
+        let junk = mods.join("junk.zip");
+        fs::write(&junk, b"not a zip").unwrap();
+
+        let err = replace_from_archive(&mods, None, "5543", &target, &junk, false).unwrap_err();
+        assert!(err.starts_with("Invalid zip archive"), "{err}");
+        assert_eq!(fs::read(target.join("old.pak")).unwrap(), b"old");
+        assert!(leftover_staging(&mods).is_empty());
+    }
+
+    #[test]
+    fn archive_replaces_the_installed_copy() {
+        let mods = scratch("replace-good");
+        let target = mods.join("5543");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("old.pak"), b"old").unwrap();
+        let archive = mods.join("mod.zip");
+        write_zip(&archive, &[("Mod/new.pak", b"new")]);
+
+        replace_from_archive(&mods, None, "5543", &target, &archive, false).unwrap();
+        assert!(!target.join("old.pak").exists());
+        assert_eq!(fs::read(target.join("Mod/new.pak")).unwrap(), b"new");
+        assert!(leftover_staging(&mods).is_empty());
+    }
+
+    #[test]
+    fn archive_installs_a_new_mod() {
+        let mods = scratch("replace-new");
+        let pak = mods.join("solo.pak");
+        fs::write(&pak, b"pak").unwrap();
+
+        replace_from_archive(&mods, None, "5543", &mods.join("5543"), &pak, false).unwrap();
+        assert_eq!(fs::read(mods.join("5543/solo.pak")).unwrap(), b"pak");
+        assert!(leftover_staging(&mods).is_empty());
     }
 
     #[test]
@@ -2271,11 +2535,11 @@ mod tests {
         let (m, p, z) = (scratch("mods"), scratch("paks"), scratch("zips"));
         upgrade_setup(&m, &p, &z);
         let mut man = read_manifest(&m.join("CS")).unwrap();
-        man.published = Some(Published { folder_id: "F".into(), dirty: false });
+        man.published = Some(Published { server: Some("https://packs.test".into()), dirty: false });
         write_manifest(&m.join("CS"), &man).unwrap();
         import_from_archive(&z.join("v16.zip"), &m, &p, &mut |_| {}).unwrap();
         let after = read_manifest(&m.join("CS")).unwrap();
-        assert_eq!(after.published, Some(Published { folder_id: "F".into(), dirty: true }));
+        assert_eq!(after.published, Some(Published { server: Some("https://packs.test".into()), dirty: true }));
     }
 
     #[test]
@@ -2284,7 +2548,7 @@ mod tests {
         let (m, p, z) = (scratch("mods"), scratch("paks"), scratch("zips"));
         upgrade_setup(&m, &p, &z);
         let mut man = read_manifest(&m.join("CS")).unwrap();
-        man.source = Some(PackSource { kind: "drive".into(), folder_id: "F".into(), resource_key: None });
+        man.source = Some(PackSource { kind: "drive".into(), folder_id: Some("F".into()), ..Default::default() });
         man.installed_hashes.insert("3063".into(), InstalledMod::default());
         write_manifest(&m.join("CS"), &man).unwrap();
         import_from_archive(&z.join("v16.zip"), &m, &p, &mut |_| {}).unwrap();
@@ -2294,13 +2558,40 @@ mod tests {
         assert!(after.published.is_none());
     }
 
+    // A zip cannot make a pack name a server, so it cannot add a server row to Settings
+    #[test]
+    fn zip_contents_never_link_or_publish_the_pack() {
+        use crate::packs::read_manifest;
+        let (m, p, z) = (scratch("mods"), scratch("paks"), scratch("zips"));
+        let linked = br#"{"pack_id": "CS", "name": "CS", "mod_ids": ["3063"], "imported_at": 1,
+            "source": {"kind": "server", "server": "https://evil.test"},
+            "published": {"server": "https://evil.test", "dirty": false}}"#;
+        make_pack_zip(&z.join("cs.zip"), serde_json::json!({
+            "name": "CS v1.5",
+            "mod_ids": ["3063"],
+            "source": {"kind": "server", "server": "https://evil.test"},
+            "published": {"server": "https://evil.test", "dirty": false},
+        }), &[
+            ("pack.json", linked),
+            ("3063/pack.json", linked),
+            ("3063/metadata.json", br#"{"version": "1.0"}"#),
+            ("3063/a.pak", b"a"),
+        ]);
+        import_from_archive(&z.join("cs.zip"), &m, &p, &mut |_| {}).unwrap();
+        let man = read_manifest(&m.join("CS")).unwrap();
+        assert!(man.source.is_none());
+        assert!(man.published.is_none());
+        assert_eq!(man.mod_ids, ["3063"]);
+        assert!(crate::accounts::pack_servers(&m).is_empty());
+    }
+
     #[test]
     fn zip_import_drops_local_hashes() {
         use crate::packs::{read_manifest, write_manifest, CachedHash, Published};
         let (m, p, z) = (scratch("mods"), scratch("paks"), scratch("zips"));
         upgrade_setup(&m, &p, &z);
         let mut man = read_manifest(&m.join("CS")).unwrap();
-        man.published = Some(Published { folder_id: "F".into(), dirty: false });
+        man.published = Some(Published { server: Some("https://packs.test".into()), dirty: false });
         man.local_hashes.insert("3063/a.pak".into(), CachedHash { size: 1, mtime_ns: 1, sha256: "x".into() });
         write_manifest(&m.join("CS"), &man).unwrap();
         import_from_archive(&z.join("v16.zip"), &m, &p, &mut |_| {}).unwrap();
@@ -2549,7 +2840,7 @@ mod tests {
         fs::create_dir_all(m.join("CS")).unwrap();
         write_manifest(&m.join("CS"), &PackManifest {
             pack_id: "CS".into(), name: "Casual Shitters".into(),
-            source: Some(PackSource { kind: "drive".into(), folder_id: "f".into(), resource_key: None }),
+            source: Some(PackSource { kind: "drive".into(), folder_id: Some("f".into()), ..Default::default() }),
             ..Default::default() }).unwrap();
         let e = move_into_pack(&m, None, "7000", "CS").unwrap_err();
         assert_eq!(e, "Casual Shitters is linked to its creator. Fork it to make changes.");
@@ -2558,6 +2849,45 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn create_pack_makes_an_empty_local_pack() {
+        let m = scratch("create-empty");
+        let (created, moved) = create_pack_dir(&m, None, "  R2 Test Pack ", &[]).unwrap();
+        assert!(created.warnings.is_empty() && moved.is_empty());
+        let on_disk = read_manifest(&m.join("R2-Test-Pack")).unwrap();
+        assert_eq!((on_disk.name.as_str(), on_disk.version.as_deref()), ("R2 Test Pack", None));
+        assert!(on_disk.mod_ids.is_empty() && on_disk.source.is_none() && on_disk.published.is_none());
+        assert!(leftover_staging(&m).is_empty());
+    }
+
+    #[test]
+    fn create_pack_moves_mods_and_keeps_them_enabled() {
+        let m = scratch("create-move-mods");
+        let p = scratch("create-move-paks");
+        put(&m, "7000/a.pak", b"a");
+        put(&m, "7001/b.pak", b"b");
+        enable_key(&m, &p, "7000").unwrap();
+
+        let keys = ["7000".to_string(), "7001".to_string(), "9999".to_string()];
+        let (created, moved) = create_pack_dir(&m, Some(&p), "Test", &keys).unwrap();
+        assert_eq!(created.pack.mod_ids, ["7000", "7001"]);
+        assert_eq!(moved, [("7000".to_string(), "Test/7000".to_string()), ("7001".to_string(), "Test/7001".to_string())]);
+        assert_eq!(created.warnings.len(), 1);
+        assert!(created.warnings[0].starts_with("9999: "), "{:?}", created.warnings);
+        assert!(names(&p).iter().any(|n| n.starts_with("Test.7000_")));
+        assert!(names(&p).iter().all(|n| !n.starts_with("Test.7001_")));
+    }
+
+    #[test]
+    fn create_pack_refuses_a_taken_name() {
+        let m = scratch("create-taken");
+        put(&m, "CS/3063/b.pak", b"b");
+        manifest(&m, &["3063"]);
+        let err = create_pack_dir(&m, None, "cs", &[]).unwrap_err();
+        assert_eq!(err, "A modpack called cs already exists");
+        assert_eq!(create_pack_dir(&m, None, "   ", &[]).unwrap_err(), "Enter a name for the modpack");
+    }
+
     #[test]
     fn move_into_pack_moves_and_relinks() {
         let m = scratch("mv-in-mods");
@@ -2798,6 +3128,32 @@ mod tests {
     }
 
     #[test]
+    fn update_check_keeps_the_installed_version() {
+        let existing = serde_json::json!({"version": "1.2", "installed_version": "1.2", "enabled": true, "addons": {"a.pak": {"enabled": false}}});
+        let fresh = serde_json::json!({"name": "Speed", "version": "1.5"});
+        let merged = merge_update_check(&existing, fresh, 5489);
+        assert_eq!(merged["name"], "Speed");
+        assert_eq!((merged["version"].as_str(), merged["installed_version"].as_str()), (Some("1.2"), Some("1.2")));
+        assert_eq!(merged["latest_version"], "1.5");
+        assert_eq!(merged["update_available"], true);
+        assert_eq!(merged["enabled"], true);
+        assert_eq!(merged["addons"], existing["addons"]);
+        assert_eq!(merged["mod_id"], 5489);
+
+        let again = merge_update_check(&merged, serde_json::json!({"version": "1.5"}), 5489);
+        assert_eq!((again["version"].as_str(), again["update_available"].as_bool()), (Some("1.2"), Some(true)));
+    }
+
+    #[test]
+    fn update_check_on_a_current_mod_finds_no_update() {
+        let merged = merge_update_check(&serde_json::json!({"version": "1.5"}), serde_json::json!({"version": "1.5"}), 5489);
+        assert_eq!((merged["installed_version"].as_str(), merged["update_available"].as_bool()), (Some("1.5"), Some(false)));
+
+        let bare = merge_update_check(&serde_json::json!({}), serde_json::json!({"version": "2.0"}), 7);
+        assert_eq!((bare["version"].as_str(), bare["update_available"].as_bool()), (Some("2.0"), Some(false)));
+    }
+
+    #[test]
     fn import_clears_update_available() {
         let (m, p, z) = (scratch("mods"), scratch("paks"), scratch("zips"));
         let zip = z.join("u.zip");
@@ -2889,7 +3245,7 @@ mod tests {
         write_manifest(&m.join("CS"), &PackManifest {
             pack_id: "CS".into(), name: "Casual".into(), version: Some("1.2".into()),
             mod_ids: vec!["3063".into(), "4296".into()], imported_at: 5,
-            source: Some(PackSource { kind: "drive".into(), folder_id: "f".into(), resource_key: None }),
+            source: Some(PackSource { kind: "drive".into(), folder_id: Some("f".into()), ..Default::default() }),
             local_hashes: [("3063/a.pak".to_string(), crate::packs::CachedHash { size: 3, mtime_ns: 1, sha256: "x".into() })].into(),
             ..Default::default() }).unwrap();
         assert!(crate::packs::ensure_pack_editable(&m, "CS").is_err());
@@ -2914,6 +3270,36 @@ mod tests {
         assert_eq!(tree(&m.join("CS")), before);
         assert_eq!(read_json(&m.join("CS/3063/metadata.json"))["enabled"], Value::Bool(true));
         assert_eq!(pack_size(&m.join("CS/3063")), 3 + 3 + 30);
+    }
+
+    #[test]
+    fn fork_writes_base_and_keeps_history() {
+        use crate::packs::{read_changelog, write_changelog, write_manifest, BaseSnapshot, Changelog, InstalledMod, ModState, PackManifest};
+        use crate::server::VersionEntry;
+        let m = scratch("fork-base");
+        put(&m, "CS/3063/a.pak", b"aaa");
+        put(&m, "CS/3063/metadata.json", br#"{"name": "Vests", "installed_version": "1.4"}"#);
+        put(&m, "CS/4296/b.pak", b"bb");
+        put(&m, "CS/4296/metadata.json", br#"{"name": "Blood"}"#);
+        let pack = m.join("CS");
+        write_manifest(&pack, &PackManifest {
+            pack_id: "CS".into(), name: "Casual".into(), version: Some("1.2".into()),
+            mod_ids: vec!["3063".into(), "4296".into()],
+            installed_hashes: [("3063".to_string(), InstalledMod { hash: "recorded".into(), files: Default::default() })].into(),
+            ..Default::default() }).unwrap();
+        let history = vec![VersionEntry { version: "1.2".into(), published_at: 9, notes: "Older notes".into(), publisher: None }];
+        write_changelog(&pack, &Changelog { entries: history.clone(), base: Some(BaseSnapshot { name: "Origin".into(), ..Default::default() }) }).unwrap();
+
+        fork_pack_dir(&m, "CS", "My Fork").unwrap();
+        let log = read_changelog(&m.join("My-Fork"));
+        assert_eq!(log.entries, history);
+        let base = log.base.unwrap();
+        assert_eq!((base.name.as_str(), base.version.as_deref()), ("Casual", Some("1.2")));
+        assert_eq!(base.mods["3063"], ModState { name: "Vests".into(), version: Some("1.4".into()), hash: "recorded".into(), nexus_mod_id: Some(3063) });
+        let blood = &base.mods["4296"];
+        assert_eq!((blood.name.as_str(), blood.version.as_deref(), blood.nexus_mod_id), ("Blood", None, Some(4296)));
+        let files = crate::hashing::hash_mod_files(&pack.join("4296"), &mut |_| {}).unwrap();
+        assert_eq!(blood.hash, crate::hashing::mod_hash(files.iter().map(|f| (f.path.as_str(), f.sha256.as_str())), &Default::default()));
     }
 
     #[test]

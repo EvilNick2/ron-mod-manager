@@ -3,7 +3,7 @@ import { onMounted, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { store, type PackProgress, type CloseBlocked } from "./store";
-import { loadGoogleStatus, checkPackUpdates, hasVisibleOps } from "./packActions";
+import { loadServers, checkPackUpdates, hasVisibleOps } from "./packActions";
 
 import Sidebar from "./components/Sidebar.vue";
 import ModGrid from "./components/ModGrid.vue";
@@ -14,6 +14,9 @@ import UpdateModal from "./components/UpdateModal.vue";
 import CloseGuardModal from "./components/CloseGuardModal.vue";
 import ProgressModal from "./components/ProgressModal.vue";
 import DialogModal from "./components/DialogModal.vue";
+import PackAccessModal from "./components/PackAccessModal.vue";
+import ServerAdminModal from "./components/ServerAdminModal.vue";
+import PackChangelogModal from "./components/PackChangelogModal.vue";
 
 const isDragging = ref(false);
 
@@ -73,11 +76,7 @@ onMounted(async () => {
     console.error("Failed to load config on startup:", error);
   }
 
-  try {
-    await loadGoogleStatus();
-  } catch (e) {
-    console.error("Failed to load Google status:", e);
-  }
+  await loadServers();
   checkPackUpdates();
 
   try {
@@ -102,7 +101,7 @@ onMounted(async () => {
     if (paths && paths.length > 0) {
       const file = paths[0];
       const lowerFile = file.toLowerCase();
-      if (lowerFile.endsWith(".zip") || lowerFile.endsWith(".pak") || lowerFile.endsWith(".rar")) {
+      if ([".zip", ".7z", ".rar", ".pak"].some((ext) => lowerFile.endsWith(ext))) {
         store.installingModPath = file;
       } else {
         console.warn("Unsupported drop file.");
@@ -121,7 +120,7 @@ onMounted(async () => {
     <h2>Drop Mod Archive Here</h2>
   </div>
 
-  <div class="app-layout" :class="{ 'modal-open': store.isSettingsOpen || store.installingModPath || store.postInstallModId || store.isUpdateModalOpen || store.closeBlocked || hasVisibleOps() || store.dialogs.length > 0, 'blur-enabled': store.isBlurEnabled }">
+  <div class="app-layout" :class="{ 'modal-open': store.isSettingsOpen || store.installingModPath || store.postInstallModId || store.isUpdateModalOpen || store.closeBlocked || store.packAccessFor || store.serverAdminFor || store.packChangelog || hasVisibleOps() || store.dialogs.length > 0, 'blur-enabled': store.isBlurEnabled }">
     <Sidebar />
     <ModGrid />
     <RightPanel />
@@ -138,6 +137,18 @@ onMounted(async () => {
 
     <transition name="fade">
       <CloseGuardModal v-if="store.closeBlocked" />
+    </transition>
+
+    <transition name="fade">
+      <PackAccessModal v-if="store.packAccessFor" />
+    </transition>
+
+    <transition name="fade">
+      <ServerAdminModal v-if="store.serverAdminFor" />
+    </transition>
+
+    <transition name="fade">
+      <PackChangelogModal v-if="store.packChangelog" />
     </transition>
 
     <ProgressModal />
@@ -161,7 +172,8 @@ onMounted(async () => {
   
   --border-light: #272a33;
   --border-dark: #101217;
-  
+
+  color-scheme: dark;
   font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
 }
 
@@ -187,6 +199,20 @@ onMounted(async () => {
 * {
   scrollbar-width: thin;
   scrollbar-color: var(--bg-hover) var(--bg-darker);
+}
+
+/* WebKitGTK draws native selects with the light GTK theme and ignores their background */
+select {
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23a1a1aa' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 0.75rem center;
+  padding-right: 2rem !important;
+}
+
+option {
+  background: var(--bg-card);
+  color: var(--text-main);
 }
 
 body {
