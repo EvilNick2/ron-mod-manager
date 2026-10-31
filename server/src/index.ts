@@ -1,3 +1,4 @@
+import { adminLogout, adminPage } from "./admin/session";
 import { nowSeconds } from "./auth";
 import { cleanup } from "./cleanup";
 import type { Env } from "./env";
@@ -31,19 +32,22 @@ import {
   verifyPublish,
 } from "./publish";
 import { recordDownload, recordUse } from "./usage";
-import { authCallback, authLogout, authStart, authToken } from "./signin";
+import { adminLogin, authCallback, authLogout, authStart, authToken } from "./signin";
 
 type Handler = (req: Request, env: Env, url: URL) => Promise<Response> | Response;
 
 const routes: Record<string, Handler> = {
   "GET /health": () => json({ ok: true }),
   "GET /auth/start": (_req, env, url) => authStart(env, url),
-  "GET /auth/callback": (_req, env, url) => authCallback(env, url),
+  "GET /auth/callback": (req, env, url) => authCallback(req, env, url),
   "POST /auth/token": (req, env) => authToken(req, env),
   "POST /auth/logout": (req, env) => authLogout(req, env),
   "POST /invites/uploader": (req, env) => createUploaderInvite(req, env),
   "GET /me": (req, env) => me(req, env),
   "GET /admin/users": (req, env) => listUsers(req, env),
+  "GET /admin": () => adminPage(),
+  "GET /admin/login": (_req, env) => adminLogin(env),
+  "POST /admin/api/logout": (req, env) => adminLogout(req, env),
 };
 
 type CodeHandler = (req: Request, env: Env, ...params: string[]) => Promise<Response> | Response;

@@ -1,9 +1,12 @@
+import { adminCookie, createAdminSession, readCookie } from "./admin/session";
 import { createSession, nowSeconds, randomToken, requireUser, sha256Hex } from "./auth";
 import { exchangeCode, fetchUser } from "./discord";
 import type { Env } from "./env";
 import { HttpError, json, readJson } from "./http";
 
 const LOGIN_TTL = 600;
+const ADMIN_REDIRECT = "admin";
+const ADMIN_STATE_COOKIE = "ron_admin_state";
 
 interface LoginRow {
   id: string;
@@ -41,6 +44,70 @@ function page(message: string): Response {
   return new Response(html, { status: 400, headers: { "content-type": "text/html; charset=utf-8" } });
 }
 
+function adminDocument(body: string, status: number, headers?: Record<string, string>): Response {
+  return new Response(`<!doctype html><meta charset="utf-8">${body}`, {
+    status,
+    headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", ...headers },
+  });
+}
+
+function discordAuthorizeUrl(env: Env, state: string): string {
+  const authorize = new URL("https://discord.com/oauth2/authorize");
+  authorize.searchParams.set("client_id", env.DISCORD_CLIENT_ID);
+  authorize.searchParams.set("response_type", "code");
+  authorize.searchParams.set("scope", "identify");
+  authorize.searchParams.set("redirect_uri", callbackUri(env));
+  authorize.searchParams.set("state", state);
+  return authorize.href;
+}
+
+async function upsertUser(env: Env, user: { id: string; name: string }): Promise<void> {
+  const owner = user.id === env.OWNER_DISCORD_ID;
+  await env.DB.prepare(
+    `insert into users (id, name, role, created_at) values (?, ?, ?, ?)
+     on conflict (id) do update set name = excluded.name,
+       role = case when ? then 'owner' when role = 'owner' then 'uploader' else role end`,
+  )
+    .bind(user.id, user.name, owner ? "owner" : null, nowSeconds(), owner ? 1 : 0)
+    .run();
+}
+
+export async function adminLogin(env: Env): Promise<Response> {
+  const id = randomToken();
+  await env.DB.prepare(
+    "insert into logins (id, app_redirect, app_state, code_challenge, expires_at) values (?, ?, '', '', ?)",
+  )
+    .bind(id, ADMIN_REDIRECT, nowSeconds() + LOGIN_TTL)
+    .run();
+  return new Response(null, {
+    status: 302,
+    headers: {
+      location: discordAuthorizeUrl(env, id),
+      "set-cookie": `${ADMIN_STATE_COOKIE}=${id}; HttpOnly; Secure; SameSite=Lax; Path=/auth/callback; Max-Age=${LOGIN_TTL}`,
+    },
+  });
+}
+
+async function adminCallback(req: Request, env: Env, loginId: string, code: string): Promise<Response> {
+  const stateMatches = readCookie(req, ADMIN_STATE_COOKIE) === loginId;
+  const del = await env.DB.prepare("delete from logins where id = ?").bind(loginId).run();
+  if (!stateMatches || del.meta.changes !== 1) return page("This sign-in expired.");
+
+  const user = await fetchUser(await exchangeCode(env, code, callbackUri(env)));
+  if (user.id !== env.OWNER_DISCORD_ID) {
+    return adminDocument("<title>Sign-in</title><p>Only the server owner can open this.</p>", 403);
+  }
+
+  await upsertUser(env, user);
+  const token = await createAdminSession(env, user.id);
+  // A 302 would lose the cookie: SameSite=Strict is not sent on a redirect chain that started on Discord.
+  return adminDocument(
+    '<meta http-equiv="refresh" content="0;url=/admin"><title>Sign-in</title><p><a href="/admin">Continue to the dashboard</a></p>',
+    200,
+    { "set-cookie": adminCookie(token) },
+  );
+}
+
 export async function authStart(env: Env, url: URL): Promise<Response> {
   const state = url.searchParams.get("state");
   const challenge = url.searchParams.get("code_challenge");
@@ -56,16 +123,10 @@ export async function authStart(env: Env, url: URL): Promise<Response> {
     .bind(id, redirect.href, state, challenge, nowSeconds() + LOGIN_TTL)
     .run();
 
-  const authorize = new URL("https://discord.com/oauth2/authorize");
-  authorize.searchParams.set("client_id", env.DISCORD_CLIENT_ID);
-  authorize.searchParams.set("response_type", "code");
-  authorize.searchParams.set("scope", "identify");
-  authorize.searchParams.set("redirect_uri", callbackUri(env));
-  authorize.searchParams.set("state", id);
-  return Response.redirect(authorize.href, 302);
+  return Response.redirect(discordAuthorizeUrl(env, id), 302);
 }
 
-export async function authCallback(env: Env, url: URL): Promise<Response> {
+export async function authCallback(req: Request, env: Env, url: URL): Promise<Response> {
   const id = url.searchParams.get("state") ?? "";
   const code = url.searchParams.get("code");
   const login = await env.DB.prepare("select * from logins where id = ?")
@@ -81,15 +142,10 @@ export async function authCallback(env: Env, url: URL): Promise<Response> {
     return page("This sign-in expired.");
   }
 
+  if (login.app_redirect === ADMIN_REDIRECT) return adminCallback(req, env, id, code);
+
   const user = await fetchUser(await exchangeCode(env, code, callbackUri(env)));
-  const owner = user.id === env.OWNER_DISCORD_ID;
-  await env.DB.prepare(
-    `insert into users (id, name, role, created_at) values (?, ?, ?, ?)
-     on conflict (id) do update set name = excluded.name,
-       role = case when ? then 'owner' when role = 'owner' then 'uploader' else role end`,
-  )
-    .bind(user.id, user.name, owner ? "owner" : null, nowSeconds(), owner ? 1 : 0)
-    .run();
+  await upsertUser(env, user);
 
   const appCode = randomToken();
   await env.DB.prepare("update logins set code_hash = ?, user_id = ? where id = ?")
